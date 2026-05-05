@@ -1,0 +1,454 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>记忆库</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#0f0f13;--surface:#1a1a24;--surface2:#22222f;--border:#2d2d3f;
+  --text:#e8e8f0;--text2:#8888aa;
+  --accent:#7c6af5;--accent2:#5c4ae8;
+  --deep:#a78bfa;--daily:#4ade80;--diary:#fbbf24;--writing:#f472b6;
+}
+body{background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,sans-serif;min-height:100vh}
+
+/* Header */
+.header{background:var(--surface);border-bottom:1px solid var(--border);padding:14px 24px;display:flex;align-items:center;justify-content:space-between;gap:16px}
+.logo{font-size:20px;font-weight:700;color:var(--accent);white-space:nowrap}
+.stats{display:flex;gap:20px}
+.stat{text-align:center}
+.stat-num{font-size:22px;font-weight:700;line-height:1}
+.stat-label{font-size:11px;color:var(--text2);margin-top:2px}
+
+/* Layout */
+.layout{display:flex;height:calc(100vh - 61px)}
+
+/* Sidebar */
+.sidebar{width:210px;flex-shrink:0;background:var(--surface);border-right:1px solid var(--border);padding:16px;overflow-y:auto}
+.sidebar-title{font-size:11px;color:var(--text2);text-transform:uppercase;letter-spacing:1px;margin-bottom:8px;padding:0 4px}
+.nav-item{padding:8px 12px;border-radius:8px;cursor:pointer;display:flex;align-items:center;gap:8px;margin-bottom:2px;color:var(--text2);transition:.15s;font-size:14px}
+.nav-item:hover,.nav-item.active{background:var(--surface2);color:var(--text)}
+.dot{width:8px;height:8px;border-radius:50%;flex-shrink:0}
+.dot-all{background:var(--accent)}.dot-deep{background:var(--deep)}
+.dot-daily{background:var(--daily)}.dot-diary{background:var(--diary)}.dot-writing{background:var(--writing)}
+.nav-count{margin-left:auto;font-size:11px;background:var(--border);padding:2px 6px;border-radius:10px}
+.sidebar-divider{height:1px;background:var(--border);margin:12px 0}
+
+/* Main */
+.main{flex:1;overflow-y:auto;padding:20px 24px}
+
+/* Toolbar */
+.toolbar{display:flex;gap:10px;margin-bottom:18px;align-items:center}
+.search{flex:1;background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:9px 14px;color:var(--text);font-size:14px;outline:none;transition:.15s}
+.search:focus{border-color:var(--accent)}
+.search::placeholder{color:var(--text2)}
+.btn{padding:9px 18px;border-radius:8px;border:none;cursor:pointer;font-size:14px;font-weight:600;transition:.15s;white-space:nowrap}
+.btn-primary{background:var(--accent);color:#fff}.btn-primary:hover{background:var(--accent2)}
+.btn-ghost{background:var(--surface2);color:var(--text2);border:1px solid var(--border)}.btn-ghost:hover{color:var(--text)}
+.btn-sm{padding:5px 10px;font-size:12px}
+.btn-del{background:#f87171 14;color:#f87171;border:1px solid #f8717133}.btn-del:hover{background:#f8717133}
+.btn-edit{background:var(--accent)14;color:var(--accent);border:1px solid var(--accent)33}.btn-edit:hover{background:var(--accent)33}
+
+/* Cards */
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(290px,1fr));gap:14px}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:16px;transition:.15s}
+.card:hover{border-color:var(--accent)44;box-shadow:0 4px 20px #7c6af511}
+.card-head{display:flex;align-items:center;gap:8px;margin-bottom:10px}
+.badge{font-size:11px;padding:3px 8px;border-radius:20px;font-weight:600;white-space:nowrap}
+.badge-deep{background:var(--deep)22;color:var(--deep)}
+.badge-daily{background:var(--daily)22;color:var(--daily)}
+.badge-diary{background:var(--diary)22;color:var(--diary)}
+.badge-writing{background:var(--writing)22;color:var(--writing)}
+.card-time{font-size:11px;color:var(--text2);margin-left:auto}
+.card-body{font-size:14px;line-height:1.65;color:var(--text);white-space:pre-wrap;word-break:break-word;margin-bottom:10px;max-height:160px;overflow:hidden;position:relative}
+.card-body.expanded{max-height:none}
+.card-expand{font-size:12px;color:var(--accent);cursor:pointer;margin-bottom:8px;display:none}
+.card-tags{display:flex;flex-wrap:wrap;gap:4px;margin-bottom:8px}
+.tag{font-size:11px;padding:2px 7px;background:var(--border);border-radius:20px;color:var(--text2)}
+.card-meta{font-size:11px;color:var(--text2);margin-bottom:8px}
+.card-actions{display:flex;gap:6px;justify-content:flex-end}
+
+/* Empty */
+.empty{text-align:center;padding:60px 20px;color:var(--text2);grid-column:1/-1}
+.empty-icon{font-size:42px;margin-bottom:12px}
+
+/* Calendar */
+.cal-nav-bar{display:flex;align-items:center;gap:14px}
+.cal-nav-bar button{background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:6px 12px;border-radius:6px;cursor:pointer;font-size:14px}
+.cal-month{font-size:16px;font-weight:700}
+.cal-header-row{display:grid;grid-template-columns:repeat(7,1fr);gap:4px;margin-top:16px;margin-bottom:4px}
+.cal-day-name{text-align:center;font-size:12px;color:var(--text2);padding:4px}
+.cal-grid{display:grid;grid-template-columns:repeat(7,1fr);gap:4px}
+.cal-cell{aspect-ratio:1;border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:13px;cursor:pointer;background:var(--surface2);transition:.15s;position:relative;user-select:none}
+.cal-cell:hover{background:var(--border)}
+.cal-cell.empty{background:transparent;cursor:default}
+.cal-cell.has-entry{border:1px solid var(--diary)44}
+.cal-cell.has-entry::after{content:'';width:6px;height:6px;border-radius:50%;position:absolute;bottom:4px;left:50%;transform:translateX(-50%)}
+.cal-cell.mood-happy::after{background:#4ade80}
+.cal-cell.mood-sad::after,.cal-cell.mood-anxious::after{background:#60a5fa}
+.cal-cell.mood-calm::after{background:#94a3b8}
+.cal-cell.mood-excited::after{background:var(--diary)}
+.has-entry:not([class*="mood-"])::after{background:var(--accent)}
+
+/* Modal */
+.overlay{display:none;position:fixed;inset:0;background:#00000099;z-index:100;align-items:center;justify-content:center}
+.overlay.open{display:flex}
+.modal{background:var(--surface);border:1px solid var(--border);border-radius:16px;padding:24px;width:540px;max-width:95vw;max-height:92vh;overflow-y:auto}
+.modal-title{font-size:18px;font-weight:700;margin-bottom:20px}
+.form-group{margin-bottom:14px}
+.form-label{font-size:13px;color:var(--text2);margin-bottom:5px;display:block}
+.form-control{width:100%;background:var(--surface2);border:1px solid var(--border);border-radius:8px;padding:9px 13px;color:var(--text);font-size:14px;outline:none;font-family:inherit;transition:.15s}
+.form-control:focus{border-color:var(--accent)}
+textarea.form-control{min-height:110px;resize:vertical}
+.form-row{display:flex;gap:12px}
+.form-row .form-group{flex:1;min-width:0}
+.modal-actions{display:flex;gap:10px;justify-content:flex-end;margin-top:20px}
+
+/* Toast */
+.toast{position:fixed;bottom:20px;right:20px;background:var(--surface);border:1px solid var(--border);padding:11px 18px;border-radius:8px;font-size:14px;z-index:999;transform:translateY(80px);opacity:0;transition:.3s;pointer-events:none}
+.toast.show{transform:translateY(0);opacity:1}
+.toast.ok{border-color:var(--daily)}
+.toast.err{border-color:#f87171}
+
+@media(max-width:700px){
+  .sidebar{display:none}.stats{gap:10px}
+  .grid{grid-template-columns:1fr}
+  .modal{padding:16px}
+}
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div class="logo">🧠 记忆库</div>
+  <div class="stats">
+    <div class="stat"><div class="stat-num" id="s-total">0</div><div class="stat-label">总记忆</div></div>
+    <div class="stat"><div class="stat-num" style="color:var(--deep)" id="s-deep">0</div><div class="stat-label">深层</div></div>
+    <div class="stat"><div class="stat-num" style="color:var(--daily)" id="s-daily">0</div><div class="stat-label">日常</div></div>
+    <div class="stat"><div class="stat-num" style="color:var(--diary)" id="s-diary">0</div><div class="stat-label">日记</div></div>
+    <div class="stat"><div class="stat-num" style="color:var(--writing)" id="s-writing">0</div><div class="stat-label">写文</div></div>
+  </div>
+</div>
+
+<div class="layout">
+  <div class="sidebar">
+    <div class="sidebar-title">分类</div>
+    <div class="nav-item active" data-cat="all"     onclick="setCat('all')"><span class="dot dot-all"></span>全部<span class="nav-count" id="n-all">0</span></div>
+    <div class="nav-item"        data-cat="deep"    onclick="setCat('deep')"><span class="dot dot-deep"></span>深层记忆<span class="nav-count" id="n-deep">0</span></div>
+    <div class="nav-item"        data-cat="daily"   onclick="setCat('daily')"><span class="dot dot-daily"></span>日常记忆<span class="nav-count" id="n-daily">0</span></div>
+    <div class="nav-item"        data-cat="diary"   onclick="setCat('diary')"><span class="dot dot-diary"></span>日记<span class="nav-count" id="n-diary">0</span></div>
+    <div class="nav-item"        data-cat="writing" onclick="setCat('writing')"><span class="dot dot-writing"></span>写文进度<span class="nav-count" id="n-writing">0</span></div>
+    <div class="sidebar-divider"></div>
+    <div class="sidebar-title">视图</div>
+    <div class="nav-item" onclick="showCal()"><span>📅</span>日历视图</div>
+  </div>
+
+  <div class="main">
+    <!-- List view -->
+    <div id="view-list">
+      <div class="toolbar">
+        <input class="search" type="text" placeholder="搜索记忆内容..." id="q" oninput="onSearch(this.value)">
+        <button class="btn btn-primary" onclick="openAdd()">+ 新记忆</button>
+      </div>
+      <div class="grid" id="grid"></div>
+    </div>
+
+    <!-- Calendar view -->
+    <div id="view-cal" style="display:none">
+      <div class="toolbar">
+        <div class="cal-nav-bar">
+          <button onclick="calMove(-1)">← 上月</button>
+          <span class="cal-month" id="cal-label"></span>
+          <button onclick="calMove(1)">下月 →</button>
+        </div>
+        <button class="btn btn-ghost" onclick="hideCal()">← 返回列表</button>
+      </div>
+      <div class="cal-header-row">
+        <div class="cal-day-name">日</div><div class="cal-day-name">一</div>
+        <div class="cal-day-name">二</div><div class="cal-day-name">三</div>
+        <div class="cal-day-name">四</div><div class="cal-day-name">五</div>
+        <div class="cal-day-name">六</div>
+      </div>
+      <div class="cal-grid" id="cal-grid"></div>
+    </div>
+  </div>
+</div>
+
+<!-- Add / Edit modal -->
+<div class="overlay" id="modal" onclick="if(event.target===this)closeModal()">
+  <div class="modal">
+    <div class="modal-title" id="modal-title">新建记忆</div>
+    <div class="form-group">
+      <label class="form-label">内容 *</label>
+      <textarea class="form-control" id="f-content" placeholder="写下这条记忆..."></textarea>
+    </div>
+    <div class="form-row">
+      <div class="form-group">
+        <label class="form-label">分类 *</label>
+        <select class="form-control" id="f-cat" onchange="onCatChange()">
+          <option value="deep">深层（长期不变）</option>
+          <option value="daily">日常（3天后过期）</option>
+          <option value="diary">日记</option>
+          <option value="writing">写文进度</option>
+        </select>
+      </div>
+      <div class="form-group" id="mood-wrap" style="display:none">
+        <label class="form-label">心情</label>
+        <select class="form-control" id="f-mood">
+          <option value="">—</option>
+          <option value="happy">😊 开心</option>
+          <option value="sad">😢 难过</option>
+          <option value="calm">😌 平静</option>
+          <option value="excited">🎉 兴奋</option>
+          <option value="anxious">😰 焦虑</option>
+        </select>
+      </div>
+    </div>
+    <div class="form-group">
+      <label class="form-label">标签（逗号分隔）</label>
+      <input class="form-control" type="text" id="f-tags" placeholder="工作, 灵感, 人物">
+    </div>
+    <div class="form-group">
+      <label class="form-label">来源</label>
+      <input class="form-control" type="text" id="f-src" placeholder="来自哪个对话或场景?">
+    </div>
+    <div class="modal-actions">
+      <button class="btn btn-ghost" onclick="closeModal()">取消</button>
+      <button class="btn btn-primary" onclick="save()">保存</button>
+    </div>
+  </div>
+</div>
+
+<!-- Diary day modal -->
+<div class="overlay" id="day-modal" onclick="if(event.target===this)closeDayModal()">
+  <div class="modal">
+    <div class="modal-title" id="day-title">日记</div>
+    <div id="day-body"></div>
+    <div class="modal-actions">
+      <button class="btn btn-ghost" onclick="closeDayModal()">关闭</button>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+const CAT_LABEL = {deep:'深层',daily:'日常',diary:'日记',writing:'写文'};
+const CAT_BADGE = {deep:'badge-deep',daily:'badge-daily',diary:'badge-diary',writing:'badge-writing'};
+const MOOD_ICON = {happy:'😊',sad:'😢',calm:'😌',excited:'🎉',anxious:'😰'};
+
+let cat = 'all', kw = '', editId = null, searchTimer = null;
+let calY = new Date().getFullYear(), calM = new Date().getMonth() + 1;
+
+// ── data ─────────────────────────────────────────────────────────────────────
+async function loadStats() {
+  const {total=0,by_category:c={}} = await api('/api/stats');
+  set('s-total', total); set('s-deep', c.deep||0); set('s-daily', c.daily||0);
+  set('s-diary', c.diary||0); set('s-writing', c.writing||0);
+  set('n-all', total); set('n-deep', c.deep||0); set('n-daily', c.daily||0);
+  set('n-diary', c.diary||0); set('n-writing', c.writing||0);
+}
+
+async function loadMemories() {
+  const p = new URLSearchParams({limit:100});
+  if (cat !== 'all') p.set('category', cat);
+  if (kw) p.set('keyword', kw);
+  const items = await api('/api/memories?' + p);
+  renderGrid(items);
+}
+
+function renderGrid(items) {
+  const g = el('grid');
+  if (!items.length) {
+    g.innerHTML = '<div class="empty"><div class="empty-icon">🧠</div><div>暂无记忆</div></div>';
+    return;
+  }
+  g.innerHTML = items.map(m => {
+    const tags = m.tags?.length ? `<div class="card-tags">${m.tags.map(t=>`<span class="tag">#${esc(t)}</span>`).join('')}</div>` : '';
+    const mood = m.mood ? `<div class="card-meta">${MOOD_ICON[m.mood]||''} ${m.mood}</div>` : '';
+    const src  = m.source ? `<div class="card-meta">来源: ${esc(m.source)}</div>` : '';
+    const exp  = m.expires_at ? `<div class="card-meta" style="color:var(--diary)">过期: ${fmtDate(m.expires_at,true)}</div>` : '';
+    const long = m.content.length > 200;
+    return `<div class="card" id="card-${m.id}">
+      <div class="card-head">
+        <span class="badge ${CAT_BADGE[m.category]}">${CAT_LABEL[m.category]}</span>
+        <span class="card-time">${fmtDate(m.created_at)}</span>
+      </div>
+      <div class="card-body" id="cb-${m.id}">${esc(m.content)}</div>
+      ${long ? `<div class="card-expand" id="cx-${m.id}" onclick="expand('${m.id}')">展开全文 ▾</div>` : ''}
+      ${tags}${mood}${src}${exp}
+      <div class="card-actions">
+        <button class="btn btn-sm btn-edit" onclick="openEdit('${m.id}')">编辑</button>
+        <button class="btn btn-sm btn-del"  onclick="del('${m.id}')">删除</button>
+      </div>
+    </div>`;
+  }).join('');
+  // show expand buttons for long cards
+  items.forEach(m => {
+    if (m.content.length > 200) el(`cx-${m.id}`).style.display = 'block';
+  });
+}
+
+function expand(id) {
+  el(`cb-${id}`).classList.toggle('expanded');
+  el(`cx-${id}`).textContent = el(`cb-${id}`).classList.contains('expanded') ? '收起 ▴' : '展开全文 ▾';
+}
+
+// ── CRUD ─────────────────────────────────────────────────────────────────────
+function openAdd() {
+  editId = null;
+  el('modal-title').textContent = '新建记忆';
+  el('f-content').value = ''; el('f-cat').value = 'deep';
+  el('f-tags').value = ''; el('f-src').value = ''; el('f-mood').value = '';
+  onCatChange();
+  el('modal').classList.add('open');
+  setTimeout(() => el('f-content').focus(), 50);
+}
+
+let _cachedItems = [];
+async function openEdit(id) {
+  if (!_cachedItems.length) _cachedItems = await api('/api/memories?limit=200');
+  const m = _cachedItems.find(x => x.id === id);
+  if (!m) return;
+  editId = id;
+  el('modal-title').textContent = '编辑记忆';
+  el('f-content').value = m.content;
+  el('f-cat').value = m.category;
+  el('f-tags').value = (m.tags||[]).join(', ');
+  el('f-src').value = m.source || '';
+  el('f-mood').value = m.mood || '';
+  onCatChange();
+  el('modal').classList.add('open');
+}
+
+function closeModal() { el('modal').classList.remove('open'); }
+
+async function save() {
+  const content = el('f-content').value.trim();
+  if (!content) { toast('内容不能为空', 'err'); return; }
+  const category = el('f-cat').value;
+  const tags = el('f-tags').value.trim().split(',').map(s=>s.trim()).filter(Boolean);
+  const source = el('f-src').value.trim();
+  const mood = el('f-mood').value || null;
+  const body = {content,category,tags,source,mood};
+
+  if (editId) {
+    await api(`/api/memories/${editId}`, {method:'PUT',body});
+    toast('记忆已更新', 'ok');
+  } else {
+    await api('/api/memories', {method:'POST',body});
+    toast('记忆已保存', 'ok');
+  }
+  _cachedItems = [];
+  closeModal();
+  loadMemories();
+  loadStats();
+}
+
+async function del(id) {
+  if (!confirm('确定删除这条记忆?')) return;
+  await api(`/api/memories/${id}`, {method:'DELETE'});
+  toast('已删除', 'ok');
+  _cachedItems = [];
+  loadMemories();
+  loadStats();
+}
+
+// ── nav ───────────────────────────────────────────────────────────────────────
+function setCat(c) {
+  cat = c;
+  document.querySelectorAll('.nav-item[data-cat]').forEach(n =>
+    n.classList.toggle('active', n.dataset.cat === c)
+  );
+  loadMemories();
+}
+
+function onSearch(v) {
+  kw = v;
+  clearTimeout(searchTimer);
+  searchTimer = setTimeout(loadMemories, 280);
+}
+
+function onCatChange() {
+  el('mood-wrap').style.display = el('f-cat').value === 'diary' ? 'block' : 'none';
+}
+
+// ── calendar ──────────────────────────────────────────────────────────────────
+function showCal() {
+  el('view-list').style.display = 'none';
+  el('view-cal').style.display = 'block';
+  renderCal();
+}
+function hideCal() {
+  el('view-cal').style.display = 'none';
+  el('view-list').style.display = 'block';
+}
+function calMove(d) { calM += d; if (calM>12){calM=1;calY++} if (calM<1){calM=12;calY--} renderCal(); }
+
+async function renderCal() {
+  el('cal-label').textContent = `${calY}年${calM}月`;
+  const entries = await api(`/api/diary-calendar?year=${calY}&month=${calM}`);
+  const map = {};
+  entries.forEach(e => { (map[e.date] = map[e.date]||[]).push(e); });
+
+  const first = new Date(calY, calM-1, 1).getDay();
+  const days  = new Date(calY, calM, 0).getDate();
+  let html = '<div class="cal-cell empty"></div>'.repeat(first);
+  for (let d=1; d<=days; d++) {
+    const ds = `${calY}-${String(calM).padStart(2,'0')}-${String(d).padStart(2,'0')}`;
+    const es = map[ds];
+    const mood = es?.[0]?.mood || '';
+    html += `<div class="cal-cell ${es?'has-entry':''} ${mood?'mood-'+mood:''}" onclick="showDay('${ds}')">${d}</div>`;
+  }
+  el('cal-grid').innerHTML = html;
+}
+
+async function showDay(date) {
+  const entries = await api(`/api/diary-calendar?year=${calY}&month=${calM}`);
+  const day = entries.filter(e => e.date === date);
+  el('day-title').textContent = date + ' 的日记';
+  el('day-body').innerHTML = day.length
+    ? day.map(e => `<div style="background:var(--surface2);border-radius:8px;padding:12px;margin-bottom:8px">
+        ${e.mood ? `<div style="margin-bottom:6px;font-size:13px">${MOOD_ICON[e.mood]||''} ${e.mood}</div>` : ''}
+        <div style="font-size:14px;line-height:1.65;white-space:pre-wrap">${esc(e.preview)}${e.preview.length>=120?'…':''}</div>
+      </div>`).join('')
+    : '<p style="color:var(--text2)">当天没有日记记录</p>';
+  el('day-modal').classList.add('open');
+}
+function closeDayModal() { el('day-modal').classList.remove('open'); }
+
+// ── utils ─────────────────────────────────────────────────────────────────────
+async function api(url, opts={}) {
+  const {method='GET', body} = opts;
+  const r = await fetch(url, {
+    method,
+    headers: body ? {'Content-Type':'application/json'} : {},
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  return r.json();
+}
+const el = id => document.getElementById(id);
+const set = (id, v) => el(id).textContent = v;
+const esc = s => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+
+function fmtDate(iso, dateOnly=false) {
+  const d = new Date(iso);
+  if (dateOnly) return d.toLocaleDateString('zh-CN');
+  return `${d.getMonth()+1}/${d.getDate()} ${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}`;
+}
+
+function toast(msg, type='') {
+  const t = el('toast');
+  t.textContent = msg;
+  t.className = `toast ${type} show`;
+  setTimeout(() => t.classList.remove('show'), 2500);
+}
+
+// ── init ──────────────────────────────────────────────────────────────────────
+loadStats();
+loadMemories();
+</script>
+</body>
+</html>
