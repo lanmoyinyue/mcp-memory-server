@@ -10,7 +10,8 @@ import fs from 'fs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-// Data dir: mount a Zeabur volume to /data for persistence
+// ── Database ──────────────────────────────────────────────────────────────────
+
 const dataDir = process.env.DATA_DIR || path.join(__dirname, 'data');
 if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir, { recursive: true });
 
@@ -28,184 +29,167 @@ db.exec(`
     updated_at  TEXT NOT NULL,
     expires_at  TEXT
   );
-  CREATE INDEX IF NOT EXISTS idx_cat ON memories(category);
+  CREATE INDEX IF NOT EXISTS idx_cat     ON memories(category);
   CREATE INDEX IF NOT EXISTS idx_created ON memories(created_at);
 `);
 
-// ── helpers ──────────────────────────────────────────────────────────────────
+// ── Helpers ───────────────────────────────────────────────────────────────────
 
 const parseTags = (t) => { try { return JSON.parse(t); } catch { return []; } };
 
 const fmt = (r) => ({
-  id: r.id,
-  content: r.content,
-  category: r.category,
-  tags: parseTags(r.tags),
-  source: r.source,
-  mood: r.mood || null,
-  created_at: r.created_at,
-  updated_at: r.updated_at,
-  expires_at: r.expires_at || null,
+  id: r.id, content: r.content, category: r.category,
+  tags: parseTags(r.tags), source: r.source, mood: r.mood || null,
+  created_at: r.created_at, updated_at: r.updated_at, expires_at: r.expires_at || null,
 });
 
 const cleanExpired = () =>
   db.prepare('DELETE FROM memories WHERE expires_at IS NOT NULL AND expires_at < ?')
     .run(new Date().toISOString());
 
-// ── MCP server ────────────────────────────────────────────────────────────────
+// ── MCP factory — one McpServer instance per SSE connection ───────────────────
 
-const mcp = new McpServer({ name: 'memory-server', version: '1.0.0' });
+function createMcpServer() {
+  const mcp = new McpServer({ name: 'memory-server', version: '1.0.0' });
 
-// 1. write_memory
-mcp.tool(
-  'write_memory',
-  'Save a new memory. category: deep=永久, daily=3天过期, diary=日记, writing=写作进度',
-  {
-    content:  z.string().min(1).describe('Memory content'),
-    category: z.enum(['deep', 'daily', 'diary', 'writing']).describe('Memory layer'),
-    tags:     z.array(z.string()).optional().describe('Tags'),
-    source:   z.string().optional().describe('Source context'),
-    mood:     z.string().optional().describe('Mood for diary (happy/sad/calm/excited/anxious)'),
-  },
-  async ({ content, category, tags, source, mood }) => {
-    const id  = uuidv4();
-    const now = new Date().toISOString();
-    let expires_at = null;
-    if (category === 'daily') {
-      const exp = new Date();
-      exp.setDate(exp.getDate() + 3);
-      expires_at = exp.toISOString();
+  // 1. write_memory
+  mcp.tool(
+    'write_memory',
+    'Save a new memory. category: deep=永久, daily=3天过期, diary=日记, writing=写作进度',
+    {
+      content:  z.string().min(1).describe('Memory content'),
+      category: z.enum(['deep', 'daily', 'diary', 'writing']).describe('Memory layer'),
+      tags:     z.array(z.string()).optional().describe('Tags'),
+      source:   z.string().optional().describe('Source context'),
+      mood:     z.string().optional().describe('Mood for diary (happy/sad/calm/excited/anxious)'),
+    },
+    async ({ content, category, tags, source, mood }) => {
+      const id = uuidv4(), now = new Date().toISOString();
+      let expires_at = null;
+      if (category === 'daily') {
+        const exp = new Date(); exp.setDate(exp.getDate() + 3); expires_at = exp.toISOString();
+      }
+      db.prepare(
+        'INSERT INTO memories (id,content,category,tags,source,mood,created_at,updated_at,expires_at) VALUES (?,?,?,?,?,?,?,?,?)'
+      ).run(id, content, category, JSON.stringify(tags ?? []), source ?? '', mood ?? null, now, now, expires_at);
+      return { content: [{ type: 'text', text: `Memory saved [${category}] ID: ${id}` }] };
     }
-    db.prepare(
-      'INSERT INTO memories (id,content,category,tags,source,mood,created_at,updated_at,expires_at) VALUES (?,?,?,?,?,?,?,?,?)'
-    ).run(id, content, category, JSON.stringify(tags ?? []), source ?? '', mood ?? null, now, now, expires_at);
-    return { content: [{ type: 'text', text: `Memory saved [${category}] ID: ${id}` }] };
-  }
-);
+  );
 
-// 2. read_memories
-mcp.tool(
-  'read_memories',
-  'Read memories with optional filters by category, tags, or keyword',
-  {
-    category:        z.enum(['deep', 'daily', 'diary', 'writing']).optional(),
-    tags:            z.array(z.string()).optional().describe('Match any of these tags'),
-    keyword:         z.string().optional().describe('Keyword in content'),
-    limit:           z.number().int().min(1).max(100).optional().describe('Max results (default 20)'),
-    include_expired: z.boolean().optional().describe('Include expired daily memories'),
-  },
-  async ({ category, tags, keyword, limit = 20, include_expired = false }) => {
-    if (!include_expired) cleanExpired();
+  // 2. read_memories
+  mcp.tool(
+    'read_memories',
+    'Read memories with optional filters by category, tags, or keyword',
+    {
+      category:        z.enum(['deep', 'daily', 'diary', 'writing']).optional(),
+      tags:            z.array(z.string()).optional().describe('Match any of these tags'),
+      keyword:         z.string().optional().describe('Keyword in content'),
+      limit:           z.number().int().min(1).max(100).optional().describe('Max results (default 20)'),
+      include_expired: z.boolean().optional().describe('Include expired daily memories'),
+    },
+    async ({ category, tags, keyword, limit = 20, include_expired = false }) => {
+      if (!include_expired) cleanExpired();
+      let sql = 'SELECT * FROM memories WHERE 1=1';
+      const p = [];
+      if (!include_expired) { sql += ' AND (expires_at IS NULL OR expires_at > ?)'; p.push(new Date().toISOString()); }
+      if (category) { sql += ' AND category = ?'; p.push(category); }
+      if (keyword)  { sql += ' AND content LIKE ?'; p.push(`%${keyword}%`); }
+      sql += ' ORDER BY created_at DESC LIMIT ?';
+      p.push(limit);
+      let rows = db.prepare(sql).all(...p).map(fmt);
+      if (tags?.length) rows = rows.filter(r => tags.some(t => r.tags.includes(t)));
+      return { content: [{ type: 'text', text: rows.length ? JSON.stringify(rows, null, 2) : 'No memories found.' }] };
+    }
+  );
 
-    let sql = 'SELECT * FROM memories WHERE 1=1';
-    const p = [];
+  // 3. search_memories
+  mcp.tool(
+    'search_memories',
+    'Full-text search across all memories',
+    {
+      query:    z.string().min(1).describe('Search term'),
+      category: z.enum(['deep', 'daily', 'diary', 'writing']).optional(),
+    },
+    async ({ query, category }) => {
+      cleanExpired();
+      let sql = 'SELECT * FROM memories WHERE content LIKE ? AND (expires_at IS NULL OR expires_at > ?)';
+      const p = [`%${query}%`, new Date().toISOString()];
+      if (category) { sql += ' AND category = ?'; p.push(category); }
+      sql += ' ORDER BY created_at DESC LIMIT 20';
+      const rows = db.prepare(sql).all(...p).map(fmt);
+      return {
+        content: [{
+          type: 'text',
+          text: rows.length ? `Found ${rows.length} result(s):\n${JSON.stringify(rows, null, 2)}` : `No results for: "${query}"`,
+        }],
+      };
+    }
+  );
 
-    if (!include_expired) { sql += ' AND (expires_at IS NULL OR expires_at > ?)'; p.push(new Date().toISOString()); }
-    if (category)         { sql += ' AND category = ?';     p.push(category); }
-    if (keyword)          { sql += ' AND content LIKE ?';   p.push(`%${keyword}%`); }
+  // 4. delete_memory
+  mcp.tool(
+    'delete_memory',
+    'Delete a memory by ID',
+    { id: z.string().describe('Memory ID') },
+    async ({ id }) => {
+      const r = db.prepare('DELETE FROM memories WHERE id = ?').run(id);
+      return { content: [{ type: 'text', text: r.changes ? `Deleted ${id}.` : `Not found: ${id}` }] };
+    }
+  );
 
-    sql += ' ORDER BY created_at DESC LIMIT ?';
-    p.push(limit);
+  // 5. update_memory
+  mcp.tool(
+    'update_memory',
+    'Update content, tags, source, or mood of an existing memory',
+    {
+      id:      z.string().describe('Memory ID'),
+      content: z.string().optional(),
+      tags:    z.array(z.string()).optional(),
+      source:  z.string().optional(),
+      mood:    z.string().optional(),
+    },
+    async ({ id, content, tags, source, mood }) => {
+      const row = db.prepare('SELECT * FROM memories WHERE id = ?').get(id);
+      if (!row) return { content: [{ type: 'text', text: `Not found: ${id}` }] };
+      db.prepare('UPDATE memories SET content=?,tags=?,source=?,mood=?,updated_at=? WHERE id=?').run(
+        content ?? row.content,
+        tags !== undefined ? JSON.stringify(tags) : row.tags,
+        source ?? row.source,
+        mood !== undefined ? mood : row.mood,
+        new Date().toISOString(),
+        id
+      );
+      return { content: [{ type: 'text', text: `Updated ${id}.` }] };
+    }
+  );
 
-    let rows = db.prepare(sql).all(...p).map(fmt);
-    if (tags?.length) rows = rows.filter(r => tags.some(t => r.tags.includes(t)));
+  // 6. get_stats
+  mcp.tool(
+    'get_stats',
+    'Return statistics about the memory store',
+    {},
+    async () => {
+      cleanExpired();
+      const total = db.prepare('SELECT COUNT(*) as c FROM memories').get().c;
+      const byCat = db.prepare('SELECT category, COUNT(*) as c FROM memories GROUP BY category').all();
+      const recent = db.prepare('SELECT * FROM memories ORDER BY created_at DESC LIMIT 5').all().map(fmt);
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            total_memories: total,
+            by_category: Object.fromEntries(byCat.map(r => [r.category, r.c])),
+            recent_memories: recent,
+          }, null, 2),
+        }],
+      };
+    }
+  );
 
-    return {
-      content: [{
-        type: 'text',
-        text: rows.length ? JSON.stringify(rows, null, 2) : 'No memories found.',
-      }],
-    };
-  }
-);
+  return mcp;
+}
 
-// 3. search_memories
-mcp.tool(
-  'search_memories',
-  'Full-text search across all memories',
-  {
-    query:    z.string().min(1).describe('Search term'),
-    category: z.enum(['deep', 'daily', 'diary', 'writing']).optional(),
-  },
-  async ({ query, category }) => {
-    cleanExpired();
-    let sql = 'SELECT * FROM memories WHERE content LIKE ? AND (expires_at IS NULL OR expires_at > ?)';
-    const p = [`%${query}%`, new Date().toISOString()];
-    if (category) { sql += ' AND category = ?'; p.push(category); }
-    sql += ' ORDER BY created_at DESC LIMIT 20';
-    const rows = db.prepare(sql).all(...p).map(fmt);
-    return {
-      content: [{
-        type: 'text',
-        text: rows.length
-          ? `Found ${rows.length} result(s):\n${JSON.stringify(rows, null, 2)}`
-          : `No results for: "${query}"`,
-      }],
-    };
-  }
-);
-
-// 4. delete_memory
-mcp.tool(
-  'delete_memory',
-  'Delete a memory by ID',
-  { id: z.string().describe('Memory ID') },
-  async ({ id }) => {
-    const r = db.prepare('DELETE FROM memories WHERE id = ?').run(id);
-    return { content: [{ type: 'text', text: r.changes ? `Deleted ${id}.` : `Not found: ${id}` }] };
-  }
-);
-
-// 5. update_memory
-mcp.tool(
-  'update_memory',
-  'Update content, tags, source, or mood of an existing memory',
-  {
-    id:      z.string().describe('Memory ID'),
-    content: z.string().optional(),
-    tags:    z.array(z.string()).optional(),
-    source:  z.string().optional(),
-    mood:    z.string().optional(),
-  },
-  async ({ id, content, tags, source, mood }) => {
-    const row = db.prepare('SELECT * FROM memories WHERE id = ?').get(id);
-    if (!row) return { content: [{ type: 'text', text: `Not found: ${id}` }] };
-    db.prepare('UPDATE memories SET content=?,tags=?,source=?,mood=?,updated_at=? WHERE id=?').run(
-      content ?? row.content,
-      tags !== undefined ? JSON.stringify(tags) : row.tags,
-      source  ?? row.source,
-      mood    !== undefined ? mood : row.mood,
-      new Date().toISOString(),
-      id
-    );
-    return { content: [{ type: 'text', text: `Updated ${id}.` }] };
-  }
-);
-
-// 6. get_stats
-mcp.tool(
-  'get_stats',
-  'Return statistics about the memory store',
-  {},
-  async () => {
-    cleanExpired();
-    const total  = db.prepare('SELECT COUNT(*) as c FROM memories').get().c;
-    const byCat  = db.prepare('SELECT category, COUNT(*) as c FROM memories GROUP BY category').all();
-    const recent = db.prepare('SELECT * FROM memories ORDER BY created_at DESC LIMIT 5').all().map(fmt);
-    return {
-      content: [{
-        type: 'text',
-        text: JSON.stringify({
-          total_memories: total,
-          by_category:    Object.fromEntries(byCat.map(r => [r.category, r.c])),
-          recent_memories: recent,
-        }, null, 2),
-      }],
-    };
-  }
-);
-
-// ── Express app ───────────────────────────────────────────────────────────────
+// ── Express ───────────────────────────────────────────────────────────────────
 
 const app = express();
 
@@ -219,7 +203,6 @@ app.use((req, res, next) => {
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
-// Optional bearer-token auth (set AUTH_TOKEN env var to enable)
 const AUTH_TOKEN = process.env.AUTH_TOKEN;
 const auth = (req, res, next) => {
   if (!AUTH_TOKEN) return next();
@@ -228,7 +211,7 @@ const auth = (req, res, next) => {
   next();
 };
 
-// ── MCP SSE transport ─────────────────────────────────────────────────────────
+// ── MCP SSE — fresh McpServer per connection ──────────────────────────────────
 
 const sessions = new Map(); // sessionId → SSEServerTransport
 
@@ -241,9 +224,9 @@ app.get('/sse', auth, async (req, res) => {
   res.on('close', () => sessions.delete(transport.sessionId));
 
   try {
-    await mcp.connect(transport);
+    await createMcpServer().connect(transport);
   } catch (err) {
-    console.error('[SSE] mcp.connect error:', err);
+    console.error('[SSE] connect error:', err);
     sessions.delete(transport.sessionId);
     if (!res.headersSent) res.status(500).end();
   }
@@ -255,12 +238,12 @@ app.post('/messages', auth, async (req, res) => {
   try {
     await transport.handlePostMessage(req, res);
   } catch (err) {
-    console.error('[messages] handlePostMessage error:', err);
+    console.error('[messages] error:', err);
     if (!res.headersSent) res.status(500).json({ error: 'Internal error' });
   }
 });
 
-// ── REST API (used by the frontend) ──────────────────────────────────────────
+// ── REST API ──────────────────────────────────────────────────────────────────
 
 app.get('/health', (_req, res) => res.json({ status: 'ok' }));
 
@@ -296,8 +279,8 @@ app.put('/api/memories/:id', (req, res) => {
   db.prepare('UPDATE memories SET content=?,tags=?,source=?,mood=?,updated_at=? WHERE id=?').run(
     content ?? row.content,
     tags !== undefined ? JSON.stringify(tags) : row.tags,
-    source  ?? row.source,
-    mood    !== undefined ? mood : row.mood,
+    source ?? row.source,
+    mood !== undefined ? mood : row.mood,
     new Date().toISOString(),
     req.params.id
   );
@@ -316,7 +299,6 @@ app.get('/api/stats', (_req, res) => {
   res.json({ total, by_category: Object.fromEntries(byCat.map(r => [r.category, r.c])) });
 });
 
-// Calendar endpoint: returns diary entries for a given year/month
 app.get('/api/diary-calendar', (req, res) => {
   const { year, month } = req.query;
   const prefix = `${year}-${String(month).padStart(2, '0')}`;
@@ -328,10 +310,12 @@ app.get('/api/diary-calendar', (req, res) => {
   res.json(rows);
 });
 
-// ── Start ─────────────────────────────────────────────────────────────────────
+// ── Global error guards ───────────────────────────────────────────────────────
 
 process.on('uncaughtException',  (err) => console.error('[uncaughtException]', err));
 process.on('unhandledRejection', (err) => console.error('[unhandledRejection]', err));
+
+// ── Start ─────────────────────────────────────────────────────────────────────
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
