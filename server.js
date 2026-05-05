@@ -233,16 +233,31 @@ const auth = (req, res, next) => {
 const sessions = new Map(); // sessionId → SSEServerTransport
 
 app.get('/sse', auth, async (req, res) => {
+  // Disable nginx/caddy proxy buffering — required for SSE on Zeabur
+  res.setHeader('X-Accel-Buffering', 'no');
+
   const transport = new SSEServerTransport('/messages', res);
   sessions.set(transport.sessionId, transport);
   res.on('close', () => sessions.delete(transport.sessionId));
-  await mcp.connect(transport);
+
+  try {
+    await mcp.connect(transport);
+  } catch (err) {
+    console.error('[SSE] mcp.connect error:', err);
+    sessions.delete(transport.sessionId);
+    if (!res.headersSent) res.status(500).end();
+  }
 });
 
 app.post('/messages', auth, async (req, res) => {
   const transport = sessions.get(req.query.sessionId);
   if (!transport) return res.status(404).json({ error: 'Session not found' });
-  await transport.handlePostMessage(req, res);
+  try {
+    await transport.handlePostMessage(req, res);
+  } catch (err) {
+    console.error('[messages] handlePostMessage error:', err);
+    if (!res.headersSent) res.status(500).json({ error: 'Internal error' });
+  }
 });
 
 // ── REST API (used by the frontend) ──────────────────────────────────────────
@@ -314,6 +329,9 @@ app.get('/api/diary-calendar', (req, res) => {
 });
 
 // ── Start ─────────────────────────────────────────────────────────────────────
+
+process.on('uncaughtException',  (err) => console.error('[uncaughtException]', err));
+process.on('unhandledRejection', (err) => console.error('[unhandledRejection]', err));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
