@@ -1,5 +1,6 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import express from 'express';
 import { DatabaseSync as Database } from 'node:sqlite';
 import { v4 as uuidv4 } from 'uuid';
@@ -242,6 +243,24 @@ app.post('/messages', auth, async (req, res) => {
     if (!res.headersSent) res.status(500).json({ error: 'Internal error' });
   }
 });
+
+// ── MCP StreamableHTTP — for Claude.ai web ───────────────────────────────────
+
+app.post('/mcp', auth, async (req, res) => {
+  res.setHeader('X-Accel-Buffering', 'no');
+  const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+  try {
+    await createMcpServer().connect(transport);
+    await transport.handleRequest(req, res, req.body);
+  } catch (err) {
+    console.error('[MCP] StreamableHTTP error:', err);
+    if (!res.headersSent) res.status(500).end();
+  }
+});
+
+// GET /mcp is not used in stateless mode
+app.get('/mcp', (_req, res) => res.status(405).json({ error: 'Use POST /mcp or GET /sse' }));
+app.delete('/mcp', (_req, res) => res.status(405).json({ error: 'Stateless mode, no sessions to delete' }));
 
 // ── REST API ──────────────────────────────────────────────────────────────────
 
