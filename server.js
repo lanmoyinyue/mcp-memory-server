@@ -34,6 +34,9 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_created ON memories(created_at);
 `);
 
+// Migrate: add embedding column for existing databases
+try { db.exec('ALTER TABLE memories ADD COLUMN embedding TEXT'); } catch {}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 const parseTags = (t) => { try { return JSON.parse(t); } catch { return []; } };
@@ -47,6 +50,49 @@ const fmt = (r) => ({
 const cleanExpired = () =>
   db.prepare('DELETE FROM memories WHERE expires_at IS NOT NULL AND expires_at < ?')
     .run(new Date().toISOString());
+
+// ── Embedding & vector similarity ─────────────────────────────────────────────
+// Set VOYAGE_API_KEY env var to enable. Free at voyageai.com (200M tokens/month)
+
+async function getEmbedding(text) {
+  const apiKey = process.env.VOYAGE_API_KEY;
+  if (!apiKey) return null;
+  try {
+    const res = await fetch('https://api.voyageai.com/v1/embeddings', {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ input: [text], model: 'voyage-3-lite' }),
+    });
+    if (!res.ok) { console.error('[embed] API error', res.status, await res.text()); return null; }
+    const data = await res.json();
+    return data.data[0].embedding; // float[]
+  } catch (err) { console.error('[embed] error:', err.message); return null; }
+}
+
+function cosineSim(a, b) {
+  let dot = 0, na = 0, nb = 0;
+  for (let i = 0; i < a.length; i++) { dot += a[i]*b[i]; na += a[i]*a[i]; nb += b[i]*b[i]; }
+  const d = Math.sqrt(na) * Math.sqrt(nb);
+  return d === 0 ? 0 : dot / d;
+}
+
+// Returns top-k semantically similar memories, excluding the given id
+function findRelated(embedding, excludeId, topK = 3) {
+  if (!embedding) return [];
+  const rows = db.prepare(
+    'SELECT id,content,category,tags,source,mood,created_at,embedding FROM memories WHERE id != ? AND embedding IS NOT NULL AND (expires_at IS NULL OR expires_at > ?)'
+  ).all(excludeId, new Date().toISOString());
+  return rows
+    .map(r => { try { return { ...r, score: cosineSim(embedding, JSON.parse(r.embedding)) }; } catch { return null; } })
+    .filter(Boolean)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, topK)
+    .map(r => ({
+      id: r.id, content: r.content, category: r.category,
+      tags: parseTags(r.tags), source: r.source, created_at: r.created_at,
+      similarity: +r.score.toFixed(3),
+    }));
+}
 
 // ── MCP factory — one McpServer instance per SSE connection ───────────────────
 
@@ -70,10 +116,25 @@ function createMcpServer() {
       if (category === 'daily') {
         const exp = new Date(); exp.setDate(exp.getDate() + 3); expires_at = exp.toISOString();
       }
+      // Compute embedding and find related BEFORE inserting (so new memory is excluded)
+      const embedding = await getEmbedding(content);
+      const related = findRelated(embedding, id);
+
       db.prepare(
-        'INSERT INTO memories (id,content,category,tags,source,mood,created_at,updated_at,expires_at) VALUES (?,?,?,?,?,?,?,?,?)'
-      ).run(id, content, category, JSON.stringify(tags ?? []), source ?? '', mood ?? null, now, now, expires_at);
-      return { content: [{ type: 'text', text: `Memory saved [${category}] ID: ${id}` }] };
+        'INSERT INTO memories (id,content,category,tags,source,mood,created_at,updated_at,expires_at,embedding) VALUES (?,?,?,?,?,?,?,?,?,?)'
+      ).run(id, content, category, JSON.stringify(tags ?? []), source ?? '', mood ?? null, now, now, expires_at,
+        embedding ? JSON.stringify(embedding) : null);
+
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            saved: { id, category },
+            related_memories: related,
+            note: embedding ? `Found ${related.length} related memories.` : 'Set VOYAGE_API_KEY to enable semantic associations.',
+          }, null, 2),
+        }],
+      };
     }
   );
 
@@ -187,6 +248,39 @@ function createMcpServer() {
     }
   );
 
+  // 7. find_related — semantic vector search
+  mcp.tool(
+    'find_related',
+    'Find semantically similar memories by meaning using vector embeddings (requires VOYAGE_API_KEY)',
+    {
+      query:    z.string().min(1).describe('Concept or text to search by meaning'),
+      top_k:    z.number().int().min(1).max(10).optional().describe('Number of results (default 5)'),
+      category: z.enum(['deep', 'daily', 'diary', 'writing']).optional().describe('Limit to category'),
+    },
+    async ({ query, top_k = 5, category }) => {
+      const embedding = await getEmbedding(query);
+      if (!embedding) {
+        return { content: [{ type: 'text', text: 'Vector search unavailable: set VOYAGE_API_KEY env var. Get a free key at voyageai.com.' }] };
+      }
+      let sql = 'SELECT * FROM memories WHERE embedding IS NOT NULL AND (expires_at IS NULL OR expires_at > ?)';
+      const p = [new Date().toISOString()];
+      if (category) { sql += ' AND category = ?'; p.push(category); }
+      const rows = db.prepare(sql).all(...p);
+      const results = rows
+        .map(r => { try { return { ...r, score: cosineSim(embedding, JSON.parse(r.embedding)) }; } catch { return null; } })
+        .filter(Boolean)
+        .sort((a, b) => b.score - a.score)
+        .slice(0, top_k)
+        .map(r => ({ ...fmt(r), similarity: +r.score.toFixed(3) }));
+      return {
+        content: [{
+          type: 'text',
+          text: results.length ? JSON.stringify(results, null, 2) : `No semantic matches found for: "${query}"`,
+        }],
+      };
+    }
+  );
+
   return mcp;
 }
 
@@ -278,7 +372,7 @@ app.get('/api/memories', (req, res) => {
   res.json(db.prepare(sql).all(...p).map(fmt));
 });
 
-app.post('/api/memories', (req, res) => {
+app.post('/api/memories', async (req, res) => {
   const { content, category, tags = [], source = '', mood = null } = req.body;
   if (!content || !category) return res.status(400).json({ error: 'content and category required' });
   const id = uuidv4(), now = new Date().toISOString();
@@ -286,8 +380,10 @@ app.post('/api/memories', (req, res) => {
   if (category === 'daily') {
     const exp = new Date(); exp.setDate(exp.getDate() + 3); expires_at = exp.toISOString();
   }
-  db.prepare('INSERT INTO memories (id,content,category,tags,source,mood,created_at,updated_at,expires_at) VALUES (?,?,?,?,?,?,?,?,?)')
-    .run(id, content, category, JSON.stringify(tags), source, mood, now, now, expires_at);
+  const embedding = await getEmbedding(content);
+  db.prepare('INSERT INTO memories (id,content,category,tags,source,mood,created_at,updated_at,expires_at,embedding) VALUES (?,?,?,?,?,?,?,?,?,?)')
+    .run(id, content, category, JSON.stringify(tags), source, mood, now, now, expires_at,
+      embedding ? JSON.stringify(embedding) : null);
   res.json({ id, message: 'Memory saved' });
 });
 
