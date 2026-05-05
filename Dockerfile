@@ -7,10 +7,10 @@ RUN npm ci --omit=dev
 
 COPY . .
 
-RUN mkdir -p /data
+RUN mkdir -p /app/data
 
 ENV PORT=3000
-ENV DATA_DIR=/data
+ENV DATA_DIR=/app/data
 
 EXPOSE 3000
 
