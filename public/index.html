@@ -7,10 +7,10 @@
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 :root{
-  --bg:#0f0f13;--surface:#1a1a24;--surface2:#22222f;--border:#2d2d3f;
-  --text:#e8e8f0;--text2:#8888aa;
-  --accent:#7c6af5;--accent2:#5c4ae8;
-  --deep:#a78bfa;--daily:#4ade80;--diary:#fbbf24;--writing:#f472b6;
+  --bg:#FEF5F8;--surface:#FFF0F5;--surface2:#FFE4EF;--border:rgba(225,180,200,0.5);
+  --text:#3D2535;--text2:#9A7080;
+  --accent:#C4607E;--accent2:#A84A68;
+  --deep:#9B7EC4;--daily:#6ABD8A;--diary:#E8956A;--writing:#E06898;
 }
 body{background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,sans-serif;min-height:100vh}
 
@@ -48,13 +48,13 @@ body{background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,
 .btn-primary{background:var(--accent);color:#fff}.btn-primary:hover{background:var(--accent2)}
 .btn-ghost{background:var(--surface2);color:var(--text2);border:1px solid var(--border)}.btn-ghost:hover{color:var(--text)}
 .btn-sm{padding:5px 10px;font-size:12px}
-.btn-del{background:#f87171 14;color:#f87171;border:1px solid #f8717133}.btn-del:hover{background:#f8717133}
+.btn-del{background:rgba(248,113,113,0.08);color:#d46060;border:1px solid rgba(248,113,113,0.25)}.btn-del:hover{background:rgba(248,113,113,0.18)}
 .btn-edit{background:var(--accent)14;color:var(--accent);border:1px solid var(--accent)33}.btn-edit:hover{background:var(--accent)33}
 
 /* Cards */
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(290px,1fr));gap:14px}
 .card{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:16px;transition:.15s}
-.card:hover{border-color:var(--accent)44;box-shadow:0 4px 20px #7c6af511}
+.card:hover{border-color:var(--accent)44;box-shadow:0 4px 20px rgba(196,96,126,0.10)}
 .card-head{display:flex;align-items:center;gap:8px;margin-bottom:10px}
 .badge{font-size:11px;padding:3px 8px;border-radius:20px;font-weight:600;white-space:nowrap}
 .badge-deep{background:var(--deep)22;color:var(--deep)}
@@ -93,7 +93,7 @@ body{background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,
 .has-entry:not([class*="mood-"])::after{background:var(--accent)}
 
 /* Modal */
-.overlay{display:none;position:fixed;inset:0;background:#00000099;z-index:100;align-items:center;justify-content:center}
+.overlay{display:none;position:fixed;inset:0;background:rgba(61,37,53,0.45);backdrop-filter:blur(4px);z-index:100;align-items:center;justify-content:center}
 .overlay.open{display:flex}
 .modal{background:var(--surface);border:1px solid var(--border);border-radius:16px;padding:24px;width:540px;max-width:95vw;max-height:92vh;overflow-y:auto}
 .modal-title{font-size:18px;font-weight:700;margin-bottom:20px}
@@ -109,8 +109,8 @@ textarea.form-control{min-height:110px;resize:vertical}
 /* Toast */
 .toast{position:fixed;bottom:20px;right:20px;background:var(--surface);border:1px solid var(--border);padding:11px 18px;border-radius:8px;font-size:14px;z-index:999;transform:translateY(80px);opacity:0;transition:.3s;pointer-events:none}
 .toast.show{transform:translateY(0);opacity:1}
-.toast.ok{border-color:var(--daily)}
-.toast.err{border-color:#f87171}
+.toast.ok{border-color:var(--daily);background:rgba(106,189,138,0.1)}
+.toast.err{border-color:#d46060;background:rgba(212,96,96,0.08)}
 
 @media(max-width:700px){
   .sidebar{display:none}.stats{gap:10px}
@@ -122,7 +122,7 @@ textarea.form-control{min-height:110px;resize:vertical}
 <body>
 
 <div class="header">
-  <div class="logo">🧠 记忆库</div>
+  <div class="logo">🌸 记忆库</div>
   <div class="stats">
     <div class="stat"><div class="stat-num" id="s-total">0</div><div class="stat-label">总记忆</div></div>
     <div class="stat"><div class="stat-num" style="color:var(--deep)" id="s-deep">0</div><div class="stat-label">深层</div></div>
