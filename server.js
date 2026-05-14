@@ -102,10 +102,10 @@ function createMcpServer() {
   // 1. write_memory
   mcp.tool(
     'write_memory',
-    'Save a new memory. category: deep=永久, daily=3天过期, diary=日记, writing=写作进度',
+    'Save a new memory. category: deep=永久, daily=3天过期, diary=日记, writing=写作进度, anchor=情绪锚(永久), 也可自定义分类名',
     {
       content:  z.string().min(1).describe('Memory content'),
-      category: z.enum(['deep', 'daily', 'diary', 'writing']).describe('Memory layer'),
+      category: z.string().describe('Memory layer: deep/daily/diary/writing/anchor or any custom category'),
       tags:     z.array(z.string()).optional().describe('Tags'),
       source:   z.string().optional().describe('Source context'),
       mood:     z.string().optional().describe('Mood for diary (happy/sad/calm/excited/anxious)'),
@@ -116,6 +116,7 @@ function createMcpServer() {
       if (category === 'daily') {
         const exp = new Date(); exp.setDate(exp.getDate() + 3); expires_at = exp.toISOString();
       }
+      // deep/anchor and custom categories never expire
       // Compute embedding and find related BEFORE inserting (so new memory is excluded)
       const embedding = await getEmbedding(content);
       const related = findRelated(embedding, id);
@@ -143,7 +144,7 @@ function createMcpServer() {
     'read_memories',
     'Read memories with optional filters by category, tags, or keyword',
     {
-      category:        z.enum(['deep', 'daily', 'diary', 'writing']).optional(),
+      category:        z.string().optional().describe('Filter by category (deep/daily/diary/writing/anchor or custom)'),
       tags:            z.array(z.string()).optional().describe('Match any of these tags'),
       keyword:         z.string().optional().describe('Keyword in content'),
       limit:           z.number().int().min(1).max(100).optional().describe('Max results (default 20)'),
@@ -170,7 +171,7 @@ function createMcpServer() {
     'Full-text search across all memories',
     {
       query:    z.string().min(1).describe('Search term'),
-      category: z.enum(['deep', 'daily', 'diary', 'writing']).optional(),
+      category: z.string().optional().describe('Filter by category'),
     },
     async ({ query, category }) => {
       cleanExpired();
@@ -255,7 +256,7 @@ function createMcpServer() {
     {
       query:    z.string().min(1).describe('Concept or text to search by meaning'),
       top_k:    z.number().int().min(1).max(10).optional().describe('Number of results (default 5)'),
-      category: z.enum(['deep', 'daily', 'diary', 'writing']).optional().describe('Limit to category'),
+      category: z.string().optional().describe('Limit to category'),
     },
     async ({ query, top_k = 5, category }) => {
       const embedding = await getEmbedding(query);

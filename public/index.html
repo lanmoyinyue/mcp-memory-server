@@ -10,7 +10,7 @@
   --bg:#F0E6D6;--surface:#FDFAF5;--surface2:#EDE0CE;--border:rgba(195,172,148,0.35);
   --text:#3A2818;--text2:#A08870;
   --accent:#C4784A;--accent2:#A86030;
-  --deep:#8B7DB5;--daily:#6AA878;--diary:#D4884E;--writing:#C05050;
+  --deep:#8B7DB5;--daily:#6AA878;--diary:#D4884E;--writing:#C05050;--anchor:#5B9BB5;
 }
 body{background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,sans-serif;min-height:100vh}
 
@@ -33,7 +33,7 @@ body{background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,
 .nav-item.active{background:#F5DDD0;color:var(--text);font-weight:500}
 .dot{width:8px;height:8px;border-radius:50%;flex-shrink:0}
 .dot-all{background:var(--accent)}.dot-deep{background:var(--deep)}
-.dot-daily{background:var(--daily)}.dot-diary{background:var(--diary)}.dot-writing{background:var(--writing)}
+.dot-daily{background:var(--daily)}.dot-diary{background:var(--diary)}.dot-writing{background:var(--writing)}.dot-anchor{background:var(--anchor)}
 .nav-count{margin-left:auto;font-size:11px;background:rgba(195,172,148,0.35);padding:2px 7px;border-radius:10px;color:var(--text2)}
 .sidebar-divider{height:1px;background:var(--border);margin:12px 0}
 
@@ -62,6 +62,8 @@ body{background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,
 .badge-daily{background:rgba(106,168,120,0.15);color:#4A8A5C}
 .badge-diary{background:rgba(212,136,78,0.15);color:#B06830}
 .badge-writing{background:rgba(192,80,80,0.15);color:#9A4040}
+.badge-anchor{background:rgba(91,155,181,0.15);color:#3A7A99}
+.badge-custom{background:rgba(160,136,112,0.15);color:#7A6050}
 .card-time{font-size:11px;color:var(--text2);margin-left:auto}
 .card-body{font-size:14px;line-height:1.7;color:var(--text);white-space:pre-wrap;word-break:break-word;margin-bottom:10px;max-height:160px;overflow:hidden;position:relative}
 .card-body.expanded{max-height:none}
@@ -130,17 +132,20 @@ textarea.form-control{min-height:110px;resize:vertical}
     <div class="stat"><div class="stat-num" style="color:var(--daily)" id="s-daily">0</div><div class="stat-label">日常</div></div>
     <div class="stat"><div class="stat-num" style="color:var(--diary)" id="s-diary">0</div><div class="stat-label">日记</div></div>
     <div class="stat"><div class="stat-num" style="color:var(--writing)" id="s-writing">0</div><div class="stat-label">写文</div></div>
+    <div class="stat"><div class="stat-num" style="color:var(--anchor)" id="s-anchor">0</div><div class="stat-label">情绪锚</div></div>
   </div>
 </div>
 
 <div class="layout">
   <div class="sidebar">
     <div class="sidebar-title">分类</div>
-    <div class="nav-item active" data-cat="all"     onclick="setCat('all')"><span class="dot dot-all"></span>全部<span class="nav-count" id="n-all">0</span></div>
-    <div class="nav-item"        data-cat="deep"    onclick="setCat('deep')"><span class="dot dot-deep"></span>深层记忆<span class="nav-count" id="n-deep">0</span></div>
-    <div class="nav-item"        data-cat="daily"   onclick="setCat('daily')"><span class="dot dot-daily"></span>日常记忆<span class="nav-count" id="n-daily">0</span></div>
-    <div class="nav-item"        data-cat="diary"   onclick="setCat('diary')"><span class="dot dot-diary"></span>日记<span class="nav-count" id="n-diary">0</span></div>
-    <div class="nav-item"        data-cat="writing" onclick="setCat('writing')"><span class="dot dot-writing"></span>写文进度<span class="nav-count" id="n-writing">0</span></div>
+    <div class="nav-item active" data-cat="all" onclick="setCat('all')"><span class="dot dot-all"></span>全部<span class="nav-count" id="n-all">0</span></div>
+    <div class="nav-item" data-cat="deep"    onclick="setCat('deep')"><span class="dot dot-deep"></span>深层记忆<span class="nav-count" id="n-deep">0</span></div>
+    <div class="nav-item" data-cat="daily"   onclick="setCat('daily')"><span class="dot dot-daily"></span>日常记忆<span class="nav-count" id="n-daily">0</span></div>
+    <div class="nav-item" data-cat="diary"   onclick="setCat('diary')"><span class="dot dot-diary"></span>日记<span class="nav-count" id="n-diary">0</span></div>
+    <div class="nav-item" data-cat="writing" onclick="setCat('writing')"><span class="dot dot-writing"></span>写文进度<span class="nav-count" id="n-writing">0</span></div>
+    <div class="nav-item" data-cat="anchor"  onclick="setCat('anchor')"><span class="dot dot-anchor"></span>情绪锚<span class="nav-count" id="n-anchor">0</span></div>
+    <div id="custom-cats"></div>
     <div class="sidebar-divider"></div>
     <div class="sidebar-title">视图</div>
     <div class="nav-item" onclick="showCal()"><span>📅</span>日历视图</div>
@@ -187,13 +192,15 @@ textarea.form-control{min-height:110px;resize:vertical}
     </div>
     <div class="form-row">
       <div class="form-group">
-        <label class="form-label">分类 *</label>
-        <select class="form-control" id="f-cat" onchange="onCatChange()">
+        <label class="form-label">分类 * <span style="font-size:11px;color:var(--text2)">（可直接输入新分类名）</span></label>
+        <input class="form-control" id="f-cat" list="cat-list" placeholder="选择或输入分类..." oninput="onCatChange()" onchange="onCatChange()">
+        <datalist id="cat-list">
           <option value="deep">深层（长期不变）</option>
           <option value="daily">日常（3天后过期）</option>
           <option value="diary">日记</option>
           <option value="writing">写文进度</option>
-        </select>
+          <option value="anchor">情绪锚</option>
+        </datalist>
       </div>
       <div class="form-group" id="mood-wrap" style="display:none">
         <label class="form-label">心情</label>
@@ -236,9 +243,11 @@ textarea.form-control{min-height:110px;resize:vertical}
 <div class="toast" id="toast"></div>
 
 <script>
-const CAT_LABEL = {deep:'深层',daily:'日常',diary:'日记',writing:'写文'};
-const CAT_BADGE = {deep:'badge-deep',daily:'badge-daily',diary:'badge-diary',writing:'badge-writing'};
+const CAT_LABEL = {deep:'深层',daily:'日常',diary:'日记',writing:'写文',anchor:'情绪锚'};
+const CAT_BADGE = {deep:'badge-deep',daily:'badge-daily',diary:'badge-diary',writing:'badge-writing',anchor:'badge-anchor'};
 const MOOD_ICON = {happy:'😊',sad:'😢',calm:'😌',excited:'🎉',anxious:'😰'};
+const getCatLabel = c => CAT_LABEL[c] || c;
+const getCatBadge = c => CAT_BADGE[c] || 'badge-custom';
 
 let cat = 'all', kw = '', editId = null, searchTimer = null;
 let calY = new Date().getFullYear(), calM = new Date().getMonth() + 1;
@@ -247,9 +256,27 @@ let calY = new Date().getFullYear(), calM = new Date().getMonth() + 1;
 async function loadStats() {
   const {total=0,by_category:c={}} = await api('/api/stats');
   set('s-total', total); set('s-deep', c.deep||0); set('s-daily', c.daily||0);
-  set('s-diary', c.diary||0); set('s-writing', c.writing||0);
+  set('s-diary', c.diary||0); set('s-writing', c.writing||0); set('s-anchor', c.anchor||0);
   set('n-all', total); set('n-deep', c.deep||0); set('n-daily', c.daily||0);
-  set('n-diary', c.diary||0); set('n-writing', c.writing||0);
+  set('n-diary', c.diary||0); set('n-writing', c.writing||0); set('n-anchor', c.anchor||0);
+
+  // 动态渲染自定义分类
+  const fixed = new Set(['deep','daily','diary','writing','anchor']);
+  const customCats = Object.entries(c).filter(([k]) => !fixed.has(k));
+  const container = el('custom-cats');
+  container.innerHTML = customCats.map(([k, cnt]) =>
+    `<div class="nav-item" data-cat="${k}" onclick="setCat('${k}')"><span class="dot" style="background:var(--text2)"></span>${k}<span class="nav-count">${cnt}</span></div>`
+  ).join('');
+
+  // 把自定义分类也加进 datalist
+  const datalist = el('cat-list');
+  customCats.forEach(([k]) => {
+    if (!datalist.querySelector(`option[value="${k}"]`)) {
+      const opt = document.createElement('option');
+      opt.value = k;
+      datalist.appendChild(opt);
+    }
+  });
 }
 
 async function loadMemories() {
@@ -274,7 +301,7 @@ function renderGrid(items) {
     const long = m.content.length > 200;
     return `<div class="card" id="card-${m.id}">
       <div class="card-head">
-        <span class="badge ${CAT_BADGE[m.category]}">${CAT_LABEL[m.category]}</span>
+        <span class="badge ${getCatBadge(m.category)}">${getCatLabel(m.category)}</span>
         <span class="card-time">${fmtDate(m.created_at)}</span>
       </div>
       <div class="card-body" id="cb-${m.id}">${esc(m.content)}</div>
@@ -302,7 +329,8 @@ function openAdd() {
   editId = null;
   el('modal-title').textContent = '新建记忆';
   el('f-content').value = ''; el('f-cat').value = 'deep';
-  el('f-tags').value = ''; el('f-src').value = ''; el('f-mood').value = '';
+  el('f-tags').value = ''; el('f-src').value = '';
+  if (el('f-mood')) el('f-mood').value = '';
   onCatChange();
   el('modal').classList.add('open');
   setTimeout(() => el('f-content').focus(), 50);
@@ -375,6 +403,8 @@ function onSearch(v) {
 function onCatChange() {
   el('mood-wrap').style.display = el('f-cat').value === 'diary' ? 'block' : 'none';
 }
+
+// REST API POST already accepts any category string — no extra changes needed
 
 // ── calendar ──────────────────────────────────────────────────────────────────
 function showCal() {
