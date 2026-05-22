@@ -302,8 +302,9 @@ app.use(express.static(path.join(__dirname, 'public')));
 const AUTH_TOKEN = process.env.AUTH_TOKEN;
 const auth = (req, res, next) => {
   if (!AUTH_TOKEN) return next();
-  const token = req.headers.authorization?.replace('Bearer ', '').trim();
-  if (token !== AUTH_TOKEN) return res.status(401).json({ error: 'Unauthorized' });
+  const headerToken = req.headers.authorization?.replace('Bearer ', '').trim();
+  const queryToken = req.query.token;
+  if (headerToken !== AUTH_TOKEN && queryToken !== AUTH_TOKEN) return res.status(401).json({ error: 'Unauthorized' });
   next();
 };
 
