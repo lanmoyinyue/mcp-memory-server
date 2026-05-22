@@ -426,6 +426,86 @@ app.get('/api/diary-calendar', auth, (req, res) => {
   res.json(rows);
 });
 
+// ── GitHub Backup ─────────────────────────────────────────────────────────────
+
+const BACKUP_REPO  = process.env.BACKUP_REPO  || 'lanmoyinyue/mcp-memory-server';
+const BACKUP_PATH  = 'backups/memories.jsonl';
+const BACKUP_TOKEN = process.env.BACKUP_GITHUB_TOKEN;
+
+async function ghRequest(method, path, body) {
+  const res = await fetch(`https://api.github.com/repos/${BACKUP_REPO}/contents/${path}`, {
+    method,
+    headers: {
+      'Authorization': `Bearer ${BACKUP_TOKEN}`,
+      'Content-Type': 'application/json',
+      'User-Agent': 'mcp-memory-server',
+      'Accept': 'application/vnd.github+json',
+    },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  return res;
+}
+
+async function runBackup() {
+  if (!BACKUP_TOKEN) return;
+  try {
+    const rows = db.prepare('SELECT * FROM memories').all().map(fmt);
+    const content = rows.map(r => JSON.stringify(r)).join('\n');
+    const contentB64 = Buffer.from(content).toString('base64');
+
+    // 查现有文件的 sha（更新时必须带上）
+    let sha = null;
+    const existing = await ghRequest('GET', BACKUP_PATH);
+    if (existing.ok) sha = (await existing.json()).sha;
+
+    await ghRequest('PUT', BACKUP_PATH, {
+      message: `backup: ${new Date().toISOString().slice(0, 10)} (${rows.length} memories)`,
+      content: contentB64,
+      ...(sha ? { sha } : {}),
+    });
+    console.log(`[backup] ${rows.length} memories backed up to GitHub`);
+  } catch (e) {
+    console.error('[backup] failed:', e.message);
+  }
+}
+
+async function autoRestore() {
+  if (!BACKUP_TOKEN) return;
+  const count = db.prepare('SELECT COUNT(*) as c FROM memories').get().c;
+  if (count > 0) return;
+  try {
+    const r = await ghRequest('GET', BACKUP_PATH);
+    if (!r.ok) return;
+    const data = await r.json();
+    const content = Buffer.from(data.content.replace(/\n/g, ''), 'base64').toString('utf-8');
+    const lines = content.split('\n').filter(l => l.trim());
+    let restored = 0;
+    for (const line of lines) {
+      const m = JSON.parse(line);
+      const exists = db.prepare('SELECT id FROM memories WHERE id = ?').get(m.id);
+      if (!exists) {
+        db.prepare('INSERT INTO memories (id,content,category,tags,source,mood,created_at,updated_at,expires_at) VALUES (?,?,?,?,?,?,?,?,?)')
+          .run(m.id, m.content, m.category, JSON.stringify(m.tags || []), m.source || '', m.mood, m.created_at, m.updated_at, m.expires_at || null);
+        restored++;
+      }
+    }
+    console.log(`[backup] auto-restored ${restored} memories from GitHub`);
+  } catch (e) {
+    console.error('[backup] auto-restore failed:', e.message);
+  }
+}
+
+// 每24小时自动备份，启动30秒后先跑一次
+setTimeout(() => { runBackup(); setInterval(runBackup, 24 * 60 * 60 * 1000); }, 30_000);
+// 启动时若 DB 为空则自动从 GitHub 恢复
+autoRestore();
+
+// 手动触发端点
+app.post('/api/backup/run', auth, async (_req, res) => {
+  try { await runBackup(); res.json({ ok: true }); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // ── Global error guards ───────────────────────────────────────────────────────
 
 process.on('uncaughtException',  (err) => console.error('[uncaughtException]', err));
@@ -439,4 +519,5 @@ app.listen(PORT, () => {
   console.log(`MCP SSE:   http://localhost:${PORT}/sse`);
   console.log(`Frontend:  http://localhost:${PORT}`);
   if (AUTH_TOKEN) console.log('Auth: Bearer token enabled');
+  if (BACKUP_TOKEN) console.log('Backup: GitHub auto-backup enabled');
 });
