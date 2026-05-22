@@ -511,7 +511,9 @@ function toast(msg, type='') {
 }
 
 // ── init ──────────────────────────────────────────────────────────────────────
-if (getToken()) { loadStats(); loadMemories(); } else { showAuth(); }
+document.addEventListener('DOMContentLoaded', () => {
+  if (getToken()) { loadStats(); loadMemories(); } else { showAuth(); }
+});
 </script>
 
 <div id="auth-overlay" class="auth-overlay">
