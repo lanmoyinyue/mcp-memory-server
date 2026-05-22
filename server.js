@@ -361,7 +361,7 @@ app.delete('/mcp', (_req, res) => res.status(405).json({ error: 'Stateless mode,
 
 app.get('/health', (_req, res) => res.json({ status: 'ok' }));
 
-app.get('/api/memories', (req, res) => {
+app.get('/api/memories', auth, (req, res) => {
   cleanExpired();
   const { category, keyword, limit = 50 } = req.query;
   let sql = 'SELECT * FROM memories WHERE (expires_at IS NULL OR expires_at > ?)';
@@ -373,7 +373,7 @@ app.get('/api/memories', (req, res) => {
   res.json(db.prepare(sql).all(...p).map(fmt));
 });
 
-app.post('/api/memories', async (req, res) => {
+app.post('/api/memories', auth, async (req, res) => {
   const { content, category, tags = [], source = '', mood = null } = req.body;
   if (!content || !category) return res.status(400).json({ error: 'content and category required' });
   const id = uuidv4(), now = new Date().toISOString();
@@ -388,7 +388,7 @@ app.post('/api/memories', async (req, res) => {
   res.json({ id, message: 'Memory saved' });
 });
 
-app.put('/api/memories/:id', (req, res) => {
+app.put('/api/memories/:id', auth, (req, res) => {
   const row = db.prepare('SELECT * FROM memories WHERE id = ?').get(req.params.id);
   if (!row) return res.status(404).json({ error: 'Not found' });
   const { content, tags, source, mood } = req.body;
@@ -403,19 +403,19 @@ app.put('/api/memories/:id', (req, res) => {
   res.json({ message: 'Updated' });
 });
 
-app.delete('/api/memories/:id', (req, res) => {
+app.delete('/api/memories/:id', auth, (req, res) => {
   const r = db.prepare('DELETE FROM memories WHERE id = ?').run(req.params.id);
   res.json({ deleted: r.changes > 0 });
 });
 
-app.get('/api/stats', (_req, res) => {
+app.get('/api/stats', auth, (_req, res) => {
   cleanExpired();
   const total = db.prepare('SELECT COUNT(*) as c FROM memories').get().c;
   const byCat = db.prepare('SELECT category, COUNT(*) as c FROM memories GROUP BY category').all();
   res.json({ total, by_category: Object.fromEntries(byCat.map(r => [r.category, r.c])) });
 });
 
-app.get('/api/diary-calendar', (req, res) => {
+app.get('/api/diary-calendar', auth, (req, res) => {
   const { year, month } = req.query;
   const prefix = `${year}-${String(month).padStart(2, '0')}`;
   const rows = db.prepare(`

@@ -120,6 +120,17 @@ textarea.form-control{min-height:110px;resize:vertical}
   .grid{grid-template-columns:1fr}
   .modal{padding:16px}
 }
+/* Auth overlay */
+.auth-overlay{display:none;position:fixed;inset:0;background:rgba(58,40,24,0.6);z-index:9999;align-items:center;justify-content:center}
+.auth-overlay.show{display:flex}
+.auth-box{background:var(--surface);border-radius:14px;padding:28px 24px;width:300px;max-width:90vw;box-shadow:0 8px 32px rgba(0,0,0,0.2)}
+.auth-box h2{font-size:15px;font-weight:600;margin-bottom:6px;color:var(--text)}
+.auth-box p{font-size:12px;color:var(--text2);margin-bottom:16px}
+.auth-box input{width:100%;padding:9px 12px;border:1px solid var(--border);border-radius:8px;font-size:14px;background:var(--bg);color:var(--text);outline:none}
+.auth-box input:focus{border-color:var(--accent)}
+.auth-btn{margin-top:12px;width:100%;padding:9px;background:var(--accent);color:#fff;border:none;border-radius:8px;cursor:pointer;font-size:14px;font-weight:500}
+.auth-btn:hover{background:var(--accent2)}
+.auth-err{margin-top:8px;font-size:12px;color:var(--writing);display:none}
 </style>
 </head>
 <body>
@@ -450,14 +461,36 @@ async function showDay(date) {
 }
 function closeDayModal() { el('day-modal').classList.remove('open'); }
 
+// ── auth ──────────────────────────────────────────────────────────────────────
+const TOKEN_KEY = 'memory-auth-token';
+const getToken = () => localStorage.getItem(TOKEN_KEY) || '';
+const saveToken = t => localStorage.setItem(TOKEN_KEY, t);
+
+function showAuth() { el('auth-overlay').classList.add('show'); el('auth-input').focus(); }
+function hideAuth() { el('auth-overlay').classList.remove('show'); }
+
+async function submitAuth() {
+  const token = el('auth-input').value.trim();
+  if (!token) return;
+  const r = await fetch('/api/stats', { headers: { 'Authorization': `Bearer ${token}` } });
+  if (r.ok) {
+    saveToken(token);
+    hideAuth();
+    loadStats();
+    loadMemories();
+  } else {
+    el('auth-err').style.display = 'block';
+  }
+}
+
 // ── utils ─────────────────────────────────────────────────────────────────────
 async function api(url, opts={}) {
   const {method='GET', body} = opts;
-  const r = await fetch(url, {
-    method,
-    headers: body ? {'Content-Type':'application/json'} : {},
-    body: body ? JSON.stringify(body) : undefined,
-  });
+  const token = getToken();
+  const headers = body ? {'Content-Type':'application/json'} : {};
+  if (token) headers['Authorization'] = `Bearer ${token}`;
+  const r = await fetch(url, { method, headers, body: body ? JSON.stringify(body) : undefined });
+  if (r.status === 401) { showAuth(); throw new Error('Unauthorized'); }
   return r.json();
 }
 const el = id => document.getElementById(id);
@@ -478,8 +511,17 @@ function toast(msg, type='') {
 }
 
 // ── init ──────────────────────────────────────────────────────────────────────
-loadStats();
-loadMemories();
+if (getToken()) { loadStats(); loadMemories(); } else { showAuth(); }
 </script>
+
+<div id="auth-overlay" class="auth-overlay">
+  <div class="auth-box">
+    <h2>记忆库</h2>
+    <p>输入访问令牌（即 AUTH_TOKEN）</p>
+    <input id="auth-input" type="password" placeholder="令牌" autocomplete="current-password" onkeydown="if(event.key==='Enter')submitAuth()">
+    <button class="auth-btn" onclick="submitAuth()">进入</button>
+    <div id="auth-err" class="auth-err">令牌不对，再试一次</div>
+  </div>
+</div>
 </body>
 </html>
