@@ -460,7 +460,7 @@ async function runBackup() {
     if (existing.ok) sha = (await existing.json()).sha;
 
     await ghRequest('PUT', BACKUP_PATH, {
-      message: `backup: ${new Date().toISOString().slice(0, 10)} (${rows.length} memories)`,
+      message: `backup: ${new Date().toISOString().slice(0, 10)} (${rows.length} memories) [zeabur skip]`,
       content: contentB64,
       ...(sha ? { sha } : {}),
     });
@@ -472,8 +472,6 @@ async function runBackup() {
 
 async function autoRestore() {
   if (!BACKUP_TOKEN) return;
-  const count = db.prepare('SELECT COUNT(*) as c FROM memories').get().c;
-  if (count > 0) return;
   try {
     const r = await ghRequest('GET', BACKUP_PATH);
     if (!r.ok) return;
