@@ -282,6 +282,70 @@ function createMcpServer() {
     }
   );
 
+  // 8. hybrid_search — keyword + semantic, fused with RRF (best default search)
+  mcp.tool(
+    'hybrid_search',
+    'Hybrid search: runs keyword (full-text) and semantic (vector) search together, fuses and re-ranks them with Reciprocal Rank Fusion. Best default search. Falls back to keyword-only if VOYAGE_API_KEY is unset.',
+    {
+      query:    z.string().min(1).describe('Search term or concept'),
+      category: z.string().optional().describe('Filter by category'),
+      limit:    z.number().int().min(1).max(20).optional().describe('Number of results (default 10)'),
+    },
+    async ({ query, category, limit = 10 }) => {
+      cleanExpired();
+      const now = new Date().toISOString();
+
+      // ── keyword half ──
+      let kSql = 'SELECT * FROM memories WHERE content LIKE ? AND (expires_at IS NULL OR expires_at > ?)';
+      const kp = [`%${query}%`, now];
+      if (category) { kSql += ' AND category = ?'; kp.push(category); }
+      kSql += ' ORDER BY created_at DESC LIMIT 50';
+      const keywordRows = db.prepare(kSql).all(...kp);
+
+      // ── semantic half ──
+      let semanticRows = [];
+      const embedding = await getEmbedding(query);
+      if (embedding) {
+        let sSql = 'SELECT * FROM memories WHERE embedding IS NOT NULL AND (expires_at IS NULL OR expires_at > ?)';
+        const sp = [now];
+        if (category) { sSql += ' AND category = ?'; sp.push(category); }
+        semanticRows = db.prepare(sSql).all(...sp)
+          .map(r => { try { return { ...r, score: cosineSim(embedding, JSON.parse(r.embedding)) }; } catch { return null; } })
+          .filter(Boolean)
+          .sort((a, b) => b.score - a.score)
+          .slice(0, 50);
+      }
+
+      // ── Reciprocal Rank Fusion ──
+      const K = 60;
+      const fuse = new Map(); // id -> { row, rrf }
+      keywordRows.forEach((r, i) => {
+        const e = fuse.get(r.id) || { row: r, rrf: 0 };
+        e.rrf += 1 / (K + i + 1);
+        fuse.set(r.id, e);
+      });
+      semanticRows.forEach((r, i) => {
+        const e = fuse.get(r.id) || { row: r, rrf: 0 };
+        e.rrf += 1 / (K + i + 1);
+        fuse.set(r.id, e);
+      });
+
+      const fused = [...fuse.values()]
+        .sort((a, b) => b.rrf - a.rrf)
+        .slice(0, limit)
+        .map(e => ({ ...fmt(e.row), rrf_score: +e.rrf.toFixed(4) }));
+
+      return {
+        content: [{
+          type: 'text',
+          text: fused.length
+            ? `Found ${fused.length} result(s) (keyword+semantic fused):\n${JSON.stringify(fused, null, 2)}`
+            : `No results for: "${query}"`,
+        }],
+      };
+    }
+  );
+
   return mcp;
 }
 
