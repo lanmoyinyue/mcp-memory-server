@@ -491,6 +491,101 @@ app.get('/api/diary-calendar', auth, (req, res) => {
   res.json(rows);
 });
 
+// ── Read-only search endpoints (for reflex hook) ──────────────────────────────
+// Mirror the MCP find_related / hybrid_search tools but expose them as REST so
+// external hooks (CC UserPromptSubmit hook) can POST queries without speaking
+// MCP protocol. **Read-only by design** — no write/delete/update here.
+
+app.post('/api/search/find_related', auth, async (req, res) => {
+  try {
+    const { query, top_k = 5, category } = req.body || {};
+    if (!query || typeof query !== 'string') {
+      return res.status(400).json({ error: 'query (non-empty string) required' });
+    }
+    const k = Math.max(1, Math.min(20, parseInt(top_k) || 5));
+
+    const embedding = await getEmbedding(query);
+    if (!embedding) {
+      return res.json({ results: [], count: 0, note: 'Embedding unavailable (set VOYAGE_API_KEY)' });
+    }
+
+    let sql = 'SELECT * FROM memories WHERE embedding IS NOT NULL AND (expires_at IS NULL OR expires_at > ?)';
+    const p = [new Date().toISOString()];
+    if (category) { sql += ' AND category = ?'; p.push(category); }
+    const rows = db.prepare(sql).all(...p);
+
+    const results = rows
+      .map(r => { try { return { ...r, score: cosineSim(embedding, JSON.parse(r.embedding)) }; } catch { return null; } })
+      .filter(Boolean)
+      .sort((a, b) => b.score - a.score)
+      .slice(0, k)
+      .map(r => ({ ...fmt(r), similarity: +r.score.toFixed(3) }));
+
+    res.json({ results, count: results.length });
+  } catch (err) {
+    console.error('[api/search/find_related] error:', err);
+    res.status(500).json({ error: 'Internal error' });
+  }
+});
+
+app.post('/api/search/hybrid', auth, async (req, res) => {
+  try {
+    const { query, limit = 10, category } = req.body || {};
+    if (!query || typeof query !== 'string') {
+      return res.status(400).json({ error: 'query (non-empty string) required' });
+    }
+    const lim = Math.max(1, Math.min(20, parseInt(limit) || 10));
+
+    cleanExpired();
+    const now = new Date().toISOString();
+
+    // keyword half
+    let kSql = 'SELECT * FROM memories WHERE content LIKE ? AND (expires_at IS NULL OR expires_at > ?)';
+    const kp = [`%${query}%`, now];
+    if (category) { kSql += ' AND category = ?'; kp.push(category); }
+    kSql += ' ORDER BY created_at DESC LIMIT 50';
+    const keywordRows = db.prepare(kSql).all(...kp);
+
+    // semantic half
+    let semanticRows = [];
+    const embedding = await getEmbedding(query);
+    if (embedding) {
+      let sSql = 'SELECT * FROM memories WHERE embedding IS NOT NULL AND (expires_at IS NULL OR expires_at > ?)';
+      const sp = [now];
+      if (category) { sSql += ' AND category = ?'; sp.push(category); }
+      semanticRows = db.prepare(sSql).all(...sp)
+        .map(r => { try { return { ...r, score: cosineSim(embedding, JSON.parse(r.embedding)) }; } catch { return null; } })
+        .filter(Boolean)
+        .sort((a, b) => b.score - a.score)
+        .slice(0, 50);
+    }
+
+    // RRF fusion
+    const K = 60;
+    const fuse = new Map();
+    keywordRows.forEach((r, i) => {
+      const e = fuse.get(r.id) || { row: r, rrf: 0 };
+      e.rrf += 1 / (K + i + 1);
+      fuse.set(r.id, e);
+    });
+    semanticRows.forEach((r, i) => {
+      const e = fuse.get(r.id) || { row: r, rrf: 0 };
+      e.rrf += 1 / (K + i + 1);
+      fuse.set(r.id, e);
+    });
+
+    const fused = [...fuse.values()]
+      .sort((a, b) => b.rrf - a.rrf)
+      .slice(0, lim)
+      .map(e => ({ ...fmt(e.row), rrf_score: +e.rrf.toFixed(4) }));
+
+    res.json({ results: fused, count: fused.length, semantic_enabled: !!embedding });
+  } catch (err) {
+    console.error('[api/search/hybrid] error:', err);
+    res.status(500).json({ error: 'Internal error' });
+  }
+});
+
 // ── GitHub Backup ─────────────────────────────────────────────────────────────
 
 const BACKUP_REPO  = process.env.BACKUP_REPO  || 'lanmoyinyue/mcp-memory-server';
