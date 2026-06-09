@@ -203,26 +203,40 @@ function createMcpServer() {
   // 5. update_memory
   mcp.tool(
     'update_memory',
-    'Update content, tags, source, or mood of an existing memory',
+    'Update content, category, tags, source, or mood of an existing memory. Passing category lets you move a memory between layers (e.g. fix a record stored in the wrong category) without delete+re-create.',
     {
-      id:      z.string().describe('Memory ID'),
-      content: z.string().optional(),
-      tags:    z.array(z.string()).optional(),
-      source:  z.string().optional(),
-      mood:    z.string().optional(),
+      id:       z.string().describe('Memory ID'),
+      content:  z.string().optional(),
+      category: z.string().optional().describe('Move memory to a different category (deep/daily/diary/writing/anchor or custom)'),
+      tags:     z.array(z.string()).optional(),
+      source:   z.string().optional(),
+      mood:     z.string().optional(),
     },
-    async ({ id, content, tags, source, mood }) => {
+    async ({ id, content, category, tags, source, mood }) => {
       const row = db.prepare('SELECT * FROM memories WHERE id = ?').get(id);
       if (!row) return { content: [{ type: 'text', text: `Not found: ${id}` }] };
-      db.prepare('UPDATE memories SET content=?,tags=?,source=?,mood=?,updated_at=? WHERE id=?').run(
+      const newCategory = category ?? row.category;
+      // Recompute expires_at if category changed: daily expires in 3 days, others never.
+      let expires_at = row.expires_at;
+      if (category !== undefined && category !== row.category) {
+        if (newCategory === 'daily') {
+          const exp = new Date(); exp.setDate(exp.getDate() + 3); expires_at = exp.toISOString();
+        } else {
+          expires_at = null;
+        }
+      }
+      db.prepare('UPDATE memories SET content=?,category=?,tags=?,source=?,mood=?,updated_at=?,expires_at=? WHERE id=?').run(
         content ?? row.content,
+        newCategory,
         tags !== undefined ? JSON.stringify(tags) : row.tags,
         source ?? row.source,
         mood !== undefined ? mood : row.mood,
         new Date().toISOString(),
+        expires_at,
         id
       );
-      return { content: [{ type: 'text', text: `Updated ${id}.` }] };
+      const moved = category !== undefined && category !== row.category;
+      return { content: [{ type: 'text', text: moved ? `Updated ${id}. Moved ${row.category} → ${newCategory}.` : `Updated ${id}.` }] };
     }
   );
 
