@@ -36,6 +36,23 @@ db.exec(`
 
 // Migrate: add embedding column for existing databases
 try { db.exec('ALTER TABLE memories ADD COLUMN embedding TEXT'); } catch {}
+// Migrate: add pinned column (pinned memories sort first in read_memories)
+try { db.exec('ALTER TABLE memories ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0'); } catch {}
+
+// One-time backfill: anchors now expire like daily (3 days). Stamp legacy
+// anchors that have no expiry; pinned ones are exempt. Old anchors were
+// archived to backups/anchors-archive-2026-06-10.jsonl before this ran.
+{
+  const legacy = db.prepare(
+    "SELECT id, created_at FROM memories WHERE category IN ('anchor','cc-anchor') AND expires_at IS NULL AND pinned = 0"
+  ).all();
+  const stamp = db.prepare('UPDATE memories SET expires_at = ? WHERE id = ?');
+  for (const m of legacy) {
+    const exp = new Date(m.created_at); exp.setDate(exp.getDate() + 3);
+    stamp.run(exp.toISOString(), m.id);
+  }
+  if (legacy.length) console.log(`[migrate] stamped 3-day expiry on ${legacy.length} legacy anchors`);
+}
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -43,13 +60,21 @@ const parseTags = (t) => { try { return JSON.parse(t); } catch { return []; } };
 
 const fmt = (r) => ({
   id: r.id, content: r.content, category: r.category,
-  tags: parseTags(r.tags), source: r.source, mood: r.mood || null,
+  tags: parseTags(r.tags), source: r.source, mood: r.mood || null, pinned: !!r.pinned,
   created_at: r.created_at, updated_at: r.updated_at, expires_at: r.expires_at || null,
 });
 
 const cleanExpired = () =>
   db.prepare('DELETE FROM memories WHERE expires_at IS NOT NULL AND expires_at < ?')
     .run(new Date().toISOString());
+
+// Categories that auto-expire after 3 days. Everything else is permanent.
+const EXPIRING = new Set(['daily', 'anchor', 'cc-anchor']);
+function expiryFor(category) {
+  if (!EXPIRING.has(category)) return null;
+  const exp = new Date(); exp.setDate(exp.getDate() + 3);
+  return exp.toISOString();
+}
 
 // ── Embedding & vector similarity ─────────────────────────────────────────────
 // Set VOYAGE_API_KEY env var to enable. Free at voyageai.com (200M tokens/month)
@@ -102,29 +127,27 @@ function createMcpServer() {
   // 1. write_memory
   mcp.tool(
     'write_memory',
-    'Save a new memory. category: deep=永久, daily=3天过期, diary=日记, writing=写作进度, anchor=情绪锚(永久), 也可自定义分类名',
+    'Save a new memory. category: deep=永久, diary=日记(永久), writing=写作进度, daily/anchor/cc-anchor=3天过期, 也可自定义分类名(永久). pinned=true 的记忆在 read_memories 里永远排最前且不过期',
     {
       content:  z.string().min(1).describe('Memory content'),
       category: z.string().describe('Memory layer: deep/daily/diary/writing/anchor or any custom category'),
       tags:     z.array(z.string()).optional().describe('Tags'),
       source:   z.string().optional().describe('Source context'),
       mood:     z.string().optional().describe('Mood for diary (happy/sad/calm/excited/anxious)'),
+      pinned:   z.boolean().optional().describe('Pin this memory: always sorts first in read_memories, never expires'),
     },
-    async ({ content, category, tags, source, mood }) => {
+    async ({ content, category, tags, source, mood, pinned }) => {
       const id = uuidv4(), now = new Date().toISOString();
-      let expires_at = null;
-      if (category === 'daily') {
-        const exp = new Date(); exp.setDate(exp.getDate() + 3); expires_at = exp.toISOString();
-      }
-      // deep/anchor and custom categories never expire
+      // daily/anchor/cc-anchor expire in 3 days; pinned never expires
+      const expires_at = pinned ? null : expiryFor(category);
       // Compute embedding and find related BEFORE inserting (so new memory is excluded)
       const embedding = await getEmbedding(content);
       const related = findRelated(embedding, id);
 
       db.prepare(
-        'INSERT INTO memories (id,content,category,tags,source,mood,created_at,updated_at,expires_at,embedding) VALUES (?,?,?,?,?,?,?,?,?,?)'
+        'INSERT INTO memories (id,content,category,tags,source,mood,created_at,updated_at,expires_at,embedding,pinned) VALUES (?,?,?,?,?,?,?,?,?,?,?)'
       ).run(id, content, category, JSON.stringify(tags ?? []), source ?? '', mood ?? null, now, now, expires_at,
-        embedding ? JSON.stringify(embedding) : null);
+        embedding ? JSON.stringify(embedding) : null, pinned ? 1 : 0);
 
       return {
         content: [{
@@ -157,7 +180,7 @@ function createMcpServer() {
       if (!include_expired) { sql += ' AND (expires_at IS NULL OR expires_at > ?)'; p.push(new Date().toISOString()); }
       if (category) { sql += ' AND category = ?'; p.push(category); }
       if (keyword)  { sql += ' AND content LIKE ?'; p.push(`%${keyword}%`); }
-      sql += ' ORDER BY created_at DESC LIMIT ?';
+      sql += ' ORDER BY pinned DESC, created_at DESC LIMIT ?';
       p.push(limit);
       let rows = db.prepare(sql).all(...p).map(fmt);
       if (tags?.length) rows = rows.filter(r => tags.some(t => r.tags.includes(t)));
@@ -203,7 +226,7 @@ function createMcpServer() {
   // 5. update_memory
   mcp.tool(
     'update_memory',
-    'Update content, category, tags, source, or mood of an existing memory. Passing category lets you move a memory between layers (e.g. fix a record stored in the wrong category) without delete+re-create.',
+    'Update content, category, tags, source, mood, or pinned of an existing memory. Passing category moves a memory between layers without delete+re-create. pinned=true pins it to the top of read_memories and exempts it from expiry; pinned=false unpins.',
     {
       id:       z.string().describe('Memory ID'),
       content:  z.string().optional(),
@@ -211,32 +234,35 @@ function createMcpServer() {
       tags:     z.array(z.string()).optional(),
       source:   z.string().optional(),
       mood:     z.string().optional(),
+      pinned:   z.boolean().optional().describe('Pin/unpin: pinned memories sort first in read_memories and never expire'),
     },
-    async ({ id, content, category, tags, source, mood }) => {
+    async ({ id, content, category, tags, source, mood, pinned }) => {
       const row = db.prepare('SELECT * FROM memories WHERE id = ?').get(id);
       if (!row) return { content: [{ type: 'text', text: `Not found: ${id}` }] };
       const newCategory = category ?? row.category;
-      // Recompute expires_at if category changed: daily expires in 3 days, others never.
+      const newPinned = pinned !== undefined ? (pinned ? 1 : 0) : row.pinned;
+      // Recompute expires_at when category or pinned changes; pinned never expires.
       let expires_at = row.expires_at;
-      if (category !== undefined && category !== row.category) {
-        if (newCategory === 'daily') {
-          const exp = new Date(); exp.setDate(exp.getDate() + 3); expires_at = exp.toISOString();
-        } else {
-          expires_at = null;
-        }
+      const categoryChanged = category !== undefined && category !== row.category;
+      const pinnedChanged = pinned !== undefined && (pinned ? 1 : 0) !== row.pinned;
+      if (categoryChanged || pinnedChanged) {
+        expires_at = newPinned ? null : expiryFor(newCategory);
       }
-      db.prepare('UPDATE memories SET content=?,category=?,tags=?,source=?,mood=?,updated_at=?,expires_at=? WHERE id=?').run(
+      db.prepare('UPDATE memories SET content=?,category=?,tags=?,source=?,mood=?,pinned=?,updated_at=?,expires_at=? WHERE id=?').run(
         content ?? row.content,
         newCategory,
         tags !== undefined ? JSON.stringify(tags) : row.tags,
         source ?? row.source,
         mood !== undefined ? mood : row.mood,
+        newPinned,
         new Date().toISOString(),
         expires_at,
         id
       );
-      const moved = category !== undefined && category !== row.category;
-      return { content: [{ type: 'text', text: moved ? `Updated ${id}. Moved ${row.category} → ${newCategory}.` : `Updated ${id}.` }] };
+      const notes = [];
+      if (categoryChanged) notes.push(`moved ${row.category} → ${newCategory}`);
+      if (pinnedChanged) notes.push(newPinned ? 'pinned' : 'unpinned');
+      return { content: [{ type: 'text', text: notes.length ? `Updated ${id} (${notes.join(', ')}).` : `Updated ${id}.` }] };
     }
   );
 
@@ -453,30 +479,39 @@ app.get('/api/memories', auth, (req, res) => {
 });
 
 app.post('/api/memories', auth, async (req, res) => {
-  const { content, category, tags = [], source = '', mood = null } = req.body;
+  const { content, category, tags = [], source = '', mood = null, pinned = false } = req.body;
   if (!content || !category) return res.status(400).json({ error: 'content and category required' });
   const id = uuidv4(), now = new Date().toISOString();
-  let expires_at = null;
-  if (category === 'daily') {
-    const exp = new Date(); exp.setDate(exp.getDate() + 3); expires_at = exp.toISOString();
-  }
+  const expires_at = pinned ? null : expiryFor(category);
   const embedding = await getEmbedding(content);
-  db.prepare('INSERT INTO memories (id,content,category,tags,source,mood,created_at,updated_at,expires_at,embedding) VALUES (?,?,?,?,?,?,?,?,?,?)')
+  db.prepare('INSERT INTO memories (id,content,category,tags,source,mood,created_at,updated_at,expires_at,embedding,pinned) VALUES (?,?,?,?,?,?,?,?,?,?,?)')
     .run(id, content, category, JSON.stringify(tags), source, mood, now, now, expires_at,
-      embedding ? JSON.stringify(embedding) : null);
+      embedding ? JSON.stringify(embedding) : null, pinned ? 1 : 0);
   res.json({ id, message: 'Memory saved' });
 });
 
 app.put('/api/memories/:id', auth, (req, res) => {
   const row = db.prepare('SELECT * FROM memories WHERE id = ?').get(req.params.id);
   if (!row) return res.status(404).json({ error: 'Not found' });
-  const { content, tags, source, mood } = req.body;
-  db.prepare('UPDATE memories SET content=?,tags=?,source=?,mood=?,updated_at=? WHERE id=?').run(
+  const { content, category, tags, source, mood, pinned } = req.body;
+  const newCategory = category ?? row.category;
+  const newPinned = pinned !== undefined ? (pinned ? 1 : 0) : row.pinned;
+  // Same recompute rule as MCP update_memory: category/pinned change resets expiry.
+  let expires_at = row.expires_at;
+  const categoryChanged = category !== undefined && category !== row.category;
+  const pinnedChanged = pinned !== undefined && (pinned ? 1 : 0) !== row.pinned;
+  if (categoryChanged || pinnedChanged) {
+    expires_at = newPinned ? null : expiryFor(newCategory);
+  }
+  db.prepare('UPDATE memories SET content=?,category=?,tags=?,source=?,mood=?,pinned=?,updated_at=?,expires_at=? WHERE id=?').run(
     content ?? row.content,
+    newCategory,
     tags !== undefined ? JSON.stringify(tags) : row.tags,
     source ?? row.source,
     mood !== undefined ? mood : row.mood,
+    newPinned,
     new Date().toISOString(),
+    expires_at,
     req.params.id
   );
   res.json({ message: 'Updated' });
@@ -645,6 +680,13 @@ async function runBackup() {
 
 async function autoRestore() {
   if (!BACKUP_TOKEN) return;
+  // Disaster recovery only: restore when the DB is EMPTY. Restoring into a
+  // populated DB would resurrect deliberately deleted/expired memories.
+  const count = db.prepare('SELECT COUNT(*) as c FROM memories').get().c;
+  if (count > 0) {
+    console.log(`[backup] DB has ${count} memories — skipping auto-restore`);
+    return;
+  }
   try {
     const r = await ghRequest('GET', BACKUP_PATH);
     if (!r.ok) return;
@@ -656,8 +698,8 @@ async function autoRestore() {
       const m = JSON.parse(line);
       const exists = db.prepare('SELECT id FROM memories WHERE id = ?').get(m.id);
       if (!exists) {
-        db.prepare('INSERT INTO memories (id,content,category,tags,source,mood,created_at,updated_at,expires_at) VALUES (?,?,?,?,?,?,?,?,?)')
-          .run(m.id, m.content, m.category, JSON.stringify(m.tags || []), m.source || '', m.mood, m.created_at, m.updated_at, m.expires_at || null);
+        db.prepare('INSERT INTO memories (id,content,category,tags,source,mood,created_at,updated_at,expires_at,pinned) VALUES (?,?,?,?,?,?,?,?,?,?)')
+          .run(m.id, m.content, m.category, JSON.stringify(m.tags || []), m.source || '', m.mood, m.created_at, m.updated_at, m.expires_at || null, m.pinned ? 1 : 0);
         restored++;
       }
     }
