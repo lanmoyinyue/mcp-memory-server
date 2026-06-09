@@ -39,12 +39,13 @@ try { db.exec('ALTER TABLE memories ADD COLUMN embedding TEXT'); } catch {}
 // Migrate: add pinned column (pinned memories sort first in read_memories)
 try { db.exec('ALTER TABLE memories ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0'); } catch {}
 
-// One-time backfill: anchors now expire like daily (3 days). Stamp legacy
-// anchors that have no expiry; pinned ones are exempt. Old anchors were
-// archived to backups/anchors-archive-2026-06-10.jsonl before this ran.
+// One-time backfill: anchors & corridor now expire like daily (3 days).
+// Both are only ever read as "latest 1" at wake-up and their content lives
+// in diary. Stamp legacy rows that have no expiry; pinned ones are exempt.
+// Archives: backups/anchors-archive-2026-06-10.jsonl, corridor-archive-2026-06-10.jsonl.
 {
   const legacy = db.prepare(
-    "SELECT id, created_at FROM memories WHERE category IN ('anchor','cc-anchor') AND expires_at IS NULL AND pinned = 0"
+    "SELECT id, created_at FROM memories WHERE category IN ('anchor','cc-anchor','corridor') AND expires_at IS NULL AND pinned = 0"
   ).all();
   const stamp = db.prepare('UPDATE memories SET expires_at = ? WHERE id = ?');
   for (const m of legacy) {
@@ -69,7 +70,7 @@ const cleanExpired = () =>
     .run(new Date().toISOString());
 
 // Categories that auto-expire after 3 days. Everything else is permanent.
-const EXPIRING = new Set(['daily', 'anchor', 'cc-anchor']);
+const EXPIRING = new Set(['daily', 'anchor', 'cc-anchor', 'corridor']);
 function expiryFor(category) {
   if (!EXPIRING.has(category)) return null;
   const exp = new Date(); exp.setDate(exp.getDate() + 3);
