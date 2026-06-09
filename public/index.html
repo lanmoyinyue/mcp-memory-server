@@ -51,6 +51,9 @@ body{background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,
 .btn-sm{padding:5px 12px;font-size:12px;border-radius:20px}
 .btn-del{background:var(--accent);color:#fff;border:none}.btn-del:hover{background:var(--accent2)}
 .btn-edit{background:transparent;color:var(--text2);border:none;font-weight:500}.btn-edit:hover{color:var(--text)}
+.btn-pin{background:transparent;color:var(--text2);border:none;font-weight:500}.btn-pin:hover{color:var(--text)}
+.btn-pin.pinned{color:var(--accent)}
+.card.is-pinned{border-color:var(--accent);box-shadow:0 2px 10px rgba(58,40,24,0.12)}
 
 /* Cards */
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(290px,1fr));gap:14px}
@@ -304,21 +307,24 @@ function renderGrid(items) {
     g.innerHTML = '<div class="empty"><div class="empty-icon">🧠</div><div>暂无记忆</div></div>';
     return;
   }
+  // 置顶的排最前，其余按时间
+  items = [...items].sort((a, b) => (b.pinned ? 1 : 0) - (a.pinned ? 1 : 0));
   g.innerHTML = items.map(m => {
     const tags = m.tags?.length ? `<div class="card-tags">${m.tags.map(t=>`<span class="tag">#${esc(t)}</span>`).join('')}</div>` : '';
     const mood = m.mood ? `<div class="card-meta">${MOOD_ICON[m.mood]||''} ${m.mood}</div>` : '';
     const src  = m.source ? `<div class="card-meta">来源: ${esc(m.source)}</div>` : '';
     const exp  = m.expires_at ? `<div class="card-meta" style="color:var(--diary)">过期: ${fmtDate(m.expires_at,true)}</div>` : '';
     const long = m.content.length > 200;
-    return `<div class="card" id="card-${m.id}">
+    return `<div class="card${m.pinned ? ' is-pinned' : ''}" id="card-${m.id}">
       <div class="card-head">
-        <span class="badge ${getCatBadge(m.category)}">${getCatLabel(m.category)}</span>
+        <span class="badge ${getCatBadge(m.category)}">${m.pinned ? '📌 ' : ''}${getCatLabel(m.category)}</span>
         <span class="card-time">${fmtDate(m.created_at)}</span>
       </div>
       <div class="card-body" id="cb-${m.id}">${esc(m.content)}</div>
       ${long ? `<div class="card-expand" id="cx-${m.id}" onclick="expand('${m.id}')">展开全文 ▾</div>` : ''}
       ${tags}${mood}${src}${exp}
       <div class="card-actions">
+        <button class="btn btn-sm btn-pin${m.pinned ? ' pinned' : ''}" onclick="togglePin('${m.id}', ${m.pinned ? 'false' : 'true'})">${m.pinned ? '取消置顶' : '置顶'}</button>
         <button class="btn btn-sm btn-edit" onclick="openEdit('${m.id}')">编辑</button>
         <button class="btn btn-sm btn-del"  onclick="del('${m.id}')">删除</button>
       </div>
@@ -394,6 +400,13 @@ async function del(id) {
   _cachedItems = [];
   loadMemories();
   loadStats();
+}
+
+async function togglePin(id, pin) {
+  await api(`/api/memories/${id}`, {method:'PUT', body:{pinned: pin}});
+  toast(pin ? '📌 已置顶（不会过期）' : '已取消置顶', 'ok');
+  _cachedItems = [];
+  loadMemories();
 }
 
 // ── nav ───────────────────────────────────────────────────────────────────────
