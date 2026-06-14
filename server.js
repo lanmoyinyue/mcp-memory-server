@@ -8,6 +8,7 @@ import { z } from 'zod';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import fs from 'fs';
+import crypto from 'crypto';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -34,10 +35,39 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_created ON memories(created_at);
 `);
 
+db.exec(`
+  CREATE TABLE IF NOT EXISTS memory_edges (
+    source_id TEXT NOT NULL,
+    target_id TEXT NOT NULL,
+    weight    REAL NOT NULL DEFAULT 1.0,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (source_id, target_id)
+  );
+  CREATE INDEX IF NOT EXISTS idx_edges_source ON memory_edges(source_id);
+  CREATE INDEX IF NOT EXISTS idx_edges_target ON memory_edges(target_id);
+`);
+
 // Migrate: add embedding column for existing databases
 try { db.exec('ALTER TABLE memories ADD COLUMN embedding TEXT'); } catch {}
 // Migrate: add pinned column (pinned memories sort first in read_memories)
 try { db.exec('ALTER TABLE memories ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0'); } catch {}
+// Migrate: add activation_score for memory temperature
+try { db.exec('ALTER TABLE memories ADD COLUMN activation_score REAL NOT NULL DEFAULT 0'); } catch {}
+// Migrate: add content_hash for dedup
+try { db.exec('ALTER TABLE memories ADD COLUMN content_hash TEXT'); } catch {}
+try { db.exec('CREATE INDEX IF NOT EXISTS idx_content_hash ON memories(content_hash)'); } catch {}
+
+const contentHash = (text, category) => crypto.createHash('sha256').update(`${category}:${text.trim()}`).digest('hex');
+
+// One-time backfill: content_hash for existing memories
+{
+  const unhashed = db.prepare("SELECT id, content, category FROM memories WHERE content_hash IS NULL").all();
+  if (unhashed.length) {
+    const stmt = db.prepare('UPDATE memories SET content_hash = ? WHERE id = ?');
+    for (const m of unhashed) stmt.run(contentHash(m.content, m.category), m.id);
+    console.log(`[migrate] backfilled content_hash for ${unhashed.length} memories`);
+  }
+}
 
 // One-time backfill: anchors & corridor now expire like daily (3 days).
 // Both are only ever read as "latest 1" at wake-up and their content lives
@@ -62,12 +92,17 @@ const parseTags = (t) => { try { return JSON.parse(t); } catch { return []; } };
 const fmt = (r) => ({
   id: r.id, content: r.content, category: r.category,
   tags: parseTags(r.tags), source: r.source, mood: r.mood || null, pinned: !!r.pinned,
+  activation_score: +(r.activation_score || 0),
   created_at: r.created_at, updated_at: r.updated_at, expires_at: r.expires_at || null,
 });
 
-const cleanExpired = () =>
-  db.prepare('DELETE FROM memories WHERE expires_at IS NOT NULL AND expires_at < ?')
+const cleanExpired = () => {
+  const r = db.prepare('DELETE FROM memories WHERE expires_at IS NOT NULL AND expires_at < ?')
     .run(new Date().toISOString());
+  if (r.changes) {
+    db.prepare(`DELETE FROM memory_edges WHERE source_id NOT IN (SELECT id FROM memories) OR target_id NOT IN (SELECT id FROM memories)`).run();
+  }
+};
 
 // Categories that auto-expire after 3 days. Everything else is permanent.
 const EXPIRING = new Set(['daily', 'anchor', 'cc-anchor', 'corridor']);
@@ -138,6 +173,21 @@ function createMcpServer() {
       pinned:   z.boolean().optional().describe('Pin this memory: always sorts first in read_memories, never expires'),
     },
     async ({ content, category, tags, source, mood, pinned }) => {
+      const hash = contentHash(content, category);
+      const dupe = db.prepare('SELECT * FROM memories WHERE content_hash = ? AND (expires_at IS NULL OR expires_at > ?)').get(hash, new Date().toISOString());
+      if (dupe) {
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              duplicate: true,
+              existing: fmt(dupe),
+              note: `已有相同内容的记忆（${dupe.category}），跳过写入。`,
+            }, null, 2),
+          }],
+        };
+      }
+
       const id = uuidv4(), now = new Date().toISOString();
       // daily/anchor/cc-anchor expire in 3 days; pinned never expires
       const expires_at = pinned ? null : expiryFor(category);
@@ -146,9 +196,18 @@ function createMcpServer() {
       const related = findRelated(embedding, id);
 
       db.prepare(
-        'INSERT INTO memories (id,content,category,tags,source,mood,created_at,updated_at,expires_at,embedding,pinned) VALUES (?,?,?,?,?,?,?,?,?,?,?)'
+        'INSERT INTO memories (id,content,category,tags,source,mood,created_at,updated_at,expires_at,embedding,pinned,content_hash) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)'
       ).run(id, content, category, JSON.stringify(tags ?? []), source ?? '', mood ?? null, now, now, expires_at,
-        embedding ? JSON.stringify(embedding) : null, pinned ? 1 : 0);
+        embedding ? JSON.stringify(embedding) : null, pinned ? 1 : 0, hash);
+
+      // "写就是读"：把相关记忆存为边
+      if (related.length) {
+        const edgeStmt = db.prepare('INSERT OR IGNORE INTO memory_edges (source_id, target_id, weight, created_at) VALUES (?, ?, ?, ?)');
+        for (const r of related) {
+          edgeStmt.run(id, r.id, r.similarity ?? 0.5, now);
+          edgeStmt.run(r.id, id, r.similarity ?? 0.5, now);
+        }
+      }
 
       return {
         content: [{
@@ -156,7 +215,8 @@ function createMcpServer() {
           text: JSON.stringify({
             saved: { id, category },
             related_memories: related,
-            note: embedding ? `Found ${related.length} related memories.` : 'Set VOYAGE_API_KEY to enable semantic associations.',
+            edges_created: related.length * 2,
+            note: embedding ? `Found ${related.length} related memories, created ${related.length * 2} edges.` : 'Set VOYAGE_API_KEY to enable semantic associations.',
           }, null, 2),
         }],
       };
@@ -220,6 +280,9 @@ function createMcpServer() {
     { id: z.string().describe('Memory ID') },
     async ({ id }) => {
       const r = db.prepare('DELETE FROM memories WHERE id = ?').run(id);
+      if (r.changes) {
+        db.prepare('DELETE FROM memory_edges WHERE source_id = ? OR target_id = ?').run(id, id);
+      }
       return { content: [{ type: 'text', text: r.changes ? `Deleted ${id}.` : `Not found: ${id}` }] };
     }
   );
@@ -249,7 +312,7 @@ function createMcpServer() {
       if (categoryChanged || pinnedChanged) {
         expires_at = newPinned ? null : expiryFor(newCategory);
       }
-      db.prepare('UPDATE memories SET content=?,category=?,tags=?,source=?,mood=?,pinned=?,updated_at=?,expires_at=? WHERE id=?').run(
+      db.prepare('UPDATE memories SET content=?,category=?,tags=?,source=?,mood=?,pinned=?,updated_at=?,expires_at=?,content_hash=? WHERE id=?').run(
         content ?? row.content,
         newCategory,
         tags !== undefined ? JSON.stringify(tags) : row.tags,
@@ -258,6 +321,7 @@ function createMcpServer() {
         newPinned,
         new Date().toISOString(),
         expires_at,
+        contentHash(content ?? row.content, newCategory),
         id
       );
       const notes = [];
@@ -323,7 +387,42 @@ function createMcpServer() {
     }
   );
 
-  // 8. hybrid_search — keyword + semantic, fused with RRF (best default search)
+  // 8. get_neighbors — find connected memories via edges (for association slot)
+  mcp.tool(
+    'get_neighbors',
+    'Find memories connected to a given memory via edges. Returns neighbors sorted by edge weight. Use for association/联想.',
+    {
+      memory_id: z.string().min(1).describe('Memory ID to find neighbors for'),
+      exclude:   z.array(z.string()).optional().describe('Memory IDs to exclude from results'),
+      limit:     z.number().int().min(1).max(10).optional().describe('Max results (default 3)'),
+    },
+    async ({ memory_id, exclude = [], limit = 3 }) => {
+      const excludeSet = new Set(exclude);
+      const edges = db.prepare(
+        'SELECT target_id, weight FROM memory_edges WHERE source_id = ? ORDER BY weight DESC'
+      ).all(memory_id);
+      const now = new Date().toISOString();
+      const results = [];
+      for (const edge of edges) {
+        if (excludeSet.has(edge.target_id)) continue;
+        const mem = db.prepare('SELECT * FROM memories WHERE id = ? AND (expires_at IS NULL OR expires_at > ?)').get(edge.target_id, now);
+        if (mem) {
+          results.push({ ...fmt(mem), edge_weight: +edge.weight.toFixed(3), bridge_from: memory_id });
+          if (results.length >= limit) break;
+        }
+      }
+      return {
+        content: [{
+          type: 'text',
+          text: results.length
+            ? JSON.stringify(results, null, 2)
+            : `No neighbors found for memory ${memory_id}`,
+        }],
+      };
+    }
+  );
+
+  // 9. hybrid_search — keyword + semantic, fused with RRF (best default search)
   mcp.tool(
     'hybrid_search',
     'Hybrid search: runs keyword (full-text) and semantic (vector) search together, fuses and re-ranks them with Reciprocal Rank Fusion. Best default search. Falls back to keyword-only if VOYAGE_API_KEY is unset.',
@@ -376,12 +475,44 @@ function createMcpServer() {
         .slice(0, limit)
         .map(e => ({ ...fmt(e.row), rrf_score: +e.rrf.toFixed(4) }));
 
+      // 命中升温
+      if (fused.length) {
+        const heat = db.prepare('UPDATE memories SET activation_score = MIN(activation_score + 0.2, 8.0) WHERE id = ?');
+        for (const r of fused) heat.run(r.id);
+      }
+
       return {
         content: [{
           type: 'text',
           text: fused.length
             ? `Found ${fused.length} result(s) (keyword+semantic fused):\n${JSON.stringify(fused, null, 2)}`
             : `No results for: "${query}"`,
+        }],
+      };
+    }
+  );
+
+  // 10. decay_activation — periodic cooldown for memory temperature
+  mcp.tool(
+    'decay_activation',
+    'Run a global cooldown on all memory activation scores. Multiply by decay_factor (default 0.85). Memories below 0.01 are zeroed. Call this daily as a "dream pass".',
+    {
+      decay_factor: z.number().min(0.5).max(0.99).optional().describe('Decay multiplier (default 0.85)'),
+    },
+    async ({ decay_factor = 0.85 }) => {
+      const before = db.prepare('SELECT COUNT(*) as c FROM memories WHERE activation_score > 0.01').get().c;
+      db.prepare('UPDATE memories SET activation_score = activation_score * ? WHERE activation_score > 0.01').run(decay_factor);
+      db.prepare('UPDATE memories SET activation_score = 0 WHERE activation_score <= 0.01 AND activation_score > 0').run();
+      const after = db.prepare('SELECT COUNT(*) as c FROM memories WHERE activation_score > 0.01').get().c;
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            decay_factor,
+            warm_before: before,
+            warm_after: after,
+            cooled: before - after,
+          }, null, 2),
         }],
       };
     }
@@ -482,13 +613,24 @@ app.get('/api/memories', auth, (req, res) => {
 app.post('/api/memories', auth, async (req, res) => {
   const { content, category, tags = [], source = '', mood = null, pinned = false } = req.body;
   if (!content || !category) return res.status(400).json({ error: 'content and category required' });
+  const hash = contentHash(content, category);
+  const dupe = db.prepare('SELECT * FROM memories WHERE content_hash = ? AND (expires_at IS NULL OR expires_at > ?)').get(hash, new Date().toISOString());
+  if (dupe) return res.json({ id: dupe.id, duplicate: true, message: 'Duplicate content, skipped' });
   const id = uuidv4(), now = new Date().toISOString();
   const expires_at = pinned ? null : expiryFor(category);
   const embedding = await getEmbedding(content);
-  db.prepare('INSERT INTO memories (id,content,category,tags,source,mood,created_at,updated_at,expires_at,embedding,pinned) VALUES (?,?,?,?,?,?,?,?,?,?,?)')
+  const related = findRelated(embedding, id);
+  db.prepare('INSERT INTO memories (id,content,category,tags,source,mood,created_at,updated_at,expires_at,embedding,pinned,content_hash) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)')
     .run(id, content, category, JSON.stringify(tags), source, mood, now, now, expires_at,
-      embedding ? JSON.stringify(embedding) : null, pinned ? 1 : 0);
-  res.json({ id, message: 'Memory saved' });
+      embedding ? JSON.stringify(embedding) : null, pinned ? 1 : 0, hash);
+  if (related.length) {
+    const edgeStmt = db.prepare('INSERT OR IGNORE INTO memory_edges (source_id, target_id, weight, created_at) VALUES (?, ?, ?, ?)');
+    for (const r of related) {
+      edgeStmt.run(id, r.id, r.similarity ?? 0.5, now);
+      edgeStmt.run(r.id, id, r.similarity ?? 0.5, now);
+    }
+  }
+  res.json({ id, message: 'Memory saved', related_memories: related, edges_created: related.length * 2 });
 });
 
 app.put('/api/memories/:id', auth, (req, res) => {
@@ -504,7 +646,7 @@ app.put('/api/memories/:id', auth, (req, res) => {
   if (categoryChanged || pinnedChanged) {
     expires_at = newPinned ? null : expiryFor(newCategory);
   }
-  db.prepare('UPDATE memories SET content=?,category=?,tags=?,source=?,mood=?,pinned=?,updated_at=?,expires_at=? WHERE id=?').run(
+  db.prepare('UPDATE memories SET content=?,category=?,tags=?,source=?,mood=?,pinned=?,updated_at=?,expires_at=?,content_hash=? WHERE id=?').run(
     content ?? row.content,
     newCategory,
     tags !== undefined ? JSON.stringify(tags) : row.tags,
@@ -513,6 +655,7 @@ app.put('/api/memories/:id', auth, (req, res) => {
     newPinned,
     new Date().toISOString(),
     expires_at,
+    contentHash(content ?? row.content, newCategory),
     req.params.id
   );
   res.json({ message: 'Updated' });
@@ -520,6 +663,9 @@ app.put('/api/memories/:id', auth, (req, res) => {
 
 app.delete('/api/memories/:id', auth, (req, res) => {
   const r = db.prepare('DELETE FROM memories WHERE id = ?').run(req.params.id);
+  if (r.changes) {
+    db.prepare('DELETE FROM memory_edges WHERE source_id = ? OR target_id = ?').run(req.params.id, req.params.id);
+  }
   res.json({ deleted: r.changes > 0 });
 });
 
@@ -629,6 +775,12 @@ app.post('/api/search/hybrid', auth, async (req, res) => {
       .slice(0, lim)
       .map(e => ({ ...fmt(e.row), rrf_score: +e.rrf.toFixed(4) }));
 
+    // 命中升温
+    if (fused.length) {
+      const heat = db.prepare('UPDATE memories SET activation_score = MIN(activation_score + 0.2, 8.0) WHERE id = ?');
+      for (const r of fused) heat.run(r.id);
+    }
+
     res.json({ results: fused, count: fused.length, semantic_enabled: !!embedding });
   } catch (err) {
     console.error('[api/search/hybrid] error:', err);
@@ -640,6 +792,7 @@ app.post('/api/search/hybrid', auth, async (req, res) => {
 
 const BACKUP_REPO  = process.env.BACKUP_REPO  || 'lanmoyinyue/mcp-memory-server';
 const BACKUP_PATH  = 'backups/memories.jsonl';
+const EDGES_BACKUP_PATH = 'backups/memory_edges.jsonl';
 const BACKUP_TOKEN = process.env.BACKUP_GITHUB_TOKEN;
 
 async function ghRequest(method, path, body) {
@@ -673,7 +826,18 @@ async function runBackup() {
       content: contentB64,
       ...(sha ? { sha } : {}),
     });
-    console.log(`[backup] ${rows.length} memories backed up to GitHub`);
+
+    const edgeRows = db.prepare('SELECT * FROM memory_edges').all();
+    const edgeContentB64 = Buffer.from(edgeRows.map(r => JSON.stringify(r)).join('\n')).toString('base64');
+    let edgeSha = null;
+    const existingEdges = await ghRequest('GET', EDGES_BACKUP_PATH);
+    if (existingEdges.ok) edgeSha = (await existingEdges.json()).sha;
+    await ghRequest('PUT', EDGES_BACKUP_PATH, {
+      message: `backup: ${new Date().toISOString().slice(0, 10)} (${edgeRows.length} memory edges) [zeabur skip]`,
+      content: edgeContentB64,
+      ...(edgeSha ? { sha: edgeSha } : {}),
+    });
+    console.log(`[backup] ${rows.length} memories and ${edgeRows.length} edges backed up to GitHub`);
   } catch (e) {
     console.error('[backup] failed:', e.message);
   }
@@ -699,12 +863,25 @@ async function autoRestore() {
       const m = JSON.parse(line);
       const exists = db.prepare('SELECT id FROM memories WHERE id = ?').get(m.id);
       if (!exists) {
-        db.prepare('INSERT INTO memories (id,content,category,tags,source,mood,created_at,updated_at,expires_at,pinned) VALUES (?,?,?,?,?,?,?,?,?,?)')
-          .run(m.id, m.content, m.category, JSON.stringify(m.tags || []), m.source || '', m.mood, m.created_at, m.updated_at, m.expires_at || null, m.pinned ? 1 : 0);
+        db.prepare('INSERT INTO memories (id,content,category,tags,source,mood,created_at,updated_at,expires_at,pinned,content_hash,activation_score) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)')
+          .run(m.id, m.content, m.category, JSON.stringify(m.tags || []), m.source || '', m.mood, m.created_at, m.updated_at, m.expires_at || null, m.pinned ? 1 : 0, m.content_hash || contentHash(m.content, m.category), Number(m.activation_score || 0));
         restored++;
       }
     }
-    console.log(`[backup] auto-restored ${restored} memories from GitHub`);
+    let restoredEdges = 0;
+    const er = await ghRequest('GET', EDGES_BACKUP_PATH);
+    if (er.ok) {
+      const edgeData = await er.json();
+      const edgeContent = Buffer.from(edgeData.content.replace(/\n/g, ''), 'base64').toString('utf-8');
+      const edgeLines = edgeContent.split('\n').filter(l => l.trim());
+      const edgeStmt = db.prepare('INSERT OR IGNORE INTO memory_edges (source_id,target_id,weight,created_at) VALUES (?,?,?,?)');
+      for (const line of edgeLines) {
+        const e = JSON.parse(line);
+        edgeStmt.run(e.source_id, e.target_id, Number(e.weight || 0), e.created_at);
+        restoredEdges++;
+      }
+    }
+    console.log(`[backup] auto-restored ${restored} memories and ${restoredEdges} edges from GitHub`);
   } catch (e) {
     console.error('[backup] auto-restore failed:', e.message);
   }
