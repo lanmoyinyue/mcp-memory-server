@@ -56,6 +56,10 @@ try { db.exec('ALTER TABLE memories ADD COLUMN activation_score REAL NOT NULL DE
 // Migrate: add content_hash for dedup
 try { db.exec('ALTER TABLE memories ADD COLUMN content_hash TEXT'); } catch {}
 try { db.exec('CREATE INDEX IF NOT EXISTS idx_content_hash ON memories(content_hash)'); } catch {}
+// Migrate: Z-axis fact evolution (LMC-5 Module 1)
+try { db.exec('ALTER TABLE memories ADD COLUMN fact_key TEXT'); } catch {}
+try { db.exec('ALTER TABLE memories ADD COLUMN superseded_by TEXT'); } catch {}
+try { db.exec('CREATE INDEX IF NOT EXISTS idx_fact_key ON memories(fact_key)'); } catch {}
 
 const contentHash = (text, category) => crypto.createHash('sha256').update(`${category}:${text.trim()}`).digest('hex');
 
@@ -93,6 +97,7 @@ const fmt = (r) => ({
   id: r.id, content: r.content, category: r.category,
   tags: parseTags(r.tags), source: r.source, mood: r.mood || null, pinned: !!r.pinned,
   activation_score: +(r.activation_score || 0),
+  fact_key: r.fact_key || null, superseded_by: r.superseded_by || null,
   created_at: r.created_at, updated_at: r.updated_at, expires_at: r.expires_at || null,
 });
 
@@ -171,8 +176,9 @@ function createMcpServer() {
       source:   z.string().optional().describe('Source context'),
       mood:     z.string().optional().describe('Mood for diary (happy/sad/calm/excited/anxious)'),
       pinned:   z.boolean().optional().describe('Pin this memory: always sorts first in read_memories, never expires'),
+      fact_key: z.string().optional().describe('Z-axis fact key (e.g. "闻川部署位置"). Same fact_key = same evolving fact; old version auto-superseded'),
     },
-    async ({ content, category, tags, source, mood, pinned }) => {
+    async ({ content, category, tags, source, mood, pinned, fact_key }) => {
       const hash = contentHash(content, category);
       const dupe = db.prepare('SELECT * FROM memories WHERE content_hash = ? AND (expires_at IS NULL OR expires_at > ?)').get(hash, new Date().toISOString());
       if (dupe) {
@@ -196,9 +202,22 @@ function createMcpServer() {
       const related = findRelated(embedding, id);
 
       db.prepare(
-        'INSERT INTO memories (id,content,category,tags,source,mood,created_at,updated_at,expires_at,embedding,pinned,content_hash) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)'
+        'INSERT INTO memories (id,content,category,tags,source,mood,created_at,updated_at,expires_at,embedding,pinned,content_hash,fact_key) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)'
       ).run(id, content, category, JSON.stringify(tags ?? []), source ?? '', mood ?? null, now, now, expires_at,
-        embedding ? JSON.stringify(embedding) : null, pinned ? 1 : 0, hash);
+        embedding ? JSON.stringify(embedding) : null, pinned ? 1 : 0, hash, fact_key ?? null);
+
+      // Z-axis: auto-supersede old versions of the same fact
+      let superseded = [];
+      if (fact_key) {
+        const old = db.prepare(
+          'SELECT id FROM memories WHERE fact_key = ? AND id != ? AND superseded_by IS NULL'
+        ).all(fact_key, id);
+        const superStmt = db.prepare('UPDATE memories SET superseded_by = ?, updated_at = ? WHERE id = ?');
+        for (const o of old) {
+          superStmt.run(id, now, o.id);
+          superseded.push(o.id);
+        }
+      }
 
       // "写就是读"：把相关记忆存为边
       if (related.length) {
@@ -213,7 +232,8 @@ function createMcpServer() {
         content: [{
           type: 'text',
           text: JSON.stringify({
-            saved: { id, category },
+            saved: { id, category, fact_key: fact_key || null },
+            superseded_ids: superseded,
             related_memories: related,
             edges_created: related.length * 2,
             note: embedding ? `Found ${related.length} related memories, created ${related.length * 2} edges.` : 'Set VOYAGE_API_KEY to enable semantic associations.',
@@ -228,17 +248,19 @@ function createMcpServer() {
     'read_memories',
     'Read memories with optional filters by category, tags, or keyword',
     {
-      category:        z.string().optional().describe('Filter by category (deep/daily/diary/writing/anchor or custom)'),
-      tags:            z.array(z.string()).optional().describe('Match any of these tags'),
-      keyword:         z.string().optional().describe('Keyword in content'),
-      limit:           z.number().int().min(1).max(100).optional().describe('Max results (default 20)'),
-      include_expired: z.boolean().optional().describe('Include expired daily memories'),
+      category:           z.string().optional().describe('Filter by category (deep/daily/diary/writing/anchor or custom)'),
+      tags:               z.array(z.string()).optional().describe('Match any of these tags'),
+      keyword:            z.string().optional().describe('Keyword in content'),
+      limit:              z.number().int().min(1).max(100).optional().describe('Max results (default 20)'),
+      include_expired:    z.boolean().optional().describe('Include expired daily memories'),
+      include_superseded: z.boolean().optional().describe('Include superseded fact versions (default false)'),
     },
-    async ({ category, tags, keyword, limit = 20, include_expired = false }) => {
+    async ({ category, tags, keyword, limit = 20, include_expired = false, include_superseded = false }) => {
       if (!include_expired) cleanExpired();
       let sql = 'SELECT * FROM memories WHERE 1=1';
       const p = [];
       if (!include_expired) { sql += ' AND (expires_at IS NULL OR expires_at > ?)'; p.push(new Date().toISOString()); }
+      if (!include_superseded) { sql += ' AND superseded_by IS NULL'; }
       if (category) { sql += ' AND category = ?'; p.push(category); }
       if (keyword)  { sql += ' AND content LIKE ?'; p.push(`%${keyword}%`); }
       sql += ' ORDER BY pinned DESC, created_at DESC LIMIT ?';
@@ -299,20 +321,21 @@ function createMcpServer() {
       source:   z.string().optional(),
       mood:     z.string().optional(),
       pinned:   z.boolean().optional().describe('Pin/unpin: pinned memories sort first in read_memories and never expire'),
+      fact_key: z.string().optional().describe('Set or change the Z-axis fact key for this memory'),
     },
-    async ({ id, content, category, tags, source, mood, pinned }) => {
+    async ({ id, content, category, tags, source, mood, pinned, fact_key }) => {
       const row = db.prepare('SELECT * FROM memories WHERE id = ?').get(id);
       if (!row) return { content: [{ type: 'text', text: `Not found: ${id}` }] };
       const newCategory = category ?? row.category;
       const newPinned = pinned !== undefined ? (pinned ? 1 : 0) : row.pinned;
-      // Recompute expires_at when category or pinned changes; pinned never expires.
       let expires_at = row.expires_at;
       const categoryChanged = category !== undefined && category !== row.category;
       const pinnedChanged = pinned !== undefined && (pinned ? 1 : 0) !== row.pinned;
       if (categoryChanged || pinnedChanged) {
         expires_at = newPinned ? null : expiryFor(newCategory);
       }
-      db.prepare('UPDATE memories SET content=?,category=?,tags=?,source=?,mood=?,pinned=?,updated_at=?,expires_at=?,content_hash=? WHERE id=?').run(
+      const newFactKey = fact_key !== undefined ? fact_key : row.fact_key;
+      db.prepare('UPDATE memories SET content=?,category=?,tags=?,source=?,mood=?,pinned=?,updated_at=?,expires_at=?,content_hash=?,fact_key=? WHERE id=?').run(
         content ?? row.content,
         newCategory,
         tags !== undefined ? JSON.stringify(tags) : row.tags,
@@ -322,11 +345,13 @@ function createMcpServer() {
         new Date().toISOString(),
         expires_at,
         contentHash(content ?? row.content, newCategory),
+        newFactKey ?? null,
         id
       );
       const notes = [];
       if (categoryChanged) notes.push(`moved ${row.category} → ${newCategory}`);
       if (pinnedChanged) notes.push(newPinned ? 'pinned' : 'unpinned');
+      if (fact_key !== undefined) notes.push(`fact_key=${fact_key || '(cleared)'}`);
       return { content: [{ type: 'text', text: notes.length ? `Updated ${id} (${notes.join(', ')}).` : `Updated ${id}.` }] };
     }
   );
@@ -518,6 +543,62 @@ function createMcpServer() {
     }
   );
 
+  // 11. check_facts — Z-axis conflict detection
+  mcp.tool(
+    'check_facts',
+    'Z-axis: list all fact_key groups. Shows current version and any conflicts (same fact_key with multiple non-superseded entries). Use to audit evolving facts.',
+    {
+      fact_key: z.string().optional().describe('Check a specific fact_key, or omit to scan all'),
+    },
+    async ({ fact_key }) => {
+      cleanExpired();
+      const now = new Date().toISOString();
+
+      if (fact_key) {
+        const rows = db.prepare(
+          'SELECT * FROM memories WHERE fact_key = ? AND (expires_at IS NULL OR expires_at > ?) ORDER BY created_at DESC'
+        ).all(fact_key, now).map(fmt);
+        const current = rows.filter(r => !r.superseded_by);
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              fact_key,
+              total_versions: rows.length,
+              current_count: current.length,
+              conflict: current.length > 1,
+              current: current,
+              superseded: rows.filter(r => r.superseded_by),
+            }, null, 2),
+          }],
+        };
+      }
+
+      // Scan all fact_keys
+      const groups = db.prepare(
+        "SELECT fact_key, COUNT(*) as total, SUM(CASE WHEN superseded_by IS NULL THEN 1 ELSE 0 END) as current_count FROM memories WHERE fact_key IS NOT NULL AND (expires_at IS NULL OR expires_at > ?) GROUP BY fact_key ORDER BY fact_key"
+      ).all(now);
+
+      const conflicts = groups.filter(g => g.current_count > 1);
+
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            total_fact_keys: groups.length,
+            conflicts: conflicts.length,
+            fact_keys: groups.map(g => ({
+              fact_key: g.fact_key,
+              versions: g.total,
+              current: g.current_count,
+              conflict: g.current_count > 1,
+            })),
+          }, null, 2),
+        }],
+      };
+    }
+  );
+
   return mcp;
 }
 
@@ -611,7 +692,7 @@ app.get('/api/memories', auth, (req, res) => {
 });
 
 app.post('/api/memories', auth, async (req, res) => {
-  const { content, category, tags = [], source = '', mood = null, pinned = false } = req.body;
+  const { content, category, tags = [], source = '', mood = null, pinned = false, fact_key = null } = req.body;
   if (!content || !category) return res.status(400).json({ error: 'content and category required' });
   const hash = contentHash(content, category);
   const dupe = db.prepare('SELECT * FROM memories WHERE content_hash = ? AND (expires_at IS NULL OR expires_at > ?)').get(hash, new Date().toISOString());
@@ -620,9 +701,16 @@ app.post('/api/memories', auth, async (req, res) => {
   const expires_at = pinned ? null : expiryFor(category);
   const embedding = await getEmbedding(content);
   const related = findRelated(embedding, id);
-  db.prepare('INSERT INTO memories (id,content,category,tags,source,mood,created_at,updated_at,expires_at,embedding,pinned,content_hash) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)')
+  db.prepare('INSERT INTO memories (id,content,category,tags,source,mood,created_at,updated_at,expires_at,embedding,pinned,content_hash,fact_key) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)')
     .run(id, content, category, JSON.stringify(tags), source, mood, now, now, expires_at,
-      embedding ? JSON.stringify(embedding) : null, pinned ? 1 : 0, hash);
+      embedding ? JSON.stringify(embedding) : null, pinned ? 1 : 0, hash, fact_key);
+  // Z-axis: auto-supersede old versions
+  let superseded = [];
+  if (fact_key) {
+    const old = db.prepare('SELECT id FROM memories WHERE fact_key = ? AND id != ? AND superseded_by IS NULL').all(fact_key, id);
+    const superStmt = db.prepare('UPDATE memories SET superseded_by = ?, updated_at = ? WHERE id = ?');
+    for (const o of old) { superStmt.run(id, now, o.id); superseded.push(o.id); }
+  }
   if (related.length) {
     const edgeStmt = db.prepare('INSERT OR IGNORE INTO memory_edges (source_id, target_id, weight, created_at) VALUES (?, ?, ?, ?)');
     for (const r of related) {
@@ -630,23 +718,23 @@ app.post('/api/memories', auth, async (req, res) => {
       edgeStmt.run(r.id, id, r.similarity ?? 0.5, now);
     }
   }
-  res.json({ id, message: 'Memory saved', related_memories: related, edges_created: related.length * 2 });
+  res.json({ id, message: 'Memory saved', fact_key, superseded_ids: superseded, related_memories: related, edges_created: related.length * 2 });
 });
 
 app.put('/api/memories/:id', auth, (req, res) => {
   const row = db.prepare('SELECT * FROM memories WHERE id = ?').get(req.params.id);
   if (!row) return res.status(404).json({ error: 'Not found' });
-  const { content, category, tags, source, mood, pinned } = req.body;
+  const { content, category, tags, source, mood, pinned, fact_key } = req.body;
   const newCategory = category ?? row.category;
   const newPinned = pinned !== undefined ? (pinned ? 1 : 0) : row.pinned;
-  // Same recompute rule as MCP update_memory: category/pinned change resets expiry.
   let expires_at = row.expires_at;
   const categoryChanged = category !== undefined && category !== row.category;
   const pinnedChanged = pinned !== undefined && (pinned ? 1 : 0) !== row.pinned;
   if (categoryChanged || pinnedChanged) {
     expires_at = newPinned ? null : expiryFor(newCategory);
   }
-  db.prepare('UPDATE memories SET content=?,category=?,tags=?,source=?,mood=?,pinned=?,updated_at=?,expires_at=?,content_hash=? WHERE id=?').run(
+  const newFactKey = fact_key !== undefined ? fact_key : row.fact_key;
+  db.prepare('UPDATE memories SET content=?,category=?,tags=?,source=?,mood=?,pinned=?,updated_at=?,expires_at=?,content_hash=?,fact_key=? WHERE id=?').run(
     content ?? row.content,
     newCategory,
     tags !== undefined ? JSON.stringify(tags) : row.tags,
@@ -656,6 +744,7 @@ app.put('/api/memories/:id', auth, (req, res) => {
     new Date().toISOString(),
     expires_at,
     contentHash(content ?? row.content, newCategory),
+    newFactKey ?? null,
     req.params.id
   );
   res.json({ message: 'Updated' });
@@ -674,6 +763,24 @@ app.get('/api/stats', auth, (_req, res) => {
   const total = db.prepare('SELECT COUNT(*) as c FROM memories').get().c;
   const byCat = db.prepare('SELECT category, COUNT(*) as c FROM memories GROUP BY category').all();
   res.json({ total, by_category: Object.fromEntries(byCat.map(r => [r.category, r.c])) });
+});
+
+// Z-axis fact check endpoint
+app.get('/api/facts', auth, (req, res) => {
+  cleanExpired();
+  const now = new Date().toISOString();
+  const { fact_key } = req.query;
+  if (fact_key) {
+    const rows = db.prepare(
+      'SELECT * FROM memories WHERE fact_key = ? AND (expires_at IS NULL OR expires_at > ?) ORDER BY created_at DESC'
+    ).all(fact_key, now).map(fmt);
+    const current = rows.filter(r => !r.superseded_by);
+    return res.json({ fact_key, total_versions: rows.length, current_count: current.length, conflict: current.length > 1, current, superseded: rows.filter(r => r.superseded_by) });
+  }
+  const groups = db.prepare(
+    "SELECT fact_key, COUNT(*) as total, SUM(CASE WHEN superseded_by IS NULL THEN 1 ELSE 0 END) as current_count FROM memories WHERE fact_key IS NOT NULL AND (expires_at IS NULL OR expires_at > ?) GROUP BY fact_key ORDER BY fact_key"
+  ).all(now);
+  res.json({ total_fact_keys: groups.length, conflicts: groups.filter(g => g.current_count > 1).length, fact_keys: groups });
 });
 
 app.get('/api/diary-calendar', auth, (req, res) => {
@@ -863,8 +970,8 @@ async function autoRestore() {
       const m = JSON.parse(line);
       const exists = db.prepare('SELECT id FROM memories WHERE id = ?').get(m.id);
       if (!exists) {
-        db.prepare('INSERT INTO memories (id,content,category,tags,source,mood,created_at,updated_at,expires_at,pinned,content_hash,activation_score) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)')
-          .run(m.id, m.content, m.category, JSON.stringify(m.tags || []), m.source || '', m.mood, m.created_at, m.updated_at, m.expires_at || null, m.pinned ? 1 : 0, m.content_hash || contentHash(m.content, m.category), Number(m.activation_score || 0));
+        db.prepare('INSERT INTO memories (id,content,category,tags,source,mood,created_at,updated_at,expires_at,pinned,content_hash,activation_score,fact_key,superseded_by) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)')
+          .run(m.id, m.content, m.category, JSON.stringify(m.tags || []), m.source || '', m.mood, m.created_at, m.updated_at, m.expires_at || null, m.pinned ? 1 : 0, m.content_hash || contentHash(m.content, m.category), Number(m.activation_score || 0), m.fact_key || null, m.superseded_by || null);
         restored++;
       }
     }
