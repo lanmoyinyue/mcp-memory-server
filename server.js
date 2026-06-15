@@ -599,6 +599,79 @@ function createMcpServer() {
     }
   );
 
+  // 12. merge_memories — lightweight hippocampus (LMC-5 Module 3)
+  mcp.tool(
+    'merge_memories',
+    'Merge multiple memory fragments into one consolidated entry. Source memories are tagged "已合并" but NOT deleted. The merged result is saved as a new memory. Use when the same event is scattered across diary/daily/anchor fragments.',
+    {
+      ids:      z.array(z.string()).min(2).max(10).describe('IDs of memories to merge (2-10)'),
+      content:  z.string().min(1).describe('The merged narrative text (you write the synthesis)'),
+      category: z.string().optional().describe('Category for merged memory (default: same as first source)'),
+      tags:     z.array(z.string()).optional().describe('Tags for merged memory'),
+      source:   z.string().optional().describe('Source note'),
+    },
+    async ({ ids, content, category, tags, source }) => {
+      const now = new Date().toISOString();
+      const sources = [];
+      for (const id of ids) {
+        const row = db.prepare('SELECT * FROM memories WHERE id = ?').get(id);
+        if (!row) return { content: [{ type: 'text', text: `Source memory not found: ${id}` }] };
+        sources.push(row);
+      }
+
+      const mergedCategory = category || sources[0].category;
+      const hash = contentHash(content, mergedCategory);
+      const dupe = db.prepare('SELECT * FROM memories WHERE content_hash = ? AND (expires_at IS NULL OR expires_at > ?)').get(hash, now);
+      if (dupe) {
+        return { content: [{ type: 'text', text: JSON.stringify({ duplicate: true, existing: fmt(dupe) }, null, 2) }] };
+      }
+
+      const mergedId = uuidv4();
+      const expires_at = expiryFor(mergedCategory);
+      const embedding = await getEmbedding(content);
+
+      const mergedTags = tags || [];
+      if (!mergedTags.includes('merged')) mergedTags.push('merged');
+
+      const sourceRef = ids.map(id => id.slice(0, 8)).join('+');
+      const mergedSource = source || `merged from ${sourceRef}`;
+
+      db.prepare(
+        'INSERT INTO memories (id,content,category,tags,source,mood,created_at,updated_at,expires_at,embedding,pinned,content_hash) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)'
+      ).run(mergedId, content, mergedCategory, JSON.stringify(mergedTags), mergedSource, null, now, now, expires_at,
+        embedding ? JSON.stringify(embedding) : null, 0, hash);
+
+      // Tag source memories as merged (don't delete them)
+      const tagStmt = db.prepare('SELECT tags FROM memories WHERE id = ?');
+      const updateStmt = db.prepare('UPDATE memories SET tags = ?, updated_at = ? WHERE id = ?');
+      for (const id of ids) {
+        const row = tagStmt.get(id);
+        const existingTags = parseTags(row.tags);
+        if (!existingTags.includes('已合并')) existingTags.push('已合并');
+        updateStmt.run(JSON.stringify(existingTags), now, id);
+      }
+
+      // Create edges from merged → sources
+      const edgeStmt = db.prepare('INSERT OR IGNORE INTO memory_edges (source_id, target_id, weight, created_at) VALUES (?, ?, ?, ?)');
+      for (const id of ids) {
+        edgeStmt.run(mergedId, id, 1.0, now);
+        edgeStmt.run(id, mergedId, 1.0, now);
+      }
+
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            merged: { id: mergedId, category: mergedCategory },
+            source_count: ids.length,
+            sources_tagged: ids,
+            note: `合并完成。${ids.length}条原始记忆已标记"已合并"，未删除。`,
+          }, null, 2),
+        }],
+      };
+    }
+  );
+
   return mcp;
 }
 
