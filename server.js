@@ -47,6 +47,61 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_edges_target ON memory_edges(target_id);
 `);
 
+db.exec(`
+  CREATE TABLE IF NOT EXISTS somatic_events (
+    id           TEXT PRIMARY KEY,
+    actor        TEXT NOT NULL DEFAULT 'moon',
+    target       TEXT NOT NULL DEFAULT 'ke',
+    source       TEXT NOT NULL,
+    channel      TEXT,
+    modality     TEXT NOT NULL,
+    action       TEXT,
+    zone         TEXT,
+    labels       TEXT NOT NULL DEFAULT '[]',
+    intensity    REAL NOT NULL DEFAULT 1.0,
+    valence      TEXT,
+    text_excerpt TEXT,
+    created_at   TEXT NOT NULL,
+    expires_at   TEXT
+  );
+  CREATE INDEX IF NOT EXISTS idx_somatic_events_target ON somatic_events(target, created_at);
+  CREATE INDEX IF NOT EXISTS idx_somatic_events_expires ON somatic_events(expires_at);
+`);
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS somatic_state (
+    id             TEXT PRIMARY KEY,
+    target         TEXT NOT NULL DEFAULT 'ke',
+    modality       TEXT NOT NULL,
+    zone           TEXT,
+    label          TEXT NOT NULL,
+    strength       REAL NOT NULL,
+    half_life_sec  INTEGER NOT NULL,
+    last_event_id  TEXT,
+    updated_at     TEXT NOT NULL,
+    expires_at     TEXT NOT NULL
+  );
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_somatic_state_key ON somatic_state(target, modality, zone, label);
+  CREATE INDEX IF NOT EXISTS idx_somatic_state_expires ON somatic_state(expires_at);
+`);
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS somatic_hooks (
+    id          TEXT PRIMARY KEY,
+    target      TEXT NOT NULL DEFAULT 'ke',
+    modality    TEXT NOT NULL,
+    cue         TEXT NOT NULL,
+    fact_key    TEXT,
+    memory_id   TEXT,
+    note        TEXT,
+    weight      REAL NOT NULL DEFAULT 1.0,
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL
+  );
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_somatic_hooks_key ON somatic_hooks(target, modality, cue);
+  CREATE INDEX IF NOT EXISTS idx_somatic_hooks_fact ON somatic_hooks(fact_key);
+`);
+
 // Migrate: add embedding column for existing databases
 try { db.exec('ALTER TABLE memories ADD COLUMN embedding TEXT'); } catch {}
 // Migrate: add pinned column (pinned memories sort first in read_memories)
@@ -115,6 +170,155 @@ function expiryFor(category) {
   if (!EXPIRING.has(category)) return null;
   const exp = new Date(); exp.setDate(exp.getDate() + 3);
   return exp.toISOString();
+}
+
+const SOMATIC_MODALITIES = new Set(['touch', 'smell', 'taste', 'sound']);
+const SOMATIC_DEFAULT_HALF_LIFE = {
+  touch: 15 * 60,
+  smell: 60 * 60,
+  taste: 40 * 60,
+  sound: 10 * 60,
+};
+const SOMATIC_MIN_STRENGTH = 0.12;
+const SOMATIC_MAX_STRENGTH = 1.5;
+const SOMATIC_TARGET = 'ke';
+
+function ensureSomaticTarget(target = SOMATIC_TARGET) {
+  const normalized = String(target || SOMATIC_TARGET).trim();
+  if (normalized !== SOMATIC_TARGET) {
+    throw new Error('somatic v1 only supports target=ke');
+  }
+  return normalized;
+}
+
+function ensureSomaticModality(modality) {
+  const normalized = String(modality || '').trim().toLowerCase();
+  if (!SOMATIC_MODALITIES.has(normalized)) {
+    throw new Error('modality must be one of touch/smell/taste/sound');
+  }
+  return normalized;
+}
+
+function somaticHalfLife(modality, halfLifeSec) {
+  const value = Number(halfLifeSec || 0);
+  if (Number.isFinite(value) && value >= 60 && value <= 24 * 60 * 60) return Math.round(value);
+  return SOMATIC_DEFAULT_HALF_LIFE[modality] || SOMATIC_DEFAULT_HALF_LIFE.touch;
+}
+
+function somaticExpiresAt(now, halfLifeSec, ttlSec) {
+  const ttl = Number(ttlSec || 0);
+  const sec = Number.isFinite(ttl) && ttl >= 60
+    ? Math.min(ttl, 7 * 24 * 60 * 60)
+    : Math.min(halfLifeSec * 5, 7 * 24 * 60 * 60);
+  return new Date(new Date(now).getTime() + sec * 1000).toISOString();
+}
+
+function somaticStateId(target, modality, zone, label) {
+  return crypto.createHash('sha256')
+    .update([target, modality, zone || '', label].join('\u0000'))
+    .digest('hex');
+}
+
+function somaticDecayedStrength(row, now = new Date().toISOString()) {
+  const elapsedSec = Math.max(0, (Date.parse(now) - Date.parse(row.updated_at)) / 1000);
+  const halfLife = Math.max(1, Number(row.half_life_sec || SOMATIC_DEFAULT_HALF_LIFE.touch));
+  const strength = Number(row.strength || 0) * Math.pow(0.5, elapsedSec / halfLife);
+  return Math.max(0, strength);
+}
+
+function parseJsonArray(value) {
+  try {
+    const parsed = JSON.parse(value || '[]');
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function fmtSomaticEvent(r) {
+  return {
+    id: r.id,
+    actor: r.actor,
+    target: r.target,
+    source: r.source,
+    channel: r.channel || null,
+    modality: r.modality,
+    action: r.action || null,
+    zone: r.zone || null,
+    labels: parseJsonArray(r.labels),
+    intensity: Number(r.intensity || 0),
+    valence: r.valence || null,
+    text_excerpt: r.text_excerpt || null,
+    created_at: r.created_at,
+    expires_at: r.expires_at || null,
+  };
+}
+
+function fmtSomaticHook(r) {
+  return {
+    id: r.id,
+    target: r.target,
+    modality: r.modality,
+    cue: r.cue,
+    fact_key: r.fact_key || null,
+    memory_id: r.memory_id || null,
+    note: r.note || null,
+    weight: Number(r.weight || 0),
+    created_at: r.created_at,
+    updated_at: r.updated_at,
+  };
+}
+
+function cleanSomaticExpired(now = new Date().toISOString(), minStrength = SOMATIC_MIN_STRENGTH) {
+  db.prepare('DELETE FROM somatic_events WHERE expires_at IS NOT NULL AND expires_at < ?').run(now);
+  const rows = db.prepare('SELECT * FROM somatic_state WHERE expires_at < ?').all(now);
+  const del = db.prepare('DELETE FROM somatic_state WHERE id = ?');
+  for (const row of rows) del.run(row.id);
+  const active = db.prepare('SELECT * FROM somatic_state WHERE expires_at >= ?').all(now);
+  for (const row of active) {
+    if (somaticDecayedStrength(row, now) < minStrength) del.run(row.id);
+  }
+}
+
+function activeSomaticStates(target = SOMATIC_TARGET, minStrength = SOMATIC_MIN_STRENGTH) {
+  const now = new Date().toISOString();
+  cleanSomaticExpired(now, minStrength);
+  const rows = db.prepare('SELECT * FROM somatic_state WHERE target = ? AND expires_at >= ? ORDER BY modality, updated_at DESC').all(target, now);
+  const updateRows = [];
+  const del = db.prepare('DELETE FROM somatic_state WHERE id = ?');
+  for (const row of rows) {
+    const strength = somaticDecayedStrength(row, now);
+    if (strength < minStrength) {
+      del.run(row.id);
+      continue;
+    }
+    updateRows.push({ ...row, strength: +strength.toFixed(4) });
+  }
+  return updateRows;
+}
+
+function matchingSomaticHooks(state) {
+  const hooks = db.prepare('SELECT * FROM somatic_hooks WHERE target = ? AND modality = ? ORDER BY weight DESC, updated_at DESC')
+    .all(state.target, state.modality)
+    .map(fmtSomaticHook);
+  const haystack = `${state.zone || ''} ${state.label}`.toLowerCase();
+  return hooks.filter(h => haystack.includes(String(h.cue).toLowerCase())).slice(0, 3);
+}
+
+function somaticPromptText(items) {
+  if (!items.length) return '';
+  const names = { touch: '触觉', smell: '嗅觉', taste: '味觉', sound: '听觉' };
+  const lines = ['[身体状态]'];
+  for (const item of items) {
+    const zone = item.zone ? `${item.zone}：` : '';
+    let line = `${names[item.modality] || item.modality}：${zone}${item.label}，强度 ${Number(item.strength).toFixed(2)}，正在散。`;
+    if (item.hooks?.length) {
+      const hook = item.hooks[0];
+      line += ` ${hook.cue} 勾起了旧联想${hook.fact_key ? `（fact_key: ${hook.fact_key}）` : ''}。`;
+    }
+    lines.push(line);
+  }
+  return lines.join('\n');
 }
 
 // ── Embedding & vector similarity ─────────────────────────────────────────────
@@ -672,6 +876,228 @@ function createMcpServer() {
     }
   );
 
+  // 13. somatic_ignite — shared short-lived body-state trigger
+  mcp.tool(
+    'somatic_ignite',
+    'Shared somatic state: record a short-lived body sensation trigger for ke. Caller must parse text and pass labels; this server stores/decays state only and does not write ordinary memories.',
+    {
+      target:       z.string().optional().describe('Target body. v1 only supports ke.'),
+      actor:        z.string().optional().describe('Who caused the trigger, default moon'),
+      source:       z.string().min(1).describe('Entry source, e.g. telegram/cc-local/wechat'),
+      channel:      z.string().optional().describe('Optional channel/group/private label'),
+      modality:     z.enum(['touch', 'smell', 'taste', 'sound']).describe('Somatic modality'),
+      action:       z.string().optional().describe('Parsed action, e.g. 捏/抱/闻到'),
+      zone:         z.string().optional().describe('Parsed body zone or cue zone, e.g. 脸/耳后/雨味'),
+      labels:       z.array(z.string()).optional().describe('Caller-generated labels, e.g. ["脸","指尖","短促","温","有肉感"]'),
+      intensity:    z.number().min(0.05).max(2).optional().describe('Trigger intensity, default 1.0'),
+      valence:      z.string().optional().describe('Optional emotional valence'),
+      text_excerpt: z.string().max(300).optional().describe('Short source excerpt only; do not pass full chat logs'),
+      half_life_sec:z.number().int().min(60).max(86400).optional().describe('Override decay half-life'),
+      ttl_sec:      z.number().int().min(60).max(604800).optional().describe('Override hard expiry'),
+    },
+    async ({ target, actor = 'moon', source, channel, modality, action, zone, labels = [], intensity = 1.0, valence, text_excerpt, half_life_sec, ttl_sec }) => {
+      try {
+        const resolvedTarget = ensureSomaticTarget(target);
+        const resolvedModality = ensureSomaticModality(modality);
+        const now = new Date().toISOString();
+        const halfLife = somaticHalfLife(resolvedModality, half_life_sec);
+        const expiresAt = somaticExpiresAt(now, halfLife, ttl_sec);
+        const cleanLabels = labels.map(v => String(v || '').trim()).filter(Boolean).slice(0, 12);
+        const label = cleanLabels.length ? cleanLabels.join('·') : [zone, action, resolvedModality].filter(Boolean).join('·');
+        if (!label) throw new Error('labels, zone, or action is required');
+
+        const eventId = uuidv4();
+        const stateId = somaticStateId(resolvedTarget, resolvedModality, zone || '', label);
+        db.exec('BEGIN IMMEDIATE');
+        try {
+          db.prepare(
+            'INSERT INTO somatic_events (id,actor,target,source,channel,modality,action,zone,labels,intensity,valence,text_excerpt,created_at,expires_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)'
+          ).run(eventId, actor, resolvedTarget, source, channel || null, resolvedModality, action || null, zone || null,
+            JSON.stringify(cleanLabels), Number(intensity), valence || null, text_excerpt || null, now, expiresAt);
+
+          const existing = db.prepare('SELECT * FROM somatic_state WHERE id = ?').get(stateId);
+          const currentStrength = existing ? somaticDecayedStrength(existing, now) : 0;
+          const nextStrength = Math.min(SOMATIC_MAX_STRENGTH, currentStrength + Number(intensity));
+          if (existing) {
+            db.prepare(
+              'UPDATE somatic_state SET strength=?, half_life_sec=?, last_event_id=?, updated_at=?, expires_at=? WHERE id=?'
+            ).run(nextStrength, halfLife, eventId, now, expiresAt, stateId);
+          } else {
+            db.prepare(
+              'INSERT INTO somatic_state (id,target,modality,zone,label,strength,half_life_sec,last_event_id,updated_at,expires_at) VALUES (?,?,?,?,?,?,?,?,?,?)'
+            ).run(stateId, resolvedTarget, resolvedModality, zone || null, label, nextStrength, halfLife, eventId, now, expiresAt);
+          }
+          db.exec('COMMIT');
+        } catch (err) {
+          db.exec('ROLLBACK');
+          throw err;
+        }
+
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              event_id: eventId,
+              state_id: stateId,
+              target: resolvedTarget,
+              modality: resolvedModality,
+              zone: zone || null,
+              label,
+              labels: cleanLabels,
+              strength: +Math.min(SOMATIC_MAX_STRENGTH, Number(intensity)).toFixed(4),
+              half_life_sec: halfLife,
+              expires_at: expiresAt,
+              state_updated: true,
+            }, null, 2),
+          }],
+        };
+      } catch (err) {
+        return { content: [{ type: 'text', text: JSON.stringify({ error: err.message }, null, 2) }] };
+      }
+    }
+  );
+
+  // 14. somatic_snapshot — read decayed shared body-state before a reply
+  mcp.tool(
+    'somatic_snapshot',
+    'Shared somatic state: read current decayed body sensations for ke. Use before replying to inject prompt_text. Does not write ordinary memories.',
+    {
+      target:              z.string().optional().describe('Target body. v1 only supports ke.'),
+      source:              z.string().optional().describe('Entry source requesting the snapshot'),
+      include_prompt_text: z.boolean().optional().describe('Include Chinese prompt block for system prompt injection'),
+      min_strength:        z.number().min(0.01).max(1).optional().describe('Minimum active strength, default 0.12'),
+    },
+    async ({ target, source, include_prompt_text = true, min_strength = SOMATIC_MIN_STRENGTH }) => {
+      try {
+        const resolvedTarget = ensureSomaticTarget(target);
+        const states = activeSomaticStates(resolvedTarget, min_strength).map(row => {
+          const hooks = matchingSomaticHooks(row);
+          return {
+            id: row.id,
+            target: row.target,
+            modality: row.modality,
+            zone: row.zone || null,
+            label: row.label,
+            strength: row.strength,
+            half_life_sec: Number(row.half_life_sec),
+            last_event_id: row.last_event_id || null,
+            updated_at: row.updated_at,
+            expires_at: row.expires_at,
+            hooks,
+          };
+        });
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              target: resolvedTarget,
+              source: source || null,
+              active: states.length > 0,
+              count: states.length,
+              prompt_text: include_prompt_text ? somaticPromptText(states) : '',
+              items: states,
+            }, null, 2),
+          }],
+        };
+      } catch (err) {
+        return { content: [{ type: 'text', text: JSON.stringify({ error: err.message }, null, 2) }] };
+      }
+    }
+  );
+
+  // 15. somatic_clear — manually clear stuck or unwanted body-state
+  mcp.tool(
+    'somatic_clear',
+    'Shared somatic state: clear current short-lived body sensations. Use for stuck states; does not delete ordinary memories.',
+    {
+      target:       z.string().optional().describe('Target body. v1 only supports ke.'),
+      modality:     z.enum(['touch', 'smell', 'taste', 'sound']).optional().describe('Optional modality filter'),
+      zone:         z.string().optional().describe('Optional zone filter'),
+      label:        z.string().optional().describe('Optional exact label filter'),
+      clear_events: z.boolean().optional().describe('Also delete short-lived matching events, default false'),
+    },
+    async ({ target, modality, zone, label, clear_events = false }) => {
+      try {
+        const resolvedTarget = ensureSomaticTarget(target);
+        let sql = 'DELETE FROM somatic_state WHERE target = ?';
+        const p = [resolvedTarget];
+        if (modality) { sql += ' AND modality = ?'; p.push(ensureSomaticModality(modality)); }
+        if (zone !== undefined) { sql += ' AND zone = ?'; p.push(zone || null); }
+        if (label) { sql += ' AND label = ?'; p.push(label); }
+        const stateResult = db.prepare(sql).run(...p);
+
+        let eventChanges = 0;
+        if (clear_events) {
+          let eSql = 'DELETE FROM somatic_events WHERE target = ?';
+          const ep = [resolvedTarget];
+          if (modality) { eSql += ' AND modality = ?'; ep.push(ensureSomaticModality(modality)); }
+          if (zone !== undefined) { eSql += ' AND zone = ?'; ep.push(zone || null); }
+          eventChanges = db.prepare(eSql).run(...ep).changes;
+        }
+
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              target: resolvedTarget,
+              cleared_state: stateResult.changes,
+              cleared_events: eventChanges,
+            }, null, 2),
+          }],
+        };
+      } catch (err) {
+        return { content: [{ type: 'text', text: JSON.stringify({ error: err.message }, null, 2) }] };
+      }
+    }
+  );
+
+  // 16. somatic_hook_upsert — maintain long-lived Proust hooks
+  mcp.tool(
+    'somatic_hook_upsert',
+    'Shared somatic state: create/update a long-lived Proust hook. Prefer fact_key over memory_id; this is the only somatic table backed up long-term.',
+    {
+      target:    z.string().optional().describe('Target body. v1 only supports ke.'),
+      modality:  z.enum(['touch', 'smell', 'taste', 'sound']).describe('Cue modality'),
+      cue:       z.string().min(1).describe('Stable cue, e.g. 雨味/洗发水/耳边低声'),
+      fact_key:  z.string().optional().describe('Preferred stable reference into ordinary memories/facts'),
+      memory_id: z.string().optional().describe('Optional auxiliary memory id; fact_key is preferred because merge may change ids'),
+      note:      z.string().optional().describe('Human-readable hook note'),
+      weight:    z.number().min(0.05).max(5).optional().describe('Hook weight, default 1.0'),
+    },
+    async ({ target, modality, cue, fact_key, memory_id, note, weight = 1.0 }) => {
+      try {
+        const resolvedTarget = ensureSomaticTarget(target);
+        const resolvedModality = ensureSomaticModality(modality);
+        const now = new Date().toISOString();
+        const cleanCue = String(cue).trim();
+        const existing = db.prepare('SELECT * FROM somatic_hooks WHERE target = ? AND modality = ? AND cue = ?')
+          .get(resolvedTarget, resolvedModality, cleanCue);
+        let id = existing?.id || uuidv4();
+        if (existing) {
+          db.prepare(
+            'UPDATE somatic_hooks SET fact_key=?, memory_id=?, note=?, weight=?, updated_at=? WHERE id=?'
+          ).run(fact_key || null, memory_id || null, note || null, Number(weight), now, id);
+        } else {
+          db.prepare(
+            'INSERT INTO somatic_hooks (id,target,modality,cue,fact_key,memory_id,note,weight,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)'
+          ).run(id, resolvedTarget, resolvedModality, cleanCue, fact_key || null, memory_id || null, note || null, Number(weight), now, now);
+        }
+        const row = db.prepare('SELECT * FROM somatic_hooks WHERE id = ?').get(id);
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              upserted: fmtSomaticHook(row),
+              note: fact_key ? 'fact_key is the primary stable reference.' : 'No fact_key set; consider adding one for merge-safe linkage.',
+            }, null, 2),
+          }],
+        };
+      } catch (err) {
+        return { content: [{ type: 'text', text: JSON.stringify({ error: err.message }, null, 2) }] };
+      }
+    }
+  );
+
   return mcp;
 }
 
@@ -973,6 +1399,7 @@ app.post('/api/search/hybrid', auth, async (req, res) => {
 const BACKUP_REPO  = process.env.BACKUP_REPO  || 'lanmoyinyue/mcp-memory-server';
 const BACKUP_PATH  = 'backups/memories.jsonl';
 const EDGES_BACKUP_PATH = 'backups/memory_edges.jsonl';
+const SOMATIC_HOOKS_BACKUP_PATH = 'backups/somatic_hooks.jsonl';
 const BACKUP_TOKEN = process.env.BACKUP_GITHUB_TOKEN;
 
 async function ghRequest(method, path, body) {
@@ -1017,14 +1444,55 @@ async function runBackup() {
       content: edgeContentB64,
       ...(edgeSha ? { sha: edgeSha } : {}),
     });
-    console.log(`[backup] ${rows.length} memories and ${edgeRows.length} edges backed up to GitHub`);
+
+    const hookRows = db.prepare('SELECT * FROM somatic_hooks').all().map(fmtSomaticHook);
+    const hookContentB64 = Buffer.from(hookRows.map(r => JSON.stringify(r)).join('\n')).toString('base64');
+    let hookSha = null;
+    const existingHooks = await ghRequest('GET', SOMATIC_HOOKS_BACKUP_PATH);
+    if (existingHooks.ok) hookSha = (await existingHooks.json()).sha;
+    await ghRequest('PUT', SOMATIC_HOOKS_BACKUP_PATH, {
+      message: `backup: ${new Date().toISOString().slice(0, 10)} (${hookRows.length} somatic hooks) [zeabur skip]`,
+      content: hookContentB64,
+      ...(hookSha ? { sha: hookSha } : {}),
+    });
+
+    console.log(`[backup] ${rows.length} memories, ${edgeRows.length} edges, and ${hookRows.length} somatic hooks backed up to GitHub`);
   } catch (e) {
     console.error('[backup] failed:', e.message);
   }
 }
 
+async function restoreSomaticHooksIfEmpty() {
+  if (!BACKUP_TOKEN) return;
+  const count = db.prepare('SELECT COUNT(*) as c FROM somatic_hooks').get().c;
+  if (count > 0) {
+    console.log(`[backup] DB has ${count} somatic hooks — skipping somatic hook restore`);
+    return;
+  }
+  try {
+    const r = await ghRequest('GET', SOMATIC_HOOKS_BACKUP_PATH);
+    if (!r.ok) return;
+    const data = await r.json();
+    const content = Buffer.from(data.content.replace(/\n/g, ''), 'base64').toString('utf-8');
+    const lines = content.split('\n').filter(l => l.trim());
+    const stmt = db.prepare(
+      'INSERT OR IGNORE INTO somatic_hooks (id,target,modality,cue,fact_key,memory_id,note,weight,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)'
+    );
+    let restored = 0;
+    for (const line of lines) {
+      const h = JSON.parse(line);
+      stmt.run(h.id, h.target || 'ke', h.modality, h.cue, h.fact_key || null, h.memory_id || null, h.note || null, Number(h.weight || 1), h.created_at, h.updated_at);
+      restored++;
+    }
+    console.log(`[backup] auto-restored ${restored} somatic hooks from GitHub`);
+  } catch (e) {
+    console.error('[backup] somatic hook restore failed:', e.message);
+  }
+}
+
 async function autoRestore() {
   if (!BACKUP_TOKEN) return;
+  await restoreSomaticHooksIfEmpty();
   // Disaster recovery only: restore when the DB is EMPTY. Restoring into a
   // populated DB would resurrect deliberately deleted/expired memories.
   const count = db.prepare('SELECT COUNT(*) as c FROM memories').get().c;
