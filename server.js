@@ -174,12 +174,12 @@ function expiryFor(category) {
 
 const SOMATIC_MODALITIES = new Set(['touch', 'smell', 'taste', 'sound']);
 const SOMATIC_DEFAULT_HALF_LIFE = {
-  touch: 15 * 60,
-  smell: 60 * 60,
-  taste: 40 * 60,
-  sound: 10 * 60,
+  touch: 600,
+  smell: 1200,
+  taste: 900,
+  sound: 450,
 };
-const SOMATIC_MIN_STRENGTH = 0.12;
+const SOMATIC_MIN_STRENGTH = 0.15;
 const SOMATIC_MAX_STRENGTH = 1.5;
 const SOMATIC_TARGET = 'ke';
 
