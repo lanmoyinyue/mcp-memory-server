@@ -48,6 +48,21 @@ db.exec(`
 `);
 
 db.exec(`
+  CREATE TABLE IF NOT EXISTS raw_events (
+    id                TEXT PRIMARY KEY,
+    session_id        TEXT NOT NULL DEFAULT '',
+    channel           TEXT NOT NULL DEFAULT 'cc',
+    role              TEXT NOT NULL,
+    content           TEXT NOT NULL,
+    timestamp         TEXT NOT NULL,
+    linked_memory_ids TEXT NOT NULL DEFAULT '[]'
+  );
+  CREATE INDEX IF NOT EXISTS idx_re_channel   ON raw_events(channel);
+  CREATE INDEX IF NOT EXISTS idx_re_timestamp ON raw_events(timestamp);
+  CREATE INDEX IF NOT EXISTS idx_re_session   ON raw_events(session_id);
+`);
+
+db.exec(`
   CREATE TABLE IF NOT EXISTS somatic_events (
     id           TEXT PRIMARY KEY,
     actor        TEXT NOT NULL DEFAULT 'moon',
@@ -115,8 +130,22 @@ try { db.exec('CREATE INDEX IF NOT EXISTS idx_content_hash ON memories(content_h
 try { db.exec('ALTER TABLE memories ADD COLUMN fact_key TEXT'); } catch {}
 try { db.exec('ALTER TABLE memories ADD COLUMN superseded_by TEXT'); } catch {}
 try { db.exec('CREATE INDEX IF NOT EXISTS idx_fact_key ON memories(fact_key)'); } catch {}
+// Migrate: protected memories and curated-memory evidence links
+try { db.exec('ALTER TABLE memories ADD COLUMN protected INTEGER NOT NULL DEFAULT 0'); } catch {}
+try { db.exec("ALTER TABLE memories ADD COLUMN evidence_raw_ids TEXT NOT NULL DEFAULT '[]'"); } catch {}
+try { db.exec('CREATE INDEX IF NOT EXISTS idx_memories_protected ON memories(protected)'); } catch {}
 
 const contentHash = (text, category) => crypto.createHash('sha256').update(`${category}:${text.trim()}`).digest('hex');
+
+// Categories that automation (supersede/decay/merge/heat) must never mutate.
+const PROTECTED_CATEGORIES = new Set(['diary', 'deep', 'anchor', '私藏', '心动', 'cc-diary']);
+const isProtectedCategory = (category) => PROTECTED_CATEGORIES.has(String(category || '').trim());
+const resolveProtectedFlag = (category, requested, existing = 0) => {
+  if (isProtectedCategory(category)) return 1;
+  if (requested !== undefined) return requested ? 1 : 0;
+  return existing ? 1 : 0;
+};
+const rowIsProtected = (row) => !!row?.protected || isProtectedCategory(row?.category);
 
 // One-time backfill: content_hash for existing memories
 {
@@ -126,6 +155,14 @@ const contentHash = (text, category) => crypto.createHash('sha256').update(`${ca
     for (const m of unhashed) stmt.run(contentHash(m.content, m.category), m.id);
     console.log(`[migrate] backfilled content_hash for ${unhashed.length} memories`);
   }
+}
+
+// One-time backfill: protect existing first-person and treasure-box memories.
+{
+  const cats = [...PROTECTED_CATEGORIES];
+  const placeholders = cats.map(() => '?').join(',');
+  const r = db.prepare(`UPDATE memories SET protected = 1 WHERE category IN (${placeholders}) AND protected = 0`).run(...cats);
+  if (r.changes) console.log(`[migrate] protected ${r.changes} existing first-person memories`);
 }
 
 // One-time backfill: anchors & corridor now expire like daily (3 days).
@@ -146,14 +183,34 @@ const contentHash = (text, category) => crypto.createHash('sha256').update(`${ca
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-const parseTags = (t) => { try { return JSON.parse(t); } catch { return []; } };
+const parseArrayField = (t) => {
+  try {
+    const parsed = JSON.parse(t || '[]');
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+};
+const parseTags = parseArrayField;
 
 const fmt = (r) => ({
   id: r.id, content: r.content, category: r.category,
   tags: parseTags(r.tags), source: r.source, mood: r.mood || null, pinned: !!r.pinned,
   activation_score: +(r.activation_score || 0),
+  protected: rowIsProtected(r),
+  evidence_raw_ids: parseArrayField(r.evidence_raw_ids),
   fact_key: r.fact_key || null, superseded_by: r.superseded_by || null,
   created_at: r.created_at, updated_at: r.updated_at, expires_at: r.expires_at || null,
+});
+
+const fmtRawEvent = (r) => ({
+  id: r.id,
+  session_id: r.session_id || '',
+  channel: r.channel,
+  role: r.role,
+  content: r.content,
+  timestamp: r.timestamp,
+  linked_memory_ids: parseArrayField(r.linked_memory_ids),
 });
 
 const cleanExpired = () => {
@@ -226,15 +283,6 @@ function somaticDecayedStrength(row, now = new Date().toISOString()) {
   return Math.max(0, strength);
 }
 
-function parseJsonArray(value) {
-  try {
-    const parsed = JSON.parse(value || '[]');
-    return Array.isArray(parsed) ? parsed : [];
-  } catch {
-    return [];
-  }
-}
-
 function fmtSomaticEvent(r) {
   return {
     id: r.id,
@@ -245,7 +293,7 @@ function fmtSomaticEvent(r) {
     modality: r.modality,
     action: r.action || null,
     zone: r.zone || null,
-    labels: parseJsonArray(r.labels),
+    labels: parseArrayField(r.labels),
     intensity: Number(r.intensity || 0),
     valence: r.valence || null,
     text_excerpt: r.text_excerpt || null,
@@ -381,8 +429,10 @@ function createMcpServer() {
       mood:     z.string().optional().describe('Mood for diary (happy/sad/calm/excited/anxious)'),
       pinned:   z.boolean().optional().describe('Pin this memory: always sorts first in read_memories, never expires'),
       fact_key: z.string().optional().describe('Z-axis fact key (e.g. "闻川部署位置"). Same fact_key = same evolving fact; old version auto-superseded'),
+      protected: z.boolean().optional().describe('Lock this memory so automation cannot mutate it'),
+      evidence_raw_ids: z.array(z.string()).optional().describe('raw_event ids used as evidence for this curated memory'),
     },
-    async ({ content, category, tags, source, mood, pinned, fact_key }) => {
+    async ({ content, category, tags, source, mood, pinned, fact_key, protected: protectedArg, evidence_raw_ids }) => {
       const hash = contentHash(content, category);
       const dupe = db.prepare('SELECT * FROM memories WHERE content_hash = ? AND (expires_at IS NULL OR expires_at > ?)').get(hash, new Date().toISOString());
       if (dupe) {
@@ -401,23 +451,44 @@ function createMcpServer() {
       const id = uuidv4(), now = new Date().toISOString();
       // daily/anchor/cc-anchor expire in 3 days; pinned never expires
       const expires_at = pinned ? null : expiryFor(category);
+      const protectedFlag = resolveProtectedFlag(category, protectedArg, 0);
+      const evidenceIds = JSON.stringify(evidence_raw_ids ?? []);
       // Compute embedding and find related BEFORE inserting (so new memory is excluded)
       const embedding = await getEmbedding(content);
       const related = findRelated(embedding, id);
 
+      // Z-axis protected guard: never auto-supersede protected old memories.
+      let oldFactRows = [];
+      if (fact_key) {
+        oldFactRows = db.prepare(
+          'SELECT * FROM memories WHERE fact_key = ? AND id != ? AND superseded_by IS NULL'
+        ).all(fact_key, id);
+        const blocked = oldFactRows.filter(rowIsProtected);
+        if (blocked.length) {
+          return {
+            content: [{
+              type: 'text',
+              text: JSON.stringify({
+                error: 'protected_fact_conflict',
+                fact_key,
+                protected_ids: blocked.map(m => m.id),
+                note: 'Refusing to auto-supersede protected memories. Update protected facts manually after review.',
+              }, null, 2),
+            }],
+          };
+        }
+      }
+
       db.prepare(
-        'INSERT INTO memories (id,content,category,tags,source,mood,created_at,updated_at,expires_at,embedding,pinned,content_hash,fact_key) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)'
+        'INSERT INTO memories (id,content,category,tags,source,mood,created_at,updated_at,expires_at,embedding,pinned,content_hash,fact_key,protected,evidence_raw_ids) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)'
       ).run(id, content, category, JSON.stringify(tags ?? []), source ?? '', mood ?? null, now, now, expires_at,
-        embedding ? JSON.stringify(embedding) : null, pinned ? 1 : 0, hash, fact_key ?? null);
+        embedding ? JSON.stringify(embedding) : null, pinned ? 1 : 0, hash, fact_key ?? null, protectedFlag, evidenceIds);
 
       // Z-axis: auto-supersede old versions of the same fact
       let superseded = [];
       if (fact_key) {
-        const old = db.prepare(
-          'SELECT id FROM memories WHERE fact_key = ? AND id != ? AND superseded_by IS NULL'
-        ).all(fact_key, id);
         const superStmt = db.prepare('UPDATE memories SET superseded_by = ?, updated_at = ? WHERE id = ?');
-        for (const o of old) {
+        for (const o of oldFactRows) {
           superStmt.run(id, now, o.id);
           superseded.push(o.id);
         }
@@ -526,12 +597,16 @@ function createMcpServer() {
       mood:     z.string().optional(),
       pinned:   z.boolean().optional().describe('Pin/unpin: pinned memories sort first in read_memories and never expire'),
       fact_key: z.string().optional().describe('Set or change the Z-axis fact key for this memory'),
+      protected: z.boolean().optional().describe('Lock/unlock automation protection; protected categories stay locked'),
+      evidence_raw_ids: z.array(z.string()).optional().describe('Replace linked raw_event evidence ids'),
     },
-    async ({ id, content, category, tags, source, mood, pinned, fact_key }) => {
+    async ({ id, content, category, tags, source, mood, pinned, fact_key, protected: protectedArg, evidence_raw_ids }) => {
       const row = db.prepare('SELECT * FROM memories WHERE id = ?').get(id);
       if (!row) return { content: [{ type: 'text', text: `Not found: ${id}` }] };
       const newCategory = category ?? row.category;
       const newPinned = pinned !== undefined ? (pinned ? 1 : 0) : row.pinned;
+      const newProtected = resolveProtectedFlag(newCategory, protectedArg, row.protected);
+      const newEvidenceIds = evidence_raw_ids !== undefined ? JSON.stringify(evidence_raw_ids) : row.evidence_raw_ids;
       let expires_at = row.expires_at;
       const categoryChanged = category !== undefined && category !== row.category;
       const pinnedChanged = pinned !== undefined && (pinned ? 1 : 0) !== row.pinned;
@@ -539,7 +614,7 @@ function createMcpServer() {
         expires_at = newPinned ? null : expiryFor(newCategory);
       }
       const newFactKey = fact_key !== undefined ? fact_key : row.fact_key;
-      db.prepare('UPDATE memories SET content=?,category=?,tags=?,source=?,mood=?,pinned=?,updated_at=?,expires_at=?,content_hash=?,fact_key=? WHERE id=?').run(
+      db.prepare('UPDATE memories SET content=?,category=?,tags=?,source=?,mood=?,pinned=?,updated_at=?,expires_at=?,content_hash=?,fact_key=?,protected=?,evidence_raw_ids=? WHERE id=?').run(
         content ?? row.content,
         newCategory,
         tags !== undefined ? JSON.stringify(tags) : row.tags,
@@ -550,12 +625,16 @@ function createMcpServer() {
         expires_at,
         contentHash(content ?? row.content, newCategory),
         newFactKey ?? null,
+        newProtected,
+        newEvidenceIds,
         id
       );
       const notes = [];
       if (categoryChanged) notes.push(`moved ${row.category} → ${newCategory}`);
       if (pinnedChanged) notes.push(newPinned ? 'pinned' : 'unpinned');
       if (fact_key !== undefined) notes.push(`fact_key=${fact_key || '(cleared)'}`);
+      if (protectedArg !== undefined || newProtected !== row.protected) notes.push(newProtected ? 'protected' : 'unprotected');
+      if (evidence_raw_ids !== undefined) notes.push(`evidence_raw_ids=${evidence_raw_ids.length}`);
       return { content: [{ type: 'text', text: notes.length ? `Updated ${id} (${notes.join(', ')}).` : `Updated ${id}.` }] };
     }
   );
@@ -706,7 +785,7 @@ function createMcpServer() {
 
       // 命中升温
       if (fused.length) {
-        const heat = db.prepare('UPDATE memories SET activation_score = MIN(activation_score + 0.2, 8.0) WHERE id = ?');
+        const heat = db.prepare('UPDATE memories SET activation_score = MIN(activation_score + 0.2, 8.0) WHERE id = ? AND protected = 0');
         for (const r of fused) heat.run(r.id);
       }
 
@@ -729,10 +808,10 @@ function createMcpServer() {
       decay_factor: z.number().min(0.5).max(0.99).optional().describe('Decay multiplier (default 0.85)'),
     },
     async ({ decay_factor = 0.85 }) => {
-      const before = db.prepare('SELECT COUNT(*) as c FROM memories WHERE activation_score > 0.01').get().c;
-      db.prepare('UPDATE memories SET activation_score = activation_score * ? WHERE activation_score > 0.01').run(decay_factor);
-      db.prepare('UPDATE memories SET activation_score = 0 WHERE activation_score <= 0.01 AND activation_score > 0').run();
-      const after = db.prepare('SELECT COUNT(*) as c FROM memories WHERE activation_score > 0.01').get().c;
+      const before = db.prepare('SELECT COUNT(*) as c FROM memories WHERE protected = 0 AND activation_score > 0.01').get().c;
+      db.prepare('UPDATE memories SET activation_score = activation_score * ? WHERE protected = 0 AND activation_score > 0.01').run(decay_factor);
+      db.prepare('UPDATE memories SET activation_score = 0 WHERE protected = 0 AND activation_score <= 0.01 AND activation_score > 0').run();
+      const after = db.prepare('SELECT COUNT(*) as c FROM memories WHERE protected = 0 AND activation_score > 0.01').get().c;
       return {
         content: [{
           type: 'text',
@@ -822,6 +901,19 @@ function createMcpServer() {
         if (!row) return { content: [{ type: 'text', text: `Source memory not found: ${id}` }] };
         sources.push(row);
       }
+      const protectedSources = sources.filter(rowIsProtected);
+      if (protectedSources.length) {
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              error: 'protected_merge_refused',
+              protected_ids: protectedSources.map(m => m.id),
+              note: 'protected memories do not participate in merge_memories.',
+            }, null, 2),
+          }],
+        };
+      }
 
       const mergedCategory = category || sources[0].category;
       const hash = contentHash(content, mergedCategory);
@@ -833,6 +925,7 @@ function createMcpServer() {
       const mergedId = uuidv4();
       const expires_at = expiryFor(mergedCategory);
       const embedding = await getEmbedding(content);
+      const protectedFlag = resolveProtectedFlag(mergedCategory, undefined, 0);
 
       const mergedTags = tags || [];
       if (!mergedTags.includes('merged')) mergedTags.push('merged');
@@ -841,9 +934,9 @@ function createMcpServer() {
       const mergedSource = source || `merged from ${sourceRef}`;
 
       db.prepare(
-        'INSERT INTO memories (id,content,category,tags,source,mood,created_at,updated_at,expires_at,embedding,pinned,content_hash) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)'
+        'INSERT INTO memories (id,content,category,tags,source,mood,created_at,updated_at,expires_at,embedding,pinned,content_hash,protected,evidence_raw_ids) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)'
       ).run(mergedId, content, mergedCategory, JSON.stringify(mergedTags), mergedSource, null, now, now, expires_at,
-        embedding ? JSON.stringify(embedding) : null, 0, hash);
+        embedding ? JSON.stringify(embedding) : null, 0, hash, protectedFlag, '[]');
 
       // Tag source memories as merged (don't delete them)
       const tagStmt = db.prepare('SELECT tags FROM memories WHERE id = ?');
@@ -876,7 +969,79 @@ function createMcpServer() {
     }
   );
 
-  // 13. somatic_ignite — shared short-lived body-state trigger
+  // 13. log_raw_event — append-only raw evidence journal
+  mcp.tool(
+    'log_raw_event',
+    'Record one original dialogue event into raw_events evidence journal. Use linked_memory_ids to connect raw text to curated memories.',
+    {
+      session_id: z.string().optional().describe('Session id; keep the same id for one conversation'),
+      channel: z.enum(['cc', 'daily', 'intimate']).describe('Conversation channel'),
+      role: z.enum(['user', 'assistant']).describe('Speaker role'),
+      content: z.string().min(1).describe('Original text content'),
+      linked_memory_ids: z.array(z.string()).optional().describe('Curated memory ids linked to this raw event'),
+    },
+    async ({ session_id = '', channel, role, content, linked_memory_ids = [] }) => {
+      const id = uuidv4();
+      const now = new Date().toISOString();
+      db.prepare(
+        'INSERT INTO raw_events (id,session_id,channel,role,content,timestamp,linked_memory_ids) VALUES (?,?,?,?,?,?,?)'
+      ).run(id, session_id, channel, role, content, now, JSON.stringify(linked_memory_ids));
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({ id, timestamp: now, channel, role }, null, 2),
+        }],
+      };
+    }
+  );
+
+  // 14. search_raw_events — keyword search original evidence
+  mcp.tool(
+    'search_raw_events',
+    'Keyword-search raw_events and return original dialogue snippets.',
+    {
+      query: z.string().min(1).describe('Search term'),
+      channel: z.enum(['cc', 'daily', 'intimate', 'all']).default('all').describe('Filter by channel, or all'),
+      limit: z.number().int().min(1).max(50).default(20),
+    },
+    async ({ query, channel = 'all', limit = 20 }) => {
+      const like = `%${query}%`;
+      const rows = channel === 'all'
+        ? db.prepare('SELECT * FROM raw_events WHERE content LIKE ? ORDER BY timestamp DESC LIMIT ?').all(like, limit)
+        : db.prepare('SELECT * FROM raw_events WHERE content LIKE ? AND channel = ? ORDER BY timestamp DESC LIMIT ?').all(like, channel, limit);
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({ results: rows.map(fmtRawEvent), count: rows.length }, null, 2),
+        }],
+      };
+    }
+  );
+
+  // 15. get_evidence — curated memory → linked raw events
+  mcp.tool(
+    'get_evidence',
+    'Return raw_events linked from one curated memory via evidence_raw_ids.',
+    {
+      memory_id: z.string().describe('Curated memory id'),
+    },
+    async ({ memory_id }) => {
+      const mem = db.prepare('SELECT evidence_raw_ids FROM memories WHERE id = ?').get(memory_id);
+      if (!mem) return { content: [{ type: 'text', text: JSON.stringify({ error: 'memory not found' }, null, 2) }] };
+      const ids = parseArrayField(mem.evidence_raw_ids);
+      if (!ids.length) return { content: [{ type: 'text', text: JSON.stringify({ evidence: [], count: 0 }, null, 2) }] };
+      const placeholders = ids.map(() => '?').join(',');
+      const rows = db.prepare(`SELECT * FROM raw_events WHERE id IN (${placeholders}) ORDER BY timestamp ASC`).all(...ids);
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({ evidence: rows.map(fmtRawEvent), count: rows.length }, null, 2),
+        }],
+      };
+    }
+  );
+
+  // 16. somatic_ignite — shared short-lived body-state trigger
   mcp.tool(
     'somatic_ignite',
     'Shared somatic state: record a short-lived body sensation trigger for ke. Caller must parse text and pass labels; this server stores/decays state only and does not write ordinary memories.',
@@ -957,7 +1122,7 @@ function createMcpServer() {
     }
   );
 
-  // 14. somatic_snapshot — read decayed shared body-state before a reply
+  // 17. somatic_snapshot — read decayed shared body-state before a reply
   mcp.tool(
     'somatic_snapshot',
     'Shared somatic state: read current decayed body sensations for ke. Use before replying to inject prompt_text. Does not write ordinary memories.',
@@ -1005,7 +1170,7 @@ function createMcpServer() {
     }
   );
 
-  // 15. somatic_clear — manually clear stuck or unwanted body-state
+  // 18. somatic_clear — manually clear stuck or unwanted body-state
   mcp.tool(
     'somatic_clear',
     'Shared somatic state: clear current short-lived body sensations. Use for stuck states; does not delete ordinary memories.',
@@ -1051,7 +1216,7 @@ function createMcpServer() {
     }
   );
 
-  // 16. somatic_hook_upsert — maintain long-lived Proust hooks
+  // 19. somatic_hook_upsert — maintain long-lived Proust hooks
   mcp.tool(
     'somatic_hook_upsert',
     'Shared somatic state: create/update a long-lived Proust hook. Prefer fact_key over memory_id; this is the only somatic table backed up long-term.',
@@ -1191,24 +1356,40 @@ app.get('/api/memories', auth, (req, res) => {
 });
 
 app.post('/api/memories', auth, async (req, res) => {
-  const { content, category, tags = [], source = '', mood = null, pinned = false, fact_key = null } = req.body;
+  const { content, category, tags = [], source = '', mood = null, pinned = false, fact_key = null, protected: protectedArg, evidence_raw_ids = [] } = req.body;
   if (!content || !category) return res.status(400).json({ error: 'content and category required' });
   const hash = contentHash(content, category);
   const dupe = db.prepare('SELECT * FROM memories WHERE content_hash = ? AND (expires_at IS NULL OR expires_at > ?)').get(hash, new Date().toISOString());
   if (dupe) return res.json({ id: dupe.id, duplicate: true, message: 'Duplicate content, skipped' });
   const id = uuidv4(), now = new Date().toISOString();
   const expires_at = pinned ? null : expiryFor(category);
+  const protectedFlag = resolveProtectedFlag(category, protectedArg, 0);
+  const evidenceIds = JSON.stringify(evidence_raw_ids);
   const embedding = await getEmbedding(content);
   const related = findRelated(embedding, id);
-  db.prepare('INSERT INTO memories (id,content,category,tags,source,mood,created_at,updated_at,expires_at,embedding,pinned,content_hash,fact_key) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)')
+
+  let oldFactRows = [];
+  if (fact_key) {
+    oldFactRows = db.prepare('SELECT * FROM memories WHERE fact_key = ? AND id != ? AND superseded_by IS NULL').all(fact_key, id);
+    const blocked = oldFactRows.filter(rowIsProtected);
+    if (blocked.length) {
+      return res.status(409).json({
+        error: 'protected_fact_conflict',
+        fact_key,
+        protected_ids: blocked.map(m => m.id),
+        message: 'Refusing to auto-supersede protected memories.',
+      });
+    }
+  }
+
+  db.prepare('INSERT INTO memories (id,content,category,tags,source,mood,created_at,updated_at,expires_at,embedding,pinned,content_hash,fact_key,protected,evidence_raw_ids) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)')
     .run(id, content, category, JSON.stringify(tags), source, mood, now, now, expires_at,
-      embedding ? JSON.stringify(embedding) : null, pinned ? 1 : 0, hash, fact_key);
+      embedding ? JSON.stringify(embedding) : null, pinned ? 1 : 0, hash, fact_key, protectedFlag, evidenceIds);
   // Z-axis: auto-supersede old versions
   let superseded = [];
   if (fact_key) {
-    const old = db.prepare('SELECT id FROM memories WHERE fact_key = ? AND id != ? AND superseded_by IS NULL').all(fact_key, id);
     const superStmt = db.prepare('UPDATE memories SET superseded_by = ?, updated_at = ? WHERE id = ?');
-    for (const o of old) { superStmt.run(id, now, o.id); superseded.push(o.id); }
+    for (const o of oldFactRows) { superStmt.run(id, now, o.id); superseded.push(o.id); }
   }
   if (related.length) {
     const edgeStmt = db.prepare('INSERT OR IGNORE INTO memory_edges (source_id, target_id, weight, created_at) VALUES (?, ?, ?, ?)');
@@ -1223,9 +1404,11 @@ app.post('/api/memories', auth, async (req, res) => {
 app.put('/api/memories/:id', auth, (req, res) => {
   const row = db.prepare('SELECT * FROM memories WHERE id = ?').get(req.params.id);
   if (!row) return res.status(404).json({ error: 'Not found' });
-  const { content, category, tags, source, mood, pinned, fact_key } = req.body;
+  const { content, category, tags, source, mood, pinned, fact_key, protected: protectedArg, evidence_raw_ids } = req.body;
   const newCategory = category ?? row.category;
   const newPinned = pinned !== undefined ? (pinned ? 1 : 0) : row.pinned;
+  const newProtected = resolveProtectedFlag(newCategory, protectedArg, row.protected);
+  const newEvidenceIds = evidence_raw_ids !== undefined ? JSON.stringify(evidence_raw_ids) : row.evidence_raw_ids;
   let expires_at = row.expires_at;
   const categoryChanged = category !== undefined && category !== row.category;
   const pinnedChanged = pinned !== undefined && (pinned ? 1 : 0) !== row.pinned;
@@ -1233,7 +1416,7 @@ app.put('/api/memories/:id', auth, (req, res) => {
     expires_at = newPinned ? null : expiryFor(newCategory);
   }
   const newFactKey = fact_key !== undefined ? fact_key : row.fact_key;
-  db.prepare('UPDATE memories SET content=?,category=?,tags=?,source=?,mood=?,pinned=?,updated_at=?,expires_at=?,content_hash=?,fact_key=? WHERE id=?').run(
+  db.prepare('UPDATE memories SET content=?,category=?,tags=?,source=?,mood=?,pinned=?,updated_at=?,expires_at=?,content_hash=?,fact_key=?,protected=?,evidence_raw_ids=? WHERE id=?').run(
     content ?? row.content,
     newCategory,
     tags !== undefined ? JSON.stringify(tags) : row.tags,
@@ -1244,6 +1427,8 @@ app.put('/api/memories/:id', auth, (req, res) => {
     expires_at,
     contentHash(content ?? row.content, newCategory),
     newFactKey ?? null,
+    newProtected,
+    newEvidenceIds,
     req.params.id
   );
   res.json({ message: 'Updated' });
@@ -1383,7 +1568,7 @@ app.post('/api/search/hybrid', auth, async (req, res) => {
 
     // 命中升温
     if (fused.length) {
-      const heat = db.prepare('UPDATE memories SET activation_score = MIN(activation_score + 0.2, 8.0) WHERE id = ?');
+      const heat = db.prepare('UPDATE memories SET activation_score = MIN(activation_score + 0.2, 8.0) WHERE id = ? AND protected = 0');
       for (const r of fused) heat.run(r.id);
     }
 
@@ -1399,6 +1584,7 @@ app.post('/api/search/hybrid', auth, async (req, res) => {
 const BACKUP_REPO  = process.env.BACKUP_REPO  || 'lanmoyinyue/mcp-memory-server';
 const BACKUP_PATH  = 'backups/memories.jsonl';
 const EDGES_BACKUP_PATH = 'backups/memory_edges.jsonl';
+const RAW_EVENTS_BACKUP_PATH = 'backups/raw_events.jsonl';
 const SOMATIC_HOOKS_BACKUP_PATH = 'backups/somatic_hooks.jsonl';
 const BACKUP_TOKEN = process.env.BACKUP_GITHUB_TOKEN;
 
@@ -1445,6 +1631,17 @@ async function runBackup() {
       ...(edgeSha ? { sha: edgeSha } : {}),
     });
 
+    const rawRows = db.prepare("SELECT * FROM raw_events WHERE channel != 'intimate' ORDER BY timestamp DESC").all().map(fmtRawEvent);
+    const rawContentB64 = Buffer.from(rawRows.map(r => JSON.stringify(r)).join('\n')).toString('base64');
+    let rawSha = null;
+    const existingRaw = await ghRequest('GET', RAW_EVENTS_BACKUP_PATH);
+    if (existingRaw.ok) rawSha = (await existingRaw.json()).sha;
+    await ghRequest('PUT', RAW_EVENTS_BACKUP_PATH, {
+      message: `backup: ${new Date().toISOString().slice(0, 10)} (${rawRows.length} raw events) [zeabur skip]`,
+      content: rawContentB64,
+      ...(rawSha ? { sha: rawSha } : {}),
+    });
+
     const hookRows = db.prepare('SELECT * FROM somatic_hooks').all().map(fmtSomaticHook);
     const hookContentB64 = Buffer.from(hookRows.map(r => JSON.stringify(r)).join('\n')).toString('base64');
     let hookSha = null;
@@ -1456,7 +1653,7 @@ async function runBackup() {
       ...(hookSha ? { sha: hookSha } : {}),
     });
 
-    console.log(`[backup] ${rows.length} memories, ${edgeRows.length} edges, and ${hookRows.length} somatic hooks backed up to GitHub`);
+    console.log(`[backup] ${rows.length} memories, ${edgeRows.length} edges, ${rawRows.length} raw events, and ${hookRows.length} somatic hooks backed up to GitHub`);
   } catch (e) {
     console.error('[backup] failed:', e.message);
   }
@@ -1490,9 +1687,39 @@ async function restoreSomaticHooksIfEmpty() {
   }
 }
 
+async function restoreRawEventsIfEmpty() {
+  if (!BACKUP_TOKEN) return;
+  const count = db.prepare('SELECT COUNT(*) as c FROM raw_events').get().c;
+  if (count > 0) {
+    console.log(`[backup] DB has ${count} raw events — skipping raw event restore`);
+    return;
+  }
+  try {
+    const r = await ghRequest('GET', RAW_EVENTS_BACKUP_PATH);
+    if (!r.ok) return;
+    const data = await r.json();
+    const content = Buffer.from(data.content.replace(/\n/g, ''), 'base64').toString('utf-8');
+    const lines = content.split('\n').filter(l => l.trim());
+    const stmt = db.prepare(
+      'INSERT OR IGNORE INTO raw_events (id,session_id,channel,role,content,timestamp,linked_memory_ids) VALUES (?,?,?,?,?,?,?)'
+    );
+    let restored = 0;
+    for (const line of lines) {
+      const e = JSON.parse(line);
+      const linked = Array.isArray(e.linked_memory_ids) ? e.linked_memory_ids : parseArrayField(e.linked_memory_ids);
+      stmt.run(e.id, e.session_id || '', e.channel, e.role, e.content, e.timestamp, JSON.stringify(linked));
+      restored++;
+    }
+    console.log(`[backup] auto-restored ${restored} raw events from GitHub`);
+  } catch (e) {
+    console.error('[backup] raw event restore failed:', e.message);
+  }
+}
+
 async function autoRestore() {
   if (!BACKUP_TOKEN) return;
   await restoreSomaticHooksIfEmpty();
+  await restoreRawEventsIfEmpty();
   // Disaster recovery only: restore when the DB is EMPTY. Restoring into a
   // populated DB would resurrect deliberately deleted/expired memories.
   const count = db.prepare('SELECT COUNT(*) as c FROM memories').get().c;
@@ -1511,8 +1738,8 @@ async function autoRestore() {
       const m = JSON.parse(line);
       const exists = db.prepare('SELECT id FROM memories WHERE id = ?').get(m.id);
       if (!exists) {
-        db.prepare('INSERT INTO memories (id,content,category,tags,source,mood,created_at,updated_at,expires_at,pinned,content_hash,activation_score,fact_key,superseded_by) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)')
-          .run(m.id, m.content, m.category, JSON.stringify(m.tags || []), m.source || '', m.mood, m.created_at, m.updated_at, m.expires_at || null, m.pinned ? 1 : 0, m.content_hash || contentHash(m.content, m.category), Number(m.activation_score || 0), m.fact_key || null, m.superseded_by || null);
+        db.prepare('INSERT INTO memories (id,content,category,tags,source,mood,created_at,updated_at,expires_at,pinned,content_hash,activation_score,fact_key,superseded_by,protected,evidence_raw_ids) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)')
+          .run(m.id, m.content, m.category, JSON.stringify(m.tags || []), m.source || '', m.mood, m.created_at, m.updated_at, m.expires_at || null, m.pinned ? 1 : 0, m.content_hash || contentHash(m.content, m.category), Number(m.activation_score || 0), m.fact_key || null, m.superseded_by || null, resolveProtectedFlag(m.category, m.protected, 0), JSON.stringify(m.evidence_raw_ids || []));
         restored++;
       }
     }
