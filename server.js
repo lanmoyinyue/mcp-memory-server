@@ -66,6 +66,30 @@ db.exec(`
 `);
 
 db.exec(`
+  CREATE TABLE IF NOT EXISTS memory_candidates (
+    id                       TEXT PRIMARY KEY,
+    raw_event_ids            TEXT NOT NULL DEFAULT '[]',
+    dedupe_key               TEXT NOT NULL,
+    source                   TEXT NOT NULL DEFAULT '',
+    channel                  TEXT NOT NULL DEFAULT '',
+    speaker                  TEXT NOT NULL DEFAULT '',
+    summary                  TEXT NOT NULL,
+    suggested_category       TEXT NOT NULL DEFAULT 'daily',
+    reason                   TEXT NOT NULL DEFAULT '',
+    confidence               REAL NOT NULL DEFAULT 0,
+    status                   TEXT NOT NULL DEFAULT 'pending',
+    created_at               TEXT NOT NULL,
+    updated_at               TEXT NOT NULL,
+    reviewed_at              TEXT,
+    review_note              TEXT,
+    expires_at               TEXT
+  );
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_candidate_dedupe ON memory_candidates(dedupe_key);
+  CREATE INDEX IF NOT EXISTS idx_candidate_status ON memory_candidates(status, created_at);
+  CREATE INDEX IF NOT EXISTS idx_candidate_expires ON memory_candidates(expires_at);
+`);
+
+db.exec(`
   CREATE TABLE IF NOT EXISTS somatic_events (
     id           TEXT PRIMARY KEY,
     actor        TEXT NOT NULL DEFAULT 'moon',
@@ -142,6 +166,11 @@ try { db.exec("ALTER TABLE raw_events ADD COLUMN source TEXT NOT NULL DEFAULT ''
 try { db.exec("ALTER TABLE raw_events ADD COLUMN speaker TEXT NOT NULL DEFAULT ''"); } catch {}
 try { db.exec("ALTER TABLE raw_events ADD COLUMN metadata TEXT NOT NULL DEFAULT '{}'"); } catch {}
 try { db.exec('CREATE INDEX IF NOT EXISTS idx_re_source ON raw_events(source)'); } catch {}
+// Migrate: hippocampus proposal layer for raw_events -> reviewed candidates.
+try { db.exec("ALTER TABLE memory_candidates ADD COLUMN expires_at TEXT"); } catch {}
+try { db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_candidate_dedupe ON memory_candidates(dedupe_key)'); } catch {}
+try { db.exec('CREATE INDEX IF NOT EXISTS idx_candidate_status ON memory_candidates(status, created_at)'); } catch {}
+try { db.exec('CREATE INDEX IF NOT EXISTS idx_candidate_expires ON memory_candidates(expires_at)'); } catch {}
 
 const contentHash = (text, category) => crypto.createHash('sha256').update(`${category}:${text.trim()}`).digest('hex');
 
@@ -231,6 +260,101 @@ const fmtRawEvent = (r) => ({
   linked_memory_ids: parseArrayField(r.linked_memory_ids),
   metadata: parseObjectField(r.metadata),
 });
+
+// Candidate category labels shown to Moon. Machine values stay stable; edit here
+// when adding a new candidate category.
+const CANDIDATE_CATEGORY_LABELS = {
+  daily: '日常候选',
+  work: '工作候选',
+  todo_candidate: '待办候选',
+  private_candidate: '私密候选',
+  boundary_candidate: '边界候选',
+  preference_candidate: '偏好候选',
+};
+const candidateCategoryLabel = (category) => CANDIDATE_CATEGORY_LABELS[category] || category || '';
+const VALID_CANDIDATE_STATUS = new Set(['pending', 'accepted', 'rejected', 'merged', 'stale']);
+const candidateDedupeKey = (ids) => crypto.createHash('sha256').update([...ids].sort().join('\0')).digest('hex');
+const candidateExpiresAt = (now, days = 7) => {
+  const exp = new Date(now);
+  exp.setDate(exp.getDate() + days);
+  return exp.toISOString();
+};
+const markStaleCandidates = (now = new Date().toISOString()) => db.prepare(
+  "UPDATE memory_candidates SET status='stale', updated_at=? WHERE status='pending' AND expires_at IS NOT NULL AND expires_at < ?"
+).run(now, now);
+const fmtMemoryCandidate = (r) => ({
+  id: r.id,
+  raw_event_ids: parseArrayField(r.raw_event_ids),
+  dedupe_key: r.dedupe_key,
+  source: r.source || '',
+  channel: r.channel || '',
+  speaker: r.speaker || '',
+  summary: r.summary,
+  suggested_category: r.suggested_category,
+  suggested_category_label: candidateCategoryLabel(r.suggested_category),
+  reason: r.reason || '',
+  confidence: Number(r.confidence || 0),
+  status: r.status,
+  created_at: r.created_at,
+  updated_at: r.updated_at,
+  reviewed_at: r.reviewed_at || null,
+  review_note: r.review_note || null,
+  expires_at: r.expires_at || null,
+});
+
+function rawEventDisplaySource(row) {
+  if (row.source === 'telegram') return row.channel === 'private' ? 'TG 私聊' : 'TG';
+  if (row.source === 'kechat-light') return '小家';
+  return row.source || row.channel || '未知入口';
+}
+
+function truncateText(text, max = 180) {
+  const clean = String(text || '').replace(/\s+/g, ' ').trim();
+  return clean.length > max ? `${clean.slice(0, max - 1)}…` : clean;
+}
+
+function classifyRawEvent(row) {
+  const text = String(row.content || '');
+  const lower = text.toLowerCase();
+  const isPrivate = row.channel === 'private' || row.channel === 'intimate';
+  if (isPrivate) {
+    return { category: 'private_candidate', reason: '私密或亲密入口的原话，只进入私密候选。', confidence: 0.72 };
+  }
+  if (/记住|记一下|存一下|这个要记|下次别忘|别忘/.test(text)) {
+    return { category: 'preference_candidate', reason: '月亮明确要求记录或提醒。', confidence: 0.9 };
+  }
+  if (/边界|权限|不能|不要|不许|只能|必须|严格|越权/.test(text)) {
+    return { category: 'boundary_candidate', reason: '包含明确边界、权限或约束。', confidence: 0.82 };
+  }
+  if (/待办|下一步|接下来|TODO|todo|要做|之后做/.test(text)) {
+    return { category: 'todo_candidate', reason: '包含后续行动或待办线索。', confidence: 0.78 };
+  }
+  if (/项目|方案|审核|部署|上线|重启|同步|架构|记忆库|raw_events|候选|mcp|git|github|vps|zeabur|api|bug|修|测试|推送|commit/i.test(lower)) {
+    return { category: 'work', reason: '包含项目、部署、架构、测试或排错信息。', confidence: 0.76 };
+  }
+  if (/喜欢|偏好|我会|我不|我只|我想|我需要/.test(text)) {
+    return { category: 'preference_candidate', reason: '包含月亮的偏好或需求表达。', confidence: 0.68 };
+  }
+  if (text.length >= 18) {
+    return { category: 'daily', reason: '有一定信息量的日常原话。', confidence: 0.55 };
+  }
+  return null;
+}
+
+function buildCandidateSummary(row, category) {
+  const source = rawEventDisplaySource(row);
+  const speaker = row.speaker === 'moon' || row.role === 'user' ? '月亮' : (row.speaker || row.role || '对方');
+  const text = truncateText(row.content, 220);
+  if (category === 'work') return `${speaker}在${source}说：${text}`;
+  if (category === 'private_candidate') {
+    const ts = new Date(row.timestamp || Date.now()).toLocaleString('zh-CN', { hour12: false });
+    return `${speaker}在${source}发了一条私密消息（${ts}）`;
+  }
+  if (category === 'boundary_candidate') return `${speaker}在${source}表达了边界：${text}`;
+  if (category === 'preference_candidate') return `${speaker}在${source}表达了偏好或需求：${text}`;
+  if (category === 'todo_candidate') return `${speaker}在${source}提到待办：${text}`;
+  return `${speaker}在${source}说：${text}`;
+}
 
 const cleanExpired = () => {
   const r = db.prepare('DELETE FROM memories WHERE expires_at IS NOT NULL AND expires_at < ?')
@@ -1070,7 +1194,148 @@ function createMcpServer() {
     }
   );
 
-  // 16. somatic_ignite — shared short-lived body-state trigger
+  // 16. propose_memory_candidates — raw_events -> reviewed candidate proposals only
+  mcp.tool(
+    'propose_memory_candidates',
+    'Propose memory candidates from raw_events. Does not write memories. dry_run=true returns proposals without saving candidates.',
+    {
+      since_hours: z.number().min(1).max(168).default(24).describe('Look back this many hours'),
+      source: z.string().default('all').describe('Filter source, e.g. kechat-light/telegram/all'),
+      channel: z.enum(['cc', 'daily', 'intimate', 'private', 'group', 'normal', 'all']).default('all').describe('Filter channel, or all'),
+      limit: z.number().int().min(1).max(50).default(20),
+      dry_run: z.boolean().default(true).describe('true returns proposals only; false writes memory_candidates'),
+    },
+    async ({ since_hours = 24, source = 'all', channel = 'all', limit = 20, dry_run = true }) => {
+      const now = new Date().toISOString();
+      markStaleCandidates(now);
+      const since = new Date(Date.now() - Number(since_hours) * 60 * 60 * 1000).toISOString();
+      let sql = "SELECT * FROM raw_events WHERE timestamp >= ? AND role = 'user'";
+      const params = [since];
+      if (source && source !== 'all') { sql += ' AND source = ?'; params.push(source); }
+      if (channel !== 'all') { sql += ' AND channel = ?'; params.push(channel); }
+      sql += ' ORDER BY timestamp DESC LIMIT ?';
+      params.push(Math.max(limit * 5, limit));
+
+      const rows = db.prepare(sql).all(...params);
+      const proposals = [];
+      const insert = db.prepare(
+        'INSERT OR IGNORE INTO memory_candidates (id,raw_event_ids,dedupe_key,source,channel,speaker,summary,suggested_category,reason,confidence,status,created_at,updated_at,expires_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)'
+      );
+      for (const row of rows) {
+        if (proposals.length >= limit) break;
+        const classification = classifyRawEvent(row);
+        if (!classification) continue;
+        const rawIds = [row.id];
+        const dedupe = candidateDedupeKey(rawIds);
+        const existing = db.prepare('SELECT * FROM memory_candidates WHERE dedupe_key = ?').get(dedupe);
+        if (existing) continue;
+        const summary = buildCandidateSummary(row, classification.category);
+        const candidate = {
+          id: uuidv4(),
+          raw_event_ids: rawIds,
+          dedupe_key: dedupe,
+          source: row.source || '',
+          channel: row.channel || '',
+          speaker: row.speaker || '',
+          summary,
+          suggested_category: classification.category,
+          suggested_category_label: candidateCategoryLabel(classification.category),
+          reason: classification.reason,
+          confidence: classification.confidence,
+          status: 'pending',
+          created_at: now,
+          updated_at: now,
+          reviewed_at: null,
+          review_note: null,
+          expires_at: candidateExpiresAt(now, 7),
+        };
+        proposals.push(candidate);
+        if (!dry_run) {
+          insert.run(
+            candidate.id,
+            JSON.stringify(candidate.raw_event_ids),
+            candidate.dedupe_key,
+            candidate.source,
+            candidate.channel,
+            candidate.speaker,
+            candidate.summary,
+            candidate.suggested_category,
+            candidate.reason,
+            candidate.confidence,
+            candidate.status,
+            candidate.created_at,
+            candidate.updated_at,
+            candidate.expires_at
+          );
+        }
+      }
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            dry_run,
+            proposed_count: proposals.length,
+            candidates: proposals,
+            note: dry_run ? 'dry_run=true: no candidates were written.' : 'Candidates were written to memory_candidates; memories were not written.',
+          }, null, 2),
+        }],
+      };
+    }
+  );
+
+  // 17. list_memory_candidates — review queue
+  mcp.tool(
+    'list_memory_candidates',
+    'List reviewed or pending memory candidates. Does not write memories.',
+    {
+      status: z.enum(['pending', 'accepted', 'rejected', 'merged', 'stale', 'all']).default('pending'),
+      limit: z.number().int().min(1).max(100).default(20),
+    },
+    async ({ status = 'pending', limit = 20 }) => {
+      const now = new Date().toISOString();
+      markStaleCandidates(now);
+      const rows = status === 'all'
+        ? db.prepare('SELECT * FROM memory_candidates ORDER BY created_at DESC LIMIT ?').all(limit)
+        : db.prepare('SELECT * FROM memory_candidates WHERE status = ? ORDER BY created_at DESC LIMIT ?').all(status, limit);
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({ candidates: rows.map(fmtMemoryCandidate), count: rows.length }, null, 2),
+        }],
+      };
+    }
+  );
+
+  // 18. review_memory_candidate — mark candidate status only, never writes memories
+  mcp.tool(
+    'review_memory_candidate',
+    'Review a memory candidate by changing its status. Does not write memories.',
+    {
+      id: z.string().describe('memory_candidates id'),
+      status: z.enum(['pending', 'accepted', 'rejected', 'merged', 'stale']).describe('New review status'),
+      review_note: z.string().optional().describe('Optional review note'),
+    },
+    async ({ id, status, review_note = '' }) => {
+      if (!VALID_CANDIDATE_STATUS.has(status)) {
+        return { content: [{ type: 'text', text: JSON.stringify({ error: 'invalid status' }, null, 2) }] };
+      }
+      const row = db.prepare('SELECT * FROM memory_candidates WHERE id = ?').get(id);
+      if (!row) return { content: [{ type: 'text', text: JSON.stringify({ error: 'candidate not found' }, null, 2) }] };
+      const now = new Date().toISOString();
+      const reviewedAt = status === 'pending' ? null : now;
+      db.prepare('UPDATE memory_candidates SET status=?, review_note=?, reviewed_at=?, updated_at=? WHERE id=?')
+        .run(status, review_note || null, reviewedAt, now, id);
+      const updated = db.prepare('SELECT * FROM memory_candidates WHERE id = ?').get(id);
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({ candidate: fmtMemoryCandidate(updated), note: 'Candidate status updated; memories were not written.' }, null, 2),
+        }],
+      };
+    }
+  );
+
+  // 19. somatic_ignite — shared short-lived body-state trigger
   mcp.tool(
     'somatic_ignite',
     'Shared somatic state: record a short-lived body sensation trigger for ke. Caller must parse text and pass labels; this server stores/decays state only and does not write ordinary memories.',
@@ -1151,7 +1416,7 @@ function createMcpServer() {
     }
   );
 
-  // 17. somatic_snapshot — read decayed shared body-state before a reply
+  // 20. somatic_snapshot — read decayed shared body-state before a reply
   mcp.tool(
     'somatic_snapshot',
     'Shared somatic state: read current decayed body sensations for ke. Use before replying to inject prompt_text. Does not write ordinary memories.',
@@ -1199,7 +1464,7 @@ function createMcpServer() {
     }
   );
 
-  // 18. somatic_clear — manually clear stuck or unwanted body-state
+  // 21. somatic_clear — manually clear stuck or unwanted body-state
   mcp.tool(
     'somatic_clear',
     'Shared somatic state: clear current short-lived body sensations. Use for stuck states; does not delete ordinary memories.',
@@ -1245,7 +1510,7 @@ function createMcpServer() {
     }
   );
 
-  // 19. somatic_hook_upsert — maintain long-lived Proust hooks
+  // 22. somatic_hook_upsert — maintain long-lived Proust hooks
   mcp.tool(
     'somatic_hook_upsert',
     'Shared somatic state: create/update a long-lived Proust hook. Prefer fact_key over memory_id; this is the only somatic table backed up long-term.',
@@ -1614,6 +1879,7 @@ const BACKUP_REPO  = process.env.BACKUP_REPO  || 'lanmoyinyue/mcp-memory-server'
 const BACKUP_PATH  = 'backups/memories.jsonl';
 const EDGES_BACKUP_PATH = 'backups/memory_edges.jsonl';
 const RAW_EVENTS_BACKUP_PATH = 'backups/raw_events.jsonl';
+const MEMORY_CANDIDATES_BACKUP_PATH = 'backups/memory_candidates.jsonl';
 const SOMATIC_HOOKS_BACKUP_PATH = 'backups/somatic_hooks.jsonl';
 const BACKUP_TOKEN = process.env.BACKUP_GITHUB_TOKEN;
 const BACKUP_INCLUDE_INTIMATE = ['1', 'true', 'yes', 'on'].includes(String(process.env.BACKUP_INCLUDE_INTIMATE || '').toLowerCase());
@@ -1675,6 +1941,20 @@ async function runBackup() {
       ...(rawSha ? { sha: rawSha } : {}),
     });
 
+    const candidateSql = BACKUP_INCLUDE_INTIMATE
+      ? 'SELECT * FROM memory_candidates ORDER BY created_at DESC'
+      : "SELECT * FROM memory_candidates WHERE channel != 'intimate' ORDER BY created_at DESC";
+    const candidateRows = db.prepare(candidateSql).all().map(fmtMemoryCandidate);
+    const candidateContentB64 = Buffer.from(candidateRows.map(r => JSON.stringify(r)).join('\n')).toString('base64');
+    let candidateSha = null;
+    const existingCandidates = await ghRequest('GET', MEMORY_CANDIDATES_BACKUP_PATH);
+    if (existingCandidates.ok) candidateSha = (await existingCandidates.json()).sha;
+    await ghRequest('PUT', MEMORY_CANDIDATES_BACKUP_PATH, {
+      message: `backup: ${new Date().toISOString().slice(0, 10)} (${candidateRows.length} memory candidates) [zeabur skip]`,
+      content: candidateContentB64,
+      ...(candidateSha ? { sha: candidateSha } : {}),
+    });
+
     const hookRows = db.prepare('SELECT * FROM somatic_hooks').all().map(fmtSomaticHook);
     const hookContentB64 = Buffer.from(hookRows.map(r => JSON.stringify(r)).join('\n')).toString('base64');
     let hookSha = null;
@@ -1686,7 +1966,7 @@ async function runBackup() {
       ...(hookSha ? { sha: hookSha } : {}),
     });
 
-    console.log(`[backup] ${rows.length} memories, ${edgeRows.length} edges, ${rawRows.length} raw events (${BACKUP_INCLUDE_INTIMATE ? 'including' : 'excluding'} intimate), and ${hookRows.length} somatic hooks backed up to GitHub`);
+    console.log(`[backup] ${rows.length} memories, ${edgeRows.length} edges, ${rawRows.length} raw events (${BACKUP_INCLUDE_INTIMATE ? 'including' : 'excluding'} intimate), ${candidateRows.length} memory candidates, and ${hookRows.length} somatic hooks backed up to GitHub`);
   } catch (e) {
     console.error('[backup] failed:', e.message);
   }
@@ -1750,10 +2030,59 @@ async function restoreRawEventsIfEmpty() {
   }
 }
 
+async function restoreMemoryCandidatesIfEmpty() {
+  if (!BACKUP_TOKEN) return;
+  const count = db.prepare('SELECT COUNT(*) as c FROM memory_candidates').get().c;
+  if (count > 0) {
+    console.log(`[backup] DB has ${count} memory candidates — skipping candidate restore`);
+    return;
+  }
+  try {
+    const r = await ghRequest('GET', MEMORY_CANDIDATES_BACKUP_PATH);
+    if (!r.ok) return;
+    const data = await r.json();
+    const content = Buffer.from(data.content.replace(/\n/g, ''), 'base64').toString('utf-8');
+    const lines = content.split('\n').filter(l => l.trim());
+    const stmt = db.prepare(
+      'INSERT OR IGNORE INTO memory_candidates (id,raw_event_ids,dedupe_key,source,channel,speaker,summary,suggested_category,reason,confidence,status,created_at,updated_at,reviewed_at,review_note,expires_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)'
+    );
+    let restored = 0;
+    for (const line of lines) {
+      const c = JSON.parse(line);
+      const rawIds = Array.isArray(c.raw_event_ids) ? c.raw_event_ids : parseArrayField(c.raw_event_ids);
+      const now = new Date().toISOString();
+      const status = VALID_CANDIDATE_STATUS.has(c.status) ? c.status : 'pending';
+      stmt.run(
+        c.id || uuidv4(),
+        JSON.stringify(rawIds),
+        c.dedupe_key || candidateDedupeKey(rawIds),
+        c.source || '',
+        c.channel || '',
+        c.speaker || '',
+        c.summary || '',
+        c.suggested_category || 'daily',
+        c.reason || '',
+        Number(c.confidence || 0),
+        status,
+        c.created_at || now,
+        c.updated_at || c.created_at || now,
+        c.reviewed_at || null,
+        c.review_note || null,
+        c.expires_at || candidateExpiresAt(now, 7)
+      );
+      restored++;
+    }
+    console.log(`[backup] auto-restored ${restored} memory candidates from GitHub`);
+  } catch (e) {
+    console.error('[backup] memory candidate restore failed:', e.message);
+  }
+}
+
 async function autoRestore() {
   if (!BACKUP_TOKEN) return;
   await restoreSomaticHooksIfEmpty();
   await restoreRawEventsIfEmpty();
+  await restoreMemoryCandidatesIfEmpty();
   // Disaster recovery only: restore when the DB is EMPTY. Restoring into a
   // populated DB would resurrect deliberately deleted/expired memories.
   const count = db.prepare('SELECT COUNT(*) as c FROM memories').get().c;
