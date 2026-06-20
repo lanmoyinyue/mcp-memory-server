@@ -51,11 +51,14 @@ db.exec(`
   CREATE TABLE IF NOT EXISTS raw_events (
     id                TEXT PRIMARY KEY,
     session_id        TEXT NOT NULL DEFAULT '',
+    source            TEXT NOT NULL DEFAULT '',
     channel           TEXT NOT NULL DEFAULT 'cc',
     role              TEXT NOT NULL,
+    speaker           TEXT NOT NULL DEFAULT '',
     content           TEXT NOT NULL,
     timestamp         TEXT NOT NULL,
-    linked_memory_ids TEXT NOT NULL DEFAULT '[]'
+    linked_memory_ids TEXT NOT NULL DEFAULT '[]',
+    metadata          TEXT NOT NULL DEFAULT '{}'
   );
   CREATE INDEX IF NOT EXISTS idx_re_channel   ON raw_events(channel);
   CREATE INDEX IF NOT EXISTS idx_re_timestamp ON raw_events(timestamp);
@@ -134,6 +137,11 @@ try { db.exec('CREATE INDEX IF NOT EXISTS idx_fact_key ON memories(fact_key)'); 
 try { db.exec('ALTER TABLE memories ADD COLUMN protected INTEGER NOT NULL DEFAULT 0'); } catch {}
 try { db.exec("ALTER TABLE memories ADD COLUMN evidence_raw_ids TEXT NOT NULL DEFAULT '[]'"); } catch {}
 try { db.exec('CREATE INDEX IF NOT EXISTS idx_memories_protected ON memories(protected)'); } catch {}
+// Migrate: raw event provenance fields for external conversation entrypoints
+try { db.exec("ALTER TABLE raw_events ADD COLUMN source TEXT NOT NULL DEFAULT ''"); } catch {}
+try { db.exec("ALTER TABLE raw_events ADD COLUMN speaker TEXT NOT NULL DEFAULT ''"); } catch {}
+try { db.exec("ALTER TABLE raw_events ADD COLUMN metadata TEXT NOT NULL DEFAULT '{}'"); } catch {}
+try { db.exec('CREATE INDEX IF NOT EXISTS idx_re_source ON raw_events(source)'); } catch {}
 
 const contentHash = (text, category) => crypto.createHash('sha256').update(`${category}:${text.trim()}`).digest('hex');
 
@@ -192,6 +200,14 @@ const parseArrayField = (t) => {
   }
 };
 const parseTags = parseArrayField;
+const parseObjectField = (t) => {
+  try {
+    const parsed = typeof t === 'string' ? JSON.parse(t || '{}') : (t || {});
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+};
 
 const fmt = (r) => ({
   id: r.id, content: r.content, category: r.category,
@@ -206,11 +222,14 @@ const fmt = (r) => ({
 const fmtRawEvent = (r) => ({
   id: r.id,
   session_id: r.session_id || '',
+  source: r.source || '',
   channel: r.channel,
   role: r.role,
+  speaker: r.speaker || '',
   content: r.content,
   timestamp: r.timestamp,
   linked_memory_ids: parseArrayField(r.linked_memory_ids),
+  metadata: parseObjectField(r.metadata),
 });
 
 const cleanExpired = () => {
@@ -975,21 +994,24 @@ function createMcpServer() {
     'Record one original dialogue event into raw_events evidence journal. Use linked_memory_ids to connect raw text to curated memories.',
     {
       session_id: z.string().optional().describe('Session id; keep the same id for one conversation'),
-      channel: z.enum(['cc', 'daily', 'intimate']).describe('Conversation channel'),
-      role: z.enum(['user', 'assistant']).describe('Speaker role'),
+      source: z.string().optional().describe('Entrypoint or system source, e.g. kechat-light or telegram'),
+      channel: z.enum(['cc', 'daily', 'intimate', 'private', 'group', 'normal']).default('normal').describe('Conversation channel'),
+      role: z.enum(['user', 'assistant', 'system']).describe('Speaker role'),
+      speaker: z.string().optional().describe('Human or agent speaker name/id, e.g. moon or ke'),
       content: z.string().min(1).describe('Original text content'),
       linked_memory_ids: z.array(z.string()).optional().describe('Curated memory ids linked to this raw event'),
+      metadata: z.record(z.unknown()).optional().describe('Structured provenance metadata'),
     },
-    async ({ session_id = '', channel, role, content, linked_memory_ids = [] }) => {
+    async ({ session_id = '', source = '', channel = 'normal', role, speaker = '', content, linked_memory_ids = [], metadata = {} }) => {
       const id = uuidv4();
       const now = new Date().toISOString();
       db.prepare(
-        'INSERT INTO raw_events (id,session_id,channel,role,content,timestamp,linked_memory_ids) VALUES (?,?,?,?,?,?,?)'
-      ).run(id, session_id, channel, role, content, now, JSON.stringify(linked_memory_ids));
+        'INSERT INTO raw_events (id,session_id,source,channel,role,speaker,content,timestamp,linked_memory_ids,metadata) VALUES (?,?,?,?,?,?,?,?,?,?)'
+      ).run(id, session_id, source, channel, role, speaker, content, now, JSON.stringify(linked_memory_ids), JSON.stringify(metadata || {}));
       return {
         content: [{
           type: 'text',
-          text: JSON.stringify({ id, timestamp: now, channel, role }, null, 2),
+          text: JSON.stringify({ id, timestamp: now, source, channel, role, speaker }, null, 2),
         }],
       };
     }
@@ -1001,14 +1023,21 @@ function createMcpServer() {
     'Keyword-search raw_events and return original dialogue snippets.',
     {
       query: z.string().min(1).describe('Search term'),
-      channel: z.enum(['cc', 'daily', 'intimate', 'all']).default('all').describe('Filter by channel, or all'),
+      channel: z.enum(['cc', 'daily', 'intimate', 'private', 'group', 'normal', 'all']).default('all').describe('Filter by channel, or all'),
+      source: z.string().optional().describe('Optional exact source filter'),
+      speaker: z.string().optional().describe('Optional exact speaker filter'),
       limit: z.number().int().min(1).max(50).default(20),
     },
-    async ({ query, channel = 'all', limit = 20 }) => {
+    async ({ query, channel = 'all', source = '', speaker = '', limit = 20 }) => {
       const like = `%${query}%`;
-      const rows = channel === 'all'
-        ? db.prepare('SELECT * FROM raw_events WHERE content LIKE ? ORDER BY timestamp DESC LIMIT ?').all(like, limit)
-        : db.prepare('SELECT * FROM raw_events WHERE content LIKE ? AND channel = ? ORDER BY timestamp DESC LIMIT ?').all(like, channel, limit);
+      let sql = 'SELECT * FROM raw_events WHERE content LIKE ?';
+      const params = [like];
+      if (channel !== 'all') { sql += ' AND channel = ?'; params.push(channel); }
+      if (source) { sql += ' AND source = ?'; params.push(source); }
+      if (speaker) { sql += ' AND speaker = ?'; params.push(speaker); }
+      sql += ' ORDER BY timestamp DESC LIMIT ?';
+      params.push(limit);
+      const rows = db.prepare(sql).all(...params);
       return {
         content: [{
           type: 'text',
@@ -1587,6 +1616,7 @@ const EDGES_BACKUP_PATH = 'backups/memory_edges.jsonl';
 const RAW_EVENTS_BACKUP_PATH = 'backups/raw_events.jsonl';
 const SOMATIC_HOOKS_BACKUP_PATH = 'backups/somatic_hooks.jsonl';
 const BACKUP_TOKEN = process.env.BACKUP_GITHUB_TOKEN;
+const BACKUP_INCLUDE_INTIMATE = ['1', 'true', 'yes', 'on'].includes(String(process.env.BACKUP_INCLUDE_INTIMATE || '').toLowerCase());
 
 async function ghRequest(method, path, body) {
   const res = await fetch(`https://api.github.com/repos/${BACKUP_REPO}/contents/${path}`, {
@@ -1631,7 +1661,10 @@ async function runBackup() {
       ...(edgeSha ? { sha: edgeSha } : {}),
     });
 
-    const rawRows = db.prepare("SELECT * FROM raw_events WHERE channel != 'intimate' ORDER BY timestamp DESC").all().map(fmtRawEvent);
+    const rawSql = BACKUP_INCLUDE_INTIMATE
+      ? 'SELECT * FROM raw_events ORDER BY timestamp DESC'
+      : "SELECT * FROM raw_events WHERE channel != 'intimate' ORDER BY timestamp DESC";
+    const rawRows = db.prepare(rawSql).all().map(fmtRawEvent);
     const rawContentB64 = Buffer.from(rawRows.map(r => JSON.stringify(r)).join('\n')).toString('base64');
     let rawSha = null;
     const existingRaw = await ghRequest('GET', RAW_EVENTS_BACKUP_PATH);
@@ -1653,7 +1686,7 @@ async function runBackup() {
       ...(hookSha ? { sha: hookSha } : {}),
     });
 
-    console.log(`[backup] ${rows.length} memories, ${edgeRows.length} edges, ${rawRows.length} raw events, and ${hookRows.length} somatic hooks backed up to GitHub`);
+    console.log(`[backup] ${rows.length} memories, ${edgeRows.length} edges, ${rawRows.length} raw events (${BACKUP_INCLUDE_INTIMATE ? 'including' : 'excluding'} intimate), and ${hookRows.length} somatic hooks backed up to GitHub`);
   } catch (e) {
     console.error('[backup] failed:', e.message);
   }
@@ -1701,13 +1734,14 @@ async function restoreRawEventsIfEmpty() {
     const content = Buffer.from(data.content.replace(/\n/g, ''), 'base64').toString('utf-8');
     const lines = content.split('\n').filter(l => l.trim());
     const stmt = db.prepare(
-      'INSERT OR IGNORE INTO raw_events (id,session_id,channel,role,content,timestamp,linked_memory_ids) VALUES (?,?,?,?,?,?,?)'
+      'INSERT OR IGNORE INTO raw_events (id,session_id,source,channel,role,speaker,content,timestamp,linked_memory_ids,metadata) VALUES (?,?,?,?,?,?,?,?,?,?)'
     );
     let restored = 0;
     for (const line of lines) {
       const e = JSON.parse(line);
       const linked = Array.isArray(e.linked_memory_ids) ? e.linked_memory_ids : parseArrayField(e.linked_memory_ids);
-      stmt.run(e.id, e.session_id || '', e.channel, e.role, e.content, e.timestamp, JSON.stringify(linked));
+      const metadata = parseObjectField(e.metadata);
+      stmt.run(e.id, e.session_id || '', e.source || '', e.channel || 'cc', e.role || 'user', e.speaker || '', e.content, e.timestamp, JSON.stringify(linked), JSON.stringify(metadata));
       restored++;
     }
     console.log(`[backup] auto-restored ${restored} raw events from GitHub`);
