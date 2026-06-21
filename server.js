@@ -274,6 +274,19 @@ const CANDIDATE_CATEGORY_LABELS = {
 const candidateCategoryLabel = (category) => CANDIDATE_CATEGORY_LABELS[category] || category || '';
 const VALID_CANDIDATE_STATUS = new Set(['pending', 'accepted', 'rejected', 'merged', 'stale']);
 const candidateDedupeKey = (ids) => crypto.createHash('sha256').update([...ids].sort().join('\0')).digest('hex');
+const normalizeCandidateText = (text) => String(text || '').replace(/\s+/g, ' ').trim().toLowerCase();
+const candidateTimeBucket = (timestamp, bucketMs = 60_000) => {
+  const ms = Date.parse(timestamp || '');
+  if (!Number.isFinite(ms)) return '';
+  return String(Math.floor(ms / bucketMs));
+};
+const candidateFingerprint = (row) => crypto.createHash('sha256').update([
+  row.source || '',
+  row.channel || '',
+  row.speaker || row.role || '',
+  candidateTimeBucket(row.timestamp),
+  normalizeCandidateText(row.content),
+].join('\0')).digest('hex');
 const candidateExpiresAt = (now, days = 7) => {
   const exp = new Date(now);
   exp.setDate(exp.getDate() + days);
@@ -1218,30 +1231,55 @@ function createMcpServer() {
 
       const rows = db.prepare(sql).all(...params);
       const proposals = [];
-      const insert = db.prepare(
-        'INSERT OR IGNORE INTO memory_candidates (id,raw_event_ids,dedupe_key,source,channel,speaker,summary,suggested_category,reason,confidence,status,created_at,updated_at,expires_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)'
-      );
+      const seen = new Set();
+      const grouped = new Map();
       for (const row of rows) {
-        if (proposals.length >= limit) break;
         const classification = classifyRawEvent(row);
         if (!classification) continue;
-        const rawIds = [row.id];
-        const dedupe = candidateDedupeKey(rawIds);
-        const existing = db.prepare('SELECT * FROM memory_candidates WHERE dedupe_key = ?').get(dedupe);
-        if (existing) continue;
-        const summary = buildCandidateSummary(row, classification.category);
-        const candidate = {
-          id: uuidv4(),
-          raw_event_ids: rawIds,
-          dedupe_key: dedupe,
+        const fingerprint = candidateFingerprint(row);
+        const group = grouped.get(fingerprint);
+        if (group) {
+          group.raw_event_ids.push(row.id);
+          group.source = group.source || row.source || '';
+          group.channel = group.channel || row.channel || '';
+          group.speaker = group.speaker || row.speaker || '';
+          group.confidence = Math.max(group.confidence, classification.confidence);
+          continue;
+        }
+        grouped.set(fingerprint, {
+          row,
+          raw_event_ids: [row.id],
+          dedupe_key: fingerprint,
           source: row.source || '',
           channel: row.channel || '',
           speaker: row.speaker || '',
-          summary,
-          suggested_category: classification.category,
-          suggested_category_label: candidateCategoryLabel(classification.category),
-          reason: classification.reason,
+          classification,
           confidence: classification.confidence,
+        });
+      }
+
+      const insert = db.prepare(
+        'INSERT OR IGNORE INTO memory_candidates (id,raw_event_ids,dedupe_key,source,channel,speaker,summary,suggested_category,reason,confidence,status,created_at,updated_at,expires_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)'
+      );
+      for (const group of grouped.values()) {
+        if (proposals.length >= limit) break;
+        if (seen.has(group.dedupe_key)) continue;
+        seen.add(group.dedupe_key);
+        const existing = db.prepare('SELECT * FROM memory_candidates WHERE dedupe_key = ?').get(group.dedupe_key);
+        if (existing) continue;
+        const summary = buildCandidateSummary(group.row, group.classification.category);
+        const candidate = {
+          id: uuidv4(),
+          raw_event_ids: group.raw_event_ids,
+          dedupe_key: group.dedupe_key,
+          source: group.source,
+          channel: group.channel,
+          speaker: group.speaker,
+          summary,
+          suggested_category: group.classification.category,
+          suggested_category_label: candidateCategoryLabel(group.classification.category),
+          reason: group.classification.reason,
+          confidence: group.confidence,
           status: 'pending',
           created_at: now,
           updated_at: now,
@@ -1335,7 +1373,45 @@ function createMcpServer() {
     }
   );
 
-  // 19. somatic_ignite — shared short-lived body-state trigger
+  // 19. batch_review_memory_candidates — batch mark candidate status only, never writes memories
+  mcp.tool(
+    'batch_review_memory_candidates',
+    'Review multiple memory candidates by changing their status. Does not write memories.',
+    {
+      ids: z.array(z.string()).min(1).max(100).describe('memory_candidates ids'),
+      status: z.enum(['pending', 'accepted', 'rejected', 'merged', 'stale']).describe('New review status'),
+      review_note: z.string().optional().describe('Optional review note applied to all ids'),
+    },
+    async ({ ids, status, review_note = '' }) => {
+      if (!VALID_CANDIDATE_STATUS.has(status)) {
+        return { content: [{ type: 'text', text: JSON.stringify({ error: 'invalid status' }, null, 2) }] };
+      }
+      const uniqueIds = [...new Set(ids.map(id => String(id || '').trim()).filter(Boolean))];
+      const now = new Date().toISOString();
+      const reviewedAt = status === 'pending' ? null : now;
+      const select = db.prepare('SELECT id FROM memory_candidates WHERE id = ?');
+      const update = db.prepare('UPDATE memory_candidates SET status=?, review_note=?, reviewed_at=?, updated_at=? WHERE id=?');
+      const updated = [];
+      const missing = [];
+      for (const id of uniqueIds) {
+        const row = select.get(id);
+        if (!row) {
+          missing.push(id);
+          continue;
+        }
+        update.run(status, review_note || null, reviewedAt, now, id);
+        updated.push(id);
+      }
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({ updated_count: updated.length, missing_count: missing.length, updated_ids: updated, missing_ids: missing, status, note: 'Candidate statuses updated; memories were not written.' }, null, 2),
+        }],
+      };
+    }
+  );
+
+  // 20. somatic_ignite — shared short-lived body-state trigger
   mcp.tool(
     'somatic_ignite',
     'Shared somatic state: record a short-lived body sensation trigger for ke. Caller must parse text and pass labels; this server stores/decays state only and does not write ordinary memories.',
@@ -1416,7 +1492,7 @@ function createMcpServer() {
     }
   );
 
-  // 20. somatic_snapshot — read decayed shared body-state before a reply
+  // 21. somatic_snapshot — read decayed shared body-state before a reply
   mcp.tool(
     'somatic_snapshot',
     'Shared somatic state: read current decayed body sensations for ke. Use before replying to inject prompt_text. Does not write ordinary memories.',
@@ -1464,7 +1540,7 @@ function createMcpServer() {
     }
   );
 
-  // 21. somatic_clear — manually clear stuck or unwanted body-state
+  // 22. somatic_clear — manually clear stuck or unwanted body-state
   mcp.tool(
     'somatic_clear',
     'Shared somatic state: clear current short-lived body sensations. Use for stuck states; does not delete ordinary memories.',
@@ -1510,7 +1586,7 @@ function createMcpServer() {
     }
   );
 
-  // 22. somatic_hook_upsert — maintain long-lived Proust hooks
+  // 23. somatic_hook_upsert — maintain long-lived Proust hooks
   mcp.tool(
     'somatic_hook_upsert',
     'Shared somatic state: create/update a long-lived Proust hook. Prefer fact_key over memory_id; this is the only somatic table backed up long-term.',
