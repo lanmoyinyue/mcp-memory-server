@@ -295,6 +295,10 @@ const candidateExpiresAt = (now, days = 7) => {
 const markStaleCandidates = (now = new Date().toISOString()) => db.prepare(
   "UPDATE memory_candidates SET status='stale', updated_at=? WHERE status='pending' AND expires_at IS NOT NULL AND expires_at < ?"
 ).run(now, now);
+function candidateHasExistingRawEvents(rawIds) {
+  const stmt = db.prepare('SELECT id FROM memory_candidates WHERE raw_event_ids LIKE ? LIMIT 1');
+  return rawIds.some(id => stmt.get(`%"${String(id).replace(/[%_]/g, '')}"%`));
+}
 const fmtMemoryCandidate = (r) => ({
   id: r.id,
   raw_event_ids: parseArrayField(r.raw_event_ids),
@@ -1266,7 +1270,7 @@ function createMcpServer() {
         if (seen.has(group.dedupe_key)) continue;
         seen.add(group.dedupe_key);
         const existing = db.prepare('SELECT * FROM memory_candidates WHERE dedupe_key = ?').get(group.dedupe_key);
-        if (existing) continue;
+        if (existing || candidateHasExistingRawEvents(group.raw_event_ids)) continue;
         const summary = buildCandidateSummary(group.row, group.classification.category);
         const candidate = {
           id: uuidv4(),
