@@ -261,6 +261,121 @@ const fmtRawEvent = (r) => ({
   metadata: parseObjectField(r.metadata),
 });
 
+function extractExactTerms(query) {
+  const text = String(query || '').trim();
+  if (!text) return [];
+  const terms = [];
+  const re = /["'`“”‘’「」『』]([^"'`“”‘’「」『』]{1,120})["'`“”‘’「」『』]/g;
+  let m;
+  while ((m = re.exec(text)) !== null) {
+    const term = m[1].trim();
+    if (term) terms.push(term);
+  }
+  if (!terms.length) terms.push(text);
+  return [...new Set(terms)].slice(0, 8);
+}
+
+function exactTermMatches(content, term) {
+  const haystack = String(content || '');
+  const needle = String(term || '').trim();
+  if (!needle) return false;
+  if (/^[A-Za-z0-9_-]+$/.test(needle)) {
+    const escaped = needle.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    return new RegExp(`(^|[^A-Za-z0-9_-])${escaped}($|[^A-Za-z0-9_-])`, 'i').test(haystack);
+  }
+  return haystack.includes(needle);
+}
+
+function rawEventSearch({ query, mode = 'fuzzy', channel = 'all', source = '', speaker = '', limit = 20 }) {
+  const params = [];
+  const where = [];
+  if (mode === 'exact') {
+    const terms = extractExactTerms(query);
+    if (!terms.length) return { rows: [], terms };
+    where.push(`(${terms.map(() => 'INSTR(content, ?) > 0').join(' OR ')})`);
+    params.push(...terms);
+  } else {
+    where.push('content LIKE ?');
+    params.push(`%${query}%`);
+  }
+  if (channel !== 'all') { where.push('channel = ?'); params.push(channel); }
+  if (source) { where.push('source = ?'); params.push(source); }
+  if (speaker) { where.push('speaker = ?'); params.push(speaker); }
+  let sql = `SELECT * FROM raw_events WHERE ${where.join(' AND ')} ORDER BY timestamp DESC LIMIT ?`;
+  params.push(Math.max(limit * (mode === 'exact' ? 3 : 1), limit));
+  let rows = db.prepare(sql).all(...params);
+  const terms = mode === 'exact' ? extractExactTerms(query) : [];
+  if (mode === 'exact') {
+    rows = rows.filter(row => terms.some(term => exactTermMatches(row.content, term))).slice(0, limit);
+  }
+  return { rows, terms };
+}
+
+function inspectMemoryEdges(limit = 50) {
+  const now = new Date().toISOString();
+  const issues = [];
+  const push = (type, severity, source_id, target_id, description) => {
+    if (issues.length >= limit) return;
+    issues.push({ type, severity, source_id, target_id, description });
+  };
+
+  const orphanRows = db.prepare(`
+    SELECT e.source_id, e.target_id
+    FROM memory_edges e
+    LEFT JOIN memories s ON s.id = e.source_id
+    LEFT JOIN memories t ON t.id = e.target_id
+    WHERE s.id IS NULL OR t.id IS NULL
+    ORDER BY e.created_at DESC
+    LIMIT ?
+  `).all(limit);
+  for (const row of orphanRows) {
+    push('orphan_edge', 'critical', row.source_id, row.target_id, '边指向不存在的记忆');
+  }
+
+  const selfLoopRows = db.prepare(`
+    SELECT source_id, target_id
+    FROM memory_edges
+    WHERE source_id = target_id
+    ORDER BY created_at DESC
+    LIMIT ?
+  `).all(limit);
+  for (const row of selfLoopRows) {
+    push('self_loop', 'critical', row.source_id, row.target_id, '边的起点和终点是同一条记忆');
+  }
+
+  const nonLiveRows = db.prepare(`
+    SELECT e.source_id, e.target_id,
+           s.superseded_by AS source_superseded_by, t.superseded_by AS target_superseded_by,
+           s.expires_at AS source_expires_at, t.expires_at AS target_expires_at
+    FROM memory_edges e
+    JOIN memories s ON s.id = e.source_id
+    JOIN memories t ON t.id = e.target_id
+    WHERE s.superseded_by IS NOT NULL
+       OR t.superseded_by IS NOT NULL
+       OR (s.expires_at IS NOT NULL AND s.expires_at <= ?)
+       OR (t.expires_at IS NOT NULL AND t.expires_at <= ?)
+    ORDER BY e.created_at DESC
+    LIMIT ?
+  `).all(now, now, limit);
+  for (const row of nonLiveRows) {
+    const reasons = [];
+    if (row.source_superseded_by) reasons.push('起点已被事实演化替代');
+    if (row.target_superseded_by) reasons.push('终点已被事实演化替代');
+    if (row.source_expires_at && row.source_expires_at <= now) reasons.push('起点已过期');
+    if (row.target_expires_at && row.target_expires_at <= now) reasons.push('终点已过期');
+    push('non_live_endpoint', 'warning', row.source_id, row.target_id, reasons.join('；') || '边连接到非当前记忆');
+  }
+
+  const total_edges = db.prepare('SELECT COUNT(*) as c FROM memory_edges').get().c;
+  return {
+    total_edges,
+    issue_count: issues.length,
+    checked_at: now,
+    issues,
+    note: '只读巡逻报告：不删除、不归档、不修改 memory_edges。',
+  };
+}
+
 // Candidate category labels shown to Moon. Machine values stay stable; edit here
 // when adding a new candidate category.
 const CANDIDATE_CATEGORY_LABELS = {
@@ -803,22 +918,22 @@ function createMcpServer() {
   mcp.tool(
     'get_stats',
     'Return statistics about the memory store',
-    {},
-    async () => {
+    {
+      include_edge_health: z.boolean().optional().describe('Include read-only memory_edges patrol report'),
+      edge_issue_limit: z.number().int().min(1).max(200).optional().describe('Max edge issues to return when include_edge_health=true'),
+    },
+    async ({ include_edge_health = false, edge_issue_limit = 50 }) => {
       cleanExpired();
       const total = db.prepare('SELECT COUNT(*) as c FROM memories').get().c;
       const byCat = db.prepare('SELECT category, COUNT(*) as c FROM memories GROUP BY category').all();
       const recent = db.prepare('SELECT * FROM memories ORDER BY created_at DESC LIMIT 5').all().map(fmt);
-      return {
-        content: [{
-          type: 'text',
-          text: JSON.stringify({
-            total_memories: total,
-            by_category: Object.fromEntries(byCat.map(r => [r.category, r.c])),
-            recent_memories: recent,
-          }, null, 2),
-        }],
+      const payload = {
+        total_memories: total,
+        by_category: Object.fromEntries(byCat.map(r => [r.category, r.c])),
+        recent_memories: recent,
       };
+      if (include_edge_health) payload.edge_health = inspectMemoryEdges(edge_issue_limit);
+      return { content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }] };
     }
   );
 
@@ -898,8 +1013,10 @@ function createMcpServer() {
       query:    z.string().min(1).describe('Search term or concept'),
       category: z.string().optional().describe('Filter by category'),
       limit:    z.number().int().min(1).max(20).optional().describe('Number of results (default 10)'),
+      fallback_to_raw: z.boolean().optional().describe('Also run exact raw_events lookup for literal short terms / quoted text. Explicit only; default false.'),
+      raw_limit: z.number().int().min(1).max(10).optional().describe('Max raw_events fallback results when fallback_to_raw=true'),
     },
-    async ({ query, category, limit = 10 }) => {
+    async ({ query, category, limit = 10, fallback_to_raw = false, raw_limit = 3 }) => {
       cleanExpired();
       const now = new Date().toISOString();
 
@@ -949,12 +1066,36 @@ function createMcpServer() {
         for (const r of fused) heat.run(r.id);
       }
 
+      let rawFallback = null;
+      if (fallback_to_raw) {
+        const { rows, terms } = rawEventSearch({
+          query,
+          mode: 'exact',
+          channel: 'all',
+          limit: raw_limit,
+        });
+        rawFallback = {
+          mode: 'exact',
+          terms,
+          count: rows.length,
+          results: rows.map(fmtRawEvent),
+          note: '显式 fallback_to_raw=true 才会查 raw_events；不写正式记忆。',
+        };
+      }
+
       return {
         content: [{
           type: 'text',
-          text: fused.length
-            ? `Found ${fused.length} result(s) (keyword+semantic fused):\n${JSON.stringify(fused, null, 2)}`
-            : `No results for: "${query}"`,
+          text: fallback_to_raw
+            ? JSON.stringify({
+                query,
+                count: fused.length,
+                results: fused,
+                raw_fallback: rawFallback,
+              }, null, 2)
+            : (fused.length
+                ? `Found ${fused.length} result(s) (keyword+semantic fused):\n${JSON.stringify(fused, null, 2)}`
+                : `No results for: "${query}"`),
         }],
       };
     }
@@ -1167,22 +1308,20 @@ function createMcpServer() {
       channel: z.enum(['cc', 'daily', 'intimate', 'private', 'group', 'normal', 'all']).default('all').describe('Filter by channel, or all'),
       source: z.string().optional().describe('Optional exact source filter'),
       speaker: z.string().optional().describe('Optional exact speaker filter'),
+      mode: z.enum(['fuzzy', 'exact']).default('fuzzy').describe('fuzzy = current LIKE search; exact = literal quoted phrase / whole ASCII word / exact CJK substring'),
       limit: z.number().int().min(1).max(50).default(20),
     },
-    async ({ query, channel = 'all', source = '', speaker = '', limit = 20 }) => {
-      const like = `%${query}%`;
-      let sql = 'SELECT * FROM raw_events WHERE content LIKE ?';
-      const params = [like];
-      if (channel !== 'all') { sql += ' AND channel = ?'; params.push(channel); }
-      if (source) { sql += ' AND source = ?'; params.push(source); }
-      if (speaker) { sql += ' AND speaker = ?'; params.push(speaker); }
-      sql += ' ORDER BY timestamp DESC LIMIT ?';
-      params.push(limit);
-      const rows = db.prepare(sql).all(...params);
+    async ({ query, channel = 'all', source = '', speaker = '', mode = 'fuzzy', limit = 20 }) => {
+      const { rows, terms } = rawEventSearch({ query, channel, source, speaker, mode, limit });
       return {
         content: [{
           type: 'text',
-          text: JSON.stringify({ results: rows.map(fmtRawEvent), count: rows.length }, null, 2),
+          text: JSON.stringify({
+            mode,
+            terms: mode === 'exact' ? terms : undefined,
+            results: rows.map(fmtRawEvent),
+            count: rows.length,
+          }, null, 2),
         }],
       };
     }
