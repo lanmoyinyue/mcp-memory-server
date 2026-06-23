@@ -48,6 +48,84 @@ db.exec(`
 `);
 
 db.exec(`
+  CREATE TABLE IF NOT EXISTS event_chunks (
+    id             TEXT PRIMARY KEY,
+    dedupe_key     TEXT NOT NULL UNIQUE,
+    source         TEXT NOT NULL DEFAULT '',
+    channel        TEXT NOT NULL DEFAULT '',
+    session_id     TEXT NOT NULL DEFAULT '',
+    start_event_id TEXT,
+    end_event_id   TEXT,
+    start_time     TEXT NOT NULL,
+    end_time       TEXT NOT NULL,
+    event_count    INTEGER NOT NULL DEFAULT 0,
+    summary        TEXT NOT NULL DEFAULT '',
+    status         TEXT NOT NULL DEFAULT 'open',
+    created_at     TEXT NOT NULL,
+    updated_at     TEXT NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_event_chunks_status ON event_chunks(status, created_at);
+  CREATE INDEX IF NOT EXISTS idx_event_chunks_time ON event_chunks(start_time, end_time);
+
+  CREATE TABLE IF NOT EXISTS chunk_events (
+    chunk_id     TEXT NOT NULL,
+    raw_event_id TEXT NOT NULL,
+    position     INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (chunk_id, raw_event_id)
+  );
+  CREATE INDEX IF NOT EXISTS idx_chunk_events_raw ON chunk_events(raw_event_id);
+
+  CREATE TABLE IF NOT EXISTS consolidation_runs (
+    id             TEXT PRIMARY KEY,
+    source         TEXT NOT NULL DEFAULT '',
+    channel        TEXT NOT NULL DEFAULT '',
+    since_time     TEXT,
+    until_time     TEXT,
+    dry_run        INTEGER NOT NULL DEFAULT 1,
+    raw_count      INTEGER NOT NULL DEFAULT 0,
+    chunk_count    INTEGER NOT NULL DEFAULT 0,
+    candidate_count INTEGER NOT NULL DEFAULT 0,
+    error          TEXT,
+    created_at     TEXT NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS z_conflict_audits (
+    id              TEXT PRIMARY KEY,
+    fact_key        TEXT NOT NULL,
+    stale_id        TEXT,
+    current_id      TEXT,
+    protected_ids   TEXT NOT NULL DEFAULT '[]',
+    reason          TEXT NOT NULL DEFAULT '',
+    status          TEXT NOT NULL DEFAULT 'pending',
+    created_at      TEXT NOT NULL,
+    updated_at      TEXT NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_z_audit_status ON z_conflict_audits(status, created_at);
+
+  CREATE TABLE IF NOT EXISTS e_axis_scores (
+    memory_id        TEXT PRIMARY KEY,
+    valence          REAL,
+    arousal          REAL,
+    tension          REAL,
+    confidence       REAL,
+    risk_level       REAL,
+    urgency          REAL,
+    scorer_version   TEXT NOT NULL DEFAULT 'rules-v1',
+    shadow           INTEGER NOT NULL DEFAULT 1,
+    updated_at       TEXT NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS memory_patrol_reports (
+    id             TEXT PRIMARY KEY,
+    status         TEXT NOT NULL DEFAULT 'ok',
+    summary        TEXT NOT NULL DEFAULT '',
+    payload        TEXT NOT NULL DEFAULT '{}',
+    created_at     TEXT NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_patrol_reports_created ON memory_patrol_reports(created_at);
+`);
+
+db.exec(`
   CREATE TABLE IF NOT EXISTS raw_events (
     id                TEXT PRIMARY KEY,
     session_id        TEXT NOT NULL DEFAULT '',
@@ -157,10 +235,19 @@ try { db.exec('CREATE INDEX IF NOT EXISTS idx_content_hash ON memories(content_h
 try { db.exec('ALTER TABLE memories ADD COLUMN fact_key TEXT'); } catch {}
 try { db.exec('ALTER TABLE memories ADD COLUMN superseded_by TEXT'); } catch {}
 try { db.exec('CREATE INDEX IF NOT EXISTS idx_fact_key ON memories(fact_key)'); } catch {}
+try { db.exec("ALTER TABLE memories ADD COLUMN status TEXT NOT NULL DEFAULT 'current'"); } catch {}
+try { db.exec('ALTER TABLE memories ADD COLUMN active_fact INTEGER NOT NULL DEFAULT 0'); } catch {}
+try { db.exec('CREATE INDEX IF NOT EXISTS idx_memories_status ON memories(status)'); } catch {}
 // Migrate: protected memories and curated-memory evidence links
 try { db.exec('ALTER TABLE memories ADD COLUMN protected INTEGER NOT NULL DEFAULT 0'); } catch {}
 try { db.exec("ALTER TABLE memories ADD COLUMN evidence_raw_ids TEXT NOT NULL DEFAULT '[]'"); } catch {}
 try { db.exec('CREATE INDEX IF NOT EXISTS idx_memories_protected ON memories(protected)'); } catch {}
+try { db.exec("ALTER TABLE memory_edges ADD COLUMN relation_type TEXT NOT NULL DEFAULT 'semantic'"); } catch {}
+try { db.exec('ALTER TABLE memory_edges ADD COLUMN strength REAL NOT NULL DEFAULT 1.0'); } catch {}
+try { db.exec("ALTER TABLE memory_edges ADD COLUMN status TEXT NOT NULL DEFAULT 'safe'"); } catch {}
+try { db.exec("ALTER TABLE memory_edges ADD COLUMN reason TEXT NOT NULL DEFAULT ''"); } catch {}
+try { db.exec('ALTER TABLE memory_edges ADD COLUMN updated_at TEXT'); } catch {}
+try { db.exec('CREATE INDEX IF NOT EXISTS idx_edges_type_status ON memory_edges(relation_type, status)'); } catch {}
 // Migrate: raw event provenance fields for external conversation entrypoints
 try { db.exec("ALTER TABLE raw_events ADD COLUMN source TEXT NOT NULL DEFAULT ''"); } catch {}
 try { db.exec("ALTER TABLE raw_events ADD COLUMN speaker TEXT NOT NULL DEFAULT ''"); } catch {}
@@ -168,6 +255,11 @@ try { db.exec("ALTER TABLE raw_events ADD COLUMN metadata TEXT NOT NULL DEFAULT 
 try { db.exec('CREATE INDEX IF NOT EXISTS idx_re_source ON raw_events(source)'); } catch {}
 // Migrate: hippocampus proposal layer for raw_events -> reviewed candidates.
 try { db.exec("ALTER TABLE memory_candidates ADD COLUMN expires_at TEXT"); } catch {}
+try { db.exec("ALTER TABLE memory_candidates ADD COLUMN source_chunk_ids TEXT NOT NULL DEFAULT '[]'"); } catch {}
+try { db.exec("ALTER TABLE memory_candidates ADD COLUMN candidate_type TEXT NOT NULL DEFAULT ''"); } catch {}
+try { db.exec('ALTER TABLE memory_candidates ADD COLUMN importance REAL NOT NULL DEFAULT 0'); } catch {}
+try { db.exec("ALTER TABLE memory_candidates ADD COLUMN suggested_tags TEXT NOT NULL DEFAULT '[]'"); } catch {}
+try { db.exec("ALTER TABLE memory_candidates ADD COLUMN evidence_preview TEXT NOT NULL DEFAULT ''"); } catch {}
 try { db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_candidate_dedupe ON memory_candidates(dedupe_key)'); } catch {}
 try { db.exec('CREATE INDEX IF NOT EXISTS idx_candidate_status ON memory_candidates(status, created_at)'); } catch {}
 try { db.exec('CREATE INDEX IF NOT EXISTS idx_candidate_expires ON memory_candidates(expires_at)'); } catch {}
@@ -183,6 +275,12 @@ const resolveProtectedFlag = (category, requested, existing = 0) => {
   return existing ? 1 : 0;
 };
 const rowIsProtected = (row) => !!row?.protected || isProtectedCategory(row?.category);
+const currentMemorySql = (alias = '') => {
+  const p = alias ? `${alias}.` : '';
+  return `COALESCE(${p}status, 'current') = 'current' AND ${p}superseded_by IS NULL`;
+};
+const factActiveValue = (factKey, status = 'current', supersededBy = null) =>
+  factKey && status === 'current' && !supersededBy ? 1 : 0;
 
 // One-time backfill: content_hash for existing memories
 {
@@ -244,6 +342,8 @@ const fmt = (r) => ({
   activation_score: +(r.activation_score || 0),
   protected: rowIsProtected(r),
   evidence_raw_ids: parseArrayField(r.evidence_raw_ids),
+  status: r.status || 'current',
+  active_fact: !!r.active_fact,
   fact_key: r.fact_key || null, superseded_by: r.superseded_by || null,
   created_at: r.created_at, updated_at: r.updated_at, expires_at: r.expires_at || null,
 });
@@ -261,6 +361,60 @@ const fmtRawEvent = (r) => ({
   metadata: parseObjectField(r.metadata),
 });
 
+const fmtEventChunk = (r) => ({
+  id: r.id,
+  dedupe_key: r.dedupe_key,
+  source: r.source || '',
+  channel: r.channel || '',
+  session_id: r.session_id || '',
+  start_event_id: r.start_event_id || null,
+  end_event_id: r.end_event_id || null,
+  start_time: r.start_time,
+  end_time: r.end_time,
+  event_count: Number(r.event_count || 0),
+  summary: r.summary || '',
+  status: r.status || 'open',
+  created_at: r.created_at,
+  updated_at: r.updated_at,
+});
+
+const fmtMemoryEdge = (r) => ({
+  source_id: r.source_id,
+  target_id: r.target_id,
+  weight: Number(r.weight || r.strength || 0),
+  strength: Number(r.strength || r.weight || 0),
+  relation_type: r.relation_type || 'semantic',
+  status: r.status || 'safe',
+  reason: r.reason || '',
+  created_at: r.created_at,
+  updated_at: r.updated_at || null,
+});
+
+const fmtZAudit = (r) => ({
+  id: r.id,
+  fact_key: r.fact_key,
+  stale_id: r.stale_id || null,
+  current_id: r.current_id || null,
+  protected_ids: parseArrayField(r.protected_ids),
+  reason: r.reason || '',
+  status: r.status || 'pending',
+  created_at: r.created_at,
+  updated_at: r.updated_at,
+});
+
+const fmtEAxisScore = (r) => ({
+  memory_id: r.memory_id,
+  valence: r.valence === null || r.valence === undefined ? null : Number(r.valence),
+  arousal: r.arousal === null || r.arousal === undefined ? null : Number(r.arousal),
+  tension: r.tension === null || r.tension === undefined ? null : Number(r.tension),
+  confidence: r.confidence === null || r.confidence === undefined ? null : Number(r.confidence),
+  risk_level: r.risk_level === null || r.risk_level === undefined ? null : Number(r.risk_level),
+  urgency: r.urgency === null || r.urgency === undefined ? null : Number(r.urgency),
+  scorer_version: r.scorer_version || 'rules-v1',
+  shadow: !!r.shadow,
+  updated_at: r.updated_at,
+});
+
 function extractExactTerms(query) {
   const text = String(query || '').trim();
   if (!text) return [];
@@ -273,6 +427,13 @@ function extractExactTerms(query) {
   }
   if (!terms.length) terms.push(text);
   return [...new Set(terms)].slice(0, 8);
+}
+
+// One-time backfill: explicit lifecycle fields for existing fact rows.
+{
+  const r1 = db.prepare("UPDATE memories SET status = 'historical', active_fact = 0 WHERE superseded_by IS NOT NULL AND COALESCE(status, 'current') = 'current'").run();
+  const r2 = db.prepare("UPDATE memories SET active_fact = 1 WHERE fact_key IS NOT NULL AND superseded_by IS NULL AND COALESCE(status, 'current') = 'current' AND active_fact = 0").run();
+  if (r1.changes || r2.changes) console.log(`[migrate] lifecycle backfill: historical=${r1.changes}, active_fact=${r2.changes}`);
 }
 
 function exactTermMatches(content, term) {
@@ -417,6 +578,7 @@ function candidateHasExistingRawEvents(rawIds) {
 const fmtMemoryCandidate = (r) => ({
   id: r.id,
   raw_event_ids: parseArrayField(r.raw_event_ids),
+  source_chunk_ids: parseArrayField(r.source_chunk_ids),
   dedupe_key: r.dedupe_key,
   source: r.source || '',
   channel: r.channel || '',
@@ -424,6 +586,10 @@ const fmtMemoryCandidate = (r) => ({
   summary: r.summary,
   suggested_category: r.suggested_category,
   suggested_category_label: candidateCategoryLabel(r.suggested_category),
+  candidate_type: r.candidate_type || r.suggested_category || '',
+  importance: Number(r.importance || 0),
+  suggested_tags: parseArrayField(r.suggested_tags),
+  evidence_preview: r.evidence_preview || '',
   reason: r.reason || '',
   confidence: Number(r.confidence || 0),
   status: r.status,
@@ -488,8 +654,192 @@ function buildCandidateSummary(row, category) {
   return `${speaker}在${source}说：${text}`;
 }
 
+function chunkDedupeKey(rawIds) {
+  return crypto.createHash('sha256').update([...rawIds].sort().join('\0')).digest('hex');
+}
+
+function eventChunkSummary(events) {
+  if (!events.length) return '';
+  const first = events[0];
+  const source = rawEventDisplaySource(first);
+  const speakers = [...new Set(events.map(e => e.speaker || e.role).filter(Boolean))].slice(0, 4).join('、') || '对话';
+  const privateLike = events.some(e => ['private', 'intimate'].includes(e.channel));
+  if (privateLike) {
+    return `${source} ${speakers} 的一段私密对话片段（${events.length} 条，${first.timestamp} - ${events[events.length - 1].timestamp}）`;
+  }
+  const preview = truncateText(events.map(e => `${e.speaker || e.role}: ${e.content}`).join(' / '), 260);
+  return `${source} ${speakers} 的对话片段（${events.length} 条）：${preview}`;
+}
+
+function loadUnchunkedRawEvents({ since_hours = 24, source = 'all', channel = 'all', limit = 500 }) {
+  const since = new Date(Date.now() - Number(since_hours) * 60 * 60 * 1000).toISOString();
+  let sql = `
+    SELECT re.*
+    FROM raw_events re
+    LEFT JOIN chunk_events ce ON ce.raw_event_id = re.id
+    WHERE re.timestamp >= ? AND ce.raw_event_id IS NULL
+  `;
+  const params = [since];
+  if (source && source !== 'all') { sql += ' AND re.source = ?'; params.push(source); }
+  if (channel && channel !== 'all') { sql += ' AND re.channel = ?'; params.push(channel); }
+  sql += ' ORDER BY re.source, re.channel, re.session_id, re.timestamp ASC LIMIT ?';
+  params.push(Math.max(1, Math.min(5000, Number(limit) || 500)));
+  return db.prepare(sql).all(...params);
+}
+
+function buildEventChunkDrafts(rawRows, windowSize = 30) {
+  const maxSize = Math.max(5, Math.min(100, Number(windowSize) || 30));
+  const groups = new Map();
+  for (const row of rawRows) {
+    const key = [row.source || '', row.channel || '', row.session_id || ''].join('\0');
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(row);
+  }
+  const drafts = [];
+  for (const rows of groups.values()) {
+    rows.sort((a, b) => String(a.timestamp).localeCompare(String(b.timestamp)));
+    for (let i = 0; i < rows.length; i += maxSize) {
+      const events = rows.slice(i, i + maxSize);
+      if (!events.length) continue;
+      const rawIds = events.map(e => e.id);
+      drafts.push({
+        id: uuidv4(),
+        dedupe_key: chunkDedupeKey(rawIds),
+        source: events[0].source || '',
+        channel: events[0].channel || '',
+        session_id: events[0].session_id || '',
+        start_event_id: events[0].id,
+        end_event_id: events[events.length - 1].id,
+        start_time: events[0].timestamp,
+        end_time: events[events.length - 1].timestamp,
+        event_count: events.length,
+        summary: eventChunkSummary(events),
+        status: 'open',
+        events,
+        raw_event_ids: rawIds,
+      });
+    }
+  }
+  return drafts;
+}
+
+function insertEventChunkDrafts(drafts, now = new Date().toISOString()) {
+  const insertChunk = db.prepare(`
+    INSERT OR IGNORE INTO event_chunks
+      (id,dedupe_key,source,channel,session_id,start_event_id,end_event_id,start_time,end_time,event_count,summary,status,created_at,updated_at)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+  `);
+  const insertEvent = db.prepare('INSERT OR IGNORE INTO chunk_events (chunk_id, raw_event_id, position) VALUES (?,?,?)');
+  let inserted = 0;
+  for (const draft of drafts) {
+    const r = insertChunk.run(
+      draft.id, draft.dedupe_key, draft.source, draft.channel, draft.session_id,
+      draft.start_event_id, draft.end_event_id, draft.start_time, draft.end_time,
+      draft.event_count, draft.summary, draft.status, now, now
+    );
+    if (!r.changes) continue;
+    draft.raw_event_ids.forEach((rawId, index) => insertEvent.run(draft.id, rawId, index));
+    inserted++;
+  }
+  return inserted;
+}
+
+function classifyChunk(chunk, events = []) {
+  const text = `${chunk.summary || ''}\n${events.map(e => e.content).join('\n')}`;
+  const privateLike = ['private', 'intimate'].includes(chunk.channel);
+  if (privateLike) return { category: 'private_candidate', type: 'private_candidate', reason: '私密片段，只生成元数据候选。', confidence: 0.74, importance: 0.62, tags: ['私密候选'] };
+  if (/部署|上线|重启|同步|架构|记忆库|mcp|vps|zeabur|github|commit|bug|测试|审核/i.test(text)) {
+    return { category: 'work', type: 'work', reason: '片段包含项目、部署、排错或审核。', confidence: 0.78, importance: 0.7, tags: ['工作候选'] };
+  }
+  if (/边界|权限|不能|不要|不许|只能|必须|严格|越权/.test(text)) {
+    return { category: 'boundary_candidate', type: 'boundary', reason: '片段包含边界或权限规则。', confidence: 0.8, importance: 0.74, tags: ['边界候选'] };
+  }
+  if (/喜欢|偏好|我会|我不|我只|我想|我需要|记住|别忘/.test(text)) {
+    return { category: 'preference_candidate', type: 'preference', reason: '片段包含偏好、需求或要求记住。', confidence: 0.72, importance: 0.7, tags: ['偏好候选'] };
+  }
+  if (events.length >= 5 || text.length >= 120) {
+    return { category: 'daily', type: 'daily', reason: '片段有一定信息量，可作为日常候选。', confidence: 0.56, importance: 0.5, tags: ['日常候选'] };
+  }
+  return null;
+}
+
+function buildChunkCandidateSummary(chunk, classification) {
+  if (classification.category === 'private_candidate') {
+    return `${rawEventDisplaySource(chunk)} 有一段私密片段（${chunk.start_time} - ${chunk.end_time}，${chunk.event_count} 条）`;
+  }
+  return chunk.summary;
+}
+
+function createZAudit({ fact_key, stale_id = null, current_id = null, protected_ids = [], reason = '' }) {
+  const now = new Date().toISOString();
+  const id = uuidv4();
+  db.prepare(
+    'INSERT INTO z_conflict_audits (id,fact_key,stale_id,current_id,protected_ids,reason,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?)'
+  ).run(id, fact_key, stale_id, current_id, JSON.stringify(protected_ids), reason, 'pending', now, now);
+  return id;
+}
+
+function validateEAxisNumber(value, min, max, name) {
+  if (value === undefined || value === null) return null;
+  const n = Number(value);
+  if (!Number.isFinite(n) || n < min || n > max) {
+    throw new Error(`${name} must be between ${min} and ${max}`);
+  }
+  return n;
+}
+
+function graphExpand(seedIds, { hops = 2, limit = 12, minStrength = 0.35 } = {}) {
+  const now = new Date().toISOString();
+  const seen = new Set(seedIds);
+  let frontier = seedIds.map(id => ({ id, depth: 0, score: 1 }));
+  const hits = [];
+  for (let depth = 1; depth <= hops; depth++) {
+    const next = [];
+    const threshold = depth === 1 ? minStrength : Math.max(0.55, minStrength + 0.15);
+    for (const seed of frontier) {
+      const edges = db.prepare(`
+        SELECT * FROM memory_edges
+        WHERE (source_id = ? OR target_id = ?)
+          AND COALESCE(status, 'safe') = 'safe'
+        ORDER BY strength DESC, weight DESC
+        LIMIT 50
+      `).all(seed.id, seed.id);
+      for (const edge of edges) {
+        const relationType = normalizeRelationType(edge.relation_type);
+        if (!relationIsSafe(relationType, edge.status || 'safe')) continue;
+        const strength = Number(edge.strength || edge.weight || 0);
+        if (strength < threshold) continue;
+        const targetId = edge.source_id === seed.id ? edge.target_id : edge.source_id;
+        if (seen.has(targetId)) continue;
+        const mem = db.prepare(`SELECT * FROM memories WHERE id = ? AND (expires_at IS NULL OR expires_at > ?) AND ${currentMemorySql()}`).get(targetId, now);
+        if (!mem) continue;
+        seen.add(targetId);
+        const typeWeight = RELATION_TYPE_WEIGHTS[relationType] || 0.65;
+        const score = seed.score * strength * typeWeight * (depth === 1 ? 0.75 : 0.45);
+        const hit = { ...fmt(mem), graph_score: +score.toFixed(4), graph_depth: depth, bridge_from: seed.id, relation: fmtMemoryEdge(edge) };
+        hits.push(hit);
+        next.push({ id: targetId, depth, score });
+        if (hits.length >= limit) return hits;
+      }
+    }
+    frontier = next;
+    if (!frontier.length) break;
+  }
+  return hits.sort((a, b) => b.graph_score - a.graph_score).slice(0, limit);
+}
+
+function eAxisScoreForMemory(mem) {
+  const text = `${mem.content || ''} ${parseTags(mem.tags).join(' ')}`;
+  const valence = /开心|喜欢|爱|稳|完成|成功|亲|抱|心动|温柔/.test(text) ? 0.45 : (/生气|难过|失败|掉线|错误|bug|冲突|风险/.test(text) ? -0.35 : 0);
+  const arousal = /紧急|立刻|马上|亲密|欲望|触觉|心动|生气|崩|炸/.test(text) ? 0.7 : 0.25;
+  const tension = /冲突|错误|失败|掉线|风险|越权|不许|不能|红线/.test(text) ? 0.75 : 0.2;
+  const risk_level = /删除|覆盖|重置|隐私|token|鉴权|越权|红线/.test(text) ? 0.7 : 0.15;
+  const urgency = /现在|立刻|马上|紧急|挂了|掉了|炸了/.test(text) ? 0.75 : 0.2;
+  return { valence, arousal, tension, confidence: 0.55, risk_level, urgency };
+}
+
 const cleanExpired = () => {
-  const r = db.prepare('DELETE FROM memories WHERE expires_at IS NOT NULL AND expires_at < ?')
+  const r = db.prepare('DELETE FROM memories WHERE protected = 0 AND expires_at IS NOT NULL AND expires_at < ?')
     .run(new Date().toISOString());
   if (r.changes) {
     db.prepare(`DELETE FROM memory_edges WHERE source_id NOT IN (SELECT id FROM memories) OR target_id NOT IN (SELECT id FROM memories)`).run();
@@ -514,6 +864,27 @@ const SOMATIC_DEFAULT_HALF_LIFE = {
 const SOMATIC_MIN_STRENGTH = 0.15;
 const SOMATIC_MAX_STRENGTH = 1.5;
 const SOMATIC_TARGET = 'ke';
+const SAFE_RELATION_TYPES = new Set(['semantic', 'same_topic', 'same_event', 'temporal_sequence', 'derived_from', 'same_project']);
+const REVIEW_RELATION_TYPES = new Set(['supports', 'contradicts', 'cause_effect', 'relationship_moment', 'emotional_link']);
+const RELATION_TYPE_WEIGHTS = {
+  semantic: 0.7,
+  same_topic: 0.8,
+  same_event: 0.95,
+  temporal_sequence: 0.75,
+  derived_from: 0.85,
+  same_project: 0.8,
+};
+
+function normalizeRelationType(type) {
+  const t = String(type || 'semantic').trim();
+  if (t === 'contradiction') return 'contradicts';
+  return t || 'semantic';
+}
+
+function relationIsSafe(type, status = 'safe') {
+  const t = normalizeRelationType(type);
+  return status === 'safe' && SAFE_RELATION_TYPES.has(t) && !REVIEW_RELATION_TYPES.has(t);
+}
 
 function ensureSomaticTarget(target = SOMATIC_TARGET) {
   const normalized = String(target || SOMATIC_TARGET).trim();
@@ -673,7 +1044,7 @@ function cosineSim(a, b) {
 function findRelated(embedding, excludeId, topK = 3) {
   if (!embedding) return [];
   const rows = db.prepare(
-    'SELECT id,content,category,tags,source,mood,created_at,embedding FROM memories WHERE id != ? AND embedding IS NOT NULL AND (expires_at IS NULL OR expires_at > ?)'
+    `SELECT id,content,category,tags,source,mood,created_at,embedding,status,superseded_by,active_fact,protected,evidence_raw_ids,pinned,activation_score,fact_key,expires_at,updated_at FROM memories WHERE id != ? AND embedding IS NOT NULL AND (expires_at IS NULL OR expires_at > ?) AND ${currentMemorySql()}`
   ).all(excludeId, new Date().toISOString());
   return rows
     .map(r => { try { return { ...r, score: cosineSim(embedding, JSON.parse(r.embedding)) }; } catch { return null; } })
@@ -725,6 +1096,8 @@ function createMcpServer() {
 
       const id = uuidv4(), now = new Date().toISOString();
       // daily/anchor/cc-anchor expire in 3 days; pinned never expires
+      const status = 'current';
+      const activeFact = factActiveValue(fact_key, status, null);
       const expires_at = pinned ? null : expiryFor(category);
       const protectedFlag = resolveProtectedFlag(category, protectedArg, 0);
       const evidenceIds = JSON.stringify(evidence_raw_ids ?? []);
@@ -736,15 +1109,22 @@ function createMcpServer() {
       let oldFactRows = [];
       if (fact_key) {
         oldFactRows = db.prepare(
-          'SELECT * FROM memories WHERE fact_key = ? AND id != ? AND superseded_by IS NULL'
+          `SELECT * FROM memories WHERE fact_key = ? AND id != ? AND ${currentMemorySql()}`
         ).all(fact_key, id);
         const blocked = oldFactRows.filter(rowIsProtected);
         if (blocked.length) {
+          const audit_id = createZAudit({
+            fact_key,
+            current_id: id,
+            protected_ids: blocked.map(m => m.id),
+            reason: 'write_memory refused to auto-supersede protected current fact',
+          });
           return {
             content: [{
               type: 'text',
               text: JSON.stringify({
                 error: 'protected_fact_conflict',
+                audit_id,
                 fact_key,
                 protected_ids: blocked.map(m => m.id),
                 note: 'Refusing to auto-supersede protected memories. Update protected facts manually after review.',
@@ -755,14 +1135,14 @@ function createMcpServer() {
       }
 
       db.prepare(
-        'INSERT INTO memories (id,content,category,tags,source,mood,created_at,updated_at,expires_at,embedding,pinned,content_hash,fact_key,protected,evidence_raw_ids) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)'
+        'INSERT INTO memories (id,content,category,tags,source,mood,created_at,updated_at,expires_at,embedding,pinned,content_hash,fact_key,protected,evidence_raw_ids,status,active_fact) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)'
       ).run(id, content, category, JSON.stringify(tags ?? []), source ?? '', mood ?? null, now, now, expires_at,
-        embedding ? JSON.stringify(embedding) : null, pinned ? 1 : 0, hash, fact_key ?? null, protectedFlag, evidenceIds);
+        embedding ? JSON.stringify(embedding) : null, pinned ? 1 : 0, hash, fact_key ?? null, protectedFlag, evidenceIds, status, activeFact);
 
       // Z-axis: auto-supersede old versions of the same fact
       let superseded = [];
       if (fact_key) {
-        const superStmt = db.prepare('UPDATE memories SET superseded_by = ?, updated_at = ? WHERE id = ?');
+        const superStmt = db.prepare("UPDATE memories SET superseded_by = ?, status = 'historical', active_fact = 0, updated_at = ? WHERE id = ? AND protected = 0");
         for (const o of oldFactRows) {
           superStmt.run(id, now, o.id);
           superseded.push(o.id);
@@ -771,10 +1151,13 @@ function createMcpServer() {
 
       // "写就是读"：把相关记忆存为边
       if (related.length) {
-        const edgeStmt = db.prepare('INSERT OR IGNORE INTO memory_edges (source_id, target_id, weight, created_at) VALUES (?, ?, ?, ?)');
+        const edgeStmt = db.prepare(
+          'INSERT OR IGNORE INTO memory_edges (source_id,target_id,weight,created_at,relation_type,strength,status,reason,updated_at) VALUES (?,?,?,?,?,?,?,?,?)'
+        );
         for (const r of related) {
-          edgeStmt.run(id, r.id, r.similarity ?? 0.5, now);
-          edgeStmt.run(r.id, id, r.similarity ?? 0.5, now);
+          const weight = r.similarity ?? 0.5;
+          edgeStmt.run(id, r.id, weight, now, 'semantic', weight, 'safe', 'auto semantic association', now);
+          edgeStmt.run(r.id, id, weight, now, 'semantic', weight, 'safe', 'auto semantic association', now);
         }
       }
 
@@ -810,7 +1193,7 @@ function createMcpServer() {
       let sql = 'SELECT * FROM memories WHERE 1=1';
       const p = [];
       if (!include_expired) { sql += ' AND (expires_at IS NULL OR expires_at > ?)'; p.push(new Date().toISOString()); }
-      if (!include_superseded) { sql += ' AND superseded_by IS NULL'; }
+      if (!include_superseded) { sql += ` AND ${currentMemorySql()}`; }
       if (category) { sql += ' AND category = ?'; p.push(category); }
       if (keyword)  { sql += ' AND content LIKE ?'; p.push(`%${keyword}%`); }
       sql += ' ORDER BY pinned DESC, created_at DESC LIMIT ?';
@@ -831,7 +1214,7 @@ function createMcpServer() {
     },
     async ({ query, category }) => {
       cleanExpired();
-      let sql = 'SELECT * FROM memories WHERE content LIKE ? AND (expires_at IS NULL OR expires_at > ?)';
+      let sql = `SELECT * FROM memories WHERE content LIKE ? AND (expires_at IS NULL OR expires_at > ?) AND ${currentMemorySql()}`;
       const p = [`%${query}%`, new Date().toISOString()];
       if (category) { sql += ' AND category = ?'; p.push(category); }
       sql += ' ORDER BY created_at DESC LIMIT 20';
@@ -889,7 +1272,9 @@ function createMcpServer() {
         expires_at = newPinned ? null : expiryFor(newCategory);
       }
       const newFactKey = fact_key !== undefined ? fact_key : row.fact_key;
-      db.prepare('UPDATE memories SET content=?,category=?,tags=?,source=?,mood=?,pinned=?,updated_at=?,expires_at=?,content_hash=?,fact_key=?,protected=?,evidence_raw_ids=? WHERE id=?').run(
+      const newStatus = row.status || 'current';
+      const newActiveFact = factActiveValue(newFactKey, newStatus, row.superseded_by);
+      db.prepare('UPDATE memories SET content=?,category=?,tags=?,source=?,mood=?,pinned=?,updated_at=?,expires_at=?,content_hash=?,fact_key=?,protected=?,evidence_raw_ids=?,active_fact=? WHERE id=?').run(
         content ?? row.content,
         newCategory,
         tags !== undefined ? JSON.stringify(tags) : row.tags,
@@ -902,6 +1287,7 @@ function createMcpServer() {
         newFactKey ?? null,
         newProtected,
         newEvidenceIds,
+        newActiveFact,
         id
       );
       const notes = [];
@@ -951,7 +1337,7 @@ function createMcpServer() {
       if (!embedding) {
         return { content: [{ type: 'text', text: 'Vector search unavailable: set VOYAGE_API_KEY env var. Get a free key at voyageai.com.' }] };
       }
-      let sql = 'SELECT * FROM memories WHERE embedding IS NOT NULL AND (expires_at IS NULL OR expires_at > ?)';
+      let sql = `SELECT * FROM memories WHERE embedding IS NOT NULL AND (expires_at IS NULL OR expires_at > ?) AND ${currentMemorySql()}`;
       const p = [new Date().toISOString()];
       if (category) { sql += ' AND category = ?'; p.push(category); }
       const rows = db.prepare(sql).all(...p);
@@ -988,7 +1374,7 @@ function createMcpServer() {
       const results = [];
       for (const edge of edges) {
         if (excludeSet.has(edge.target_id)) continue;
-        const mem = db.prepare('SELECT * FROM memories WHERE id = ? AND (expires_at IS NULL OR expires_at > ?)').get(edge.target_id, now);
+        const mem = db.prepare(`SELECT * FROM memories WHERE id = ? AND (expires_at IS NULL OR expires_at > ?) AND ${currentMemorySql()}`).get(edge.target_id, now);
         if (mem) {
           results.push({ ...fmt(mem), edge_weight: +edge.weight.toFixed(3), bridge_from: memory_id });
           if (results.length >= limit) break;
@@ -1021,7 +1407,7 @@ function createMcpServer() {
       const now = new Date().toISOString();
 
       // ── keyword half ──
-      let kSql = 'SELECT * FROM memories WHERE content LIKE ? AND (expires_at IS NULL OR expires_at > ?)';
+      let kSql = `SELECT * FROM memories WHERE content LIKE ? AND (expires_at IS NULL OR expires_at > ?) AND ${currentMemorySql()}`;
       const kp = [`%${query}%`, now];
       if (category) { kSql += ' AND category = ?'; kp.push(category); }
       kSql += ' ORDER BY created_at DESC LIMIT 50';
@@ -1031,7 +1417,7 @@ function createMcpServer() {
       let semanticRows = [];
       const embedding = await getEmbedding(query);
       if (embedding) {
-        let sSql = 'SELECT * FROM memories WHERE embedding IS NOT NULL AND (expires_at IS NULL OR expires_at > ?)';
+        let sSql = `SELECT * FROM memories WHERE embedding IS NOT NULL AND (expires_at IS NULL OR expires_at > ?) AND ${currentMemorySql()}`;
         const sp = [now];
         if (category) { sSql += ' AND category = ?'; sp.push(category); }
         semanticRows = db.prepare(sSql).all(...sp)
@@ -1142,7 +1528,7 @@ function createMcpServer() {
         const rows = db.prepare(
           'SELECT * FROM memories WHERE fact_key = ? AND (expires_at IS NULL OR expires_at > ?) ORDER BY created_at DESC'
         ).all(fact_key, now).map(fmt);
-        const current = rows.filter(r => !r.superseded_by);
+        const current = rows.filter(r => r.status === 'current' && !r.superseded_by);
         return {
           content: [{
             type: 'text',
@@ -1160,7 +1546,7 @@ function createMcpServer() {
 
       // Scan all fact_keys
       const groups = db.prepare(
-        "SELECT fact_key, COUNT(*) as total, SUM(CASE WHEN superseded_by IS NULL THEN 1 ELSE 0 END) as current_count FROM memories WHERE fact_key IS NOT NULL AND (expires_at IS NULL OR expires_at > ?) GROUP BY fact_key ORDER BY fact_key"
+        "SELECT fact_key, COUNT(*) as total, SUM(CASE WHEN COALESCE(status, 'current') = 'current' AND superseded_by IS NULL THEN 1 ELSE 0 END) as current_count FROM memories WHERE fact_key IS NOT NULL AND (expires_at IS NULL OR expires_at > ?) GROUP BY fact_key ORDER BY fact_key"
       ).all(now);
 
       const conflicts = groups.filter(g => g.current_count > 1);
@@ -1235,9 +1621,9 @@ function createMcpServer() {
       const mergedSource = source || `merged from ${sourceRef}`;
 
       db.prepare(
-        'INSERT INTO memories (id,content,category,tags,source,mood,created_at,updated_at,expires_at,embedding,pinned,content_hash,protected,evidence_raw_ids) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)'
+        'INSERT INTO memories (id,content,category,tags,source,mood,created_at,updated_at,expires_at,embedding,pinned,content_hash,protected,evidence_raw_ids,status,active_fact) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)'
       ).run(mergedId, content, mergedCategory, JSON.stringify(mergedTags), mergedSource, null, now, now, expires_at,
-        embedding ? JSON.stringify(embedding) : null, 0, hash, protectedFlag, '[]');
+        embedding ? JSON.stringify(embedding) : null, 0, hash, protectedFlag, '[]', 'current', 0);
 
       // Tag source memories as merged (don't delete them)
       const tagStmt = db.prepare('SELECT tags FROM memories WHERE id = ?');
@@ -1250,10 +1636,12 @@ function createMcpServer() {
       }
 
       // Create edges from merged → sources
-      const edgeStmt = db.prepare('INSERT OR IGNORE INTO memory_edges (source_id, target_id, weight, created_at) VALUES (?, ?, ?, ?)');
+      const edgeStmt = db.prepare(
+        'INSERT OR IGNORE INTO memory_edges (source_id,target_id,weight,created_at,relation_type,strength,status,reason,updated_at) VALUES (?,?,?,?,?,?,?,?,?)'
+      );
       for (const id of ids) {
-        edgeStmt.run(mergedId, id, 1.0, now);
-        edgeStmt.run(id, mergedId, 1.0, now);
+        edgeStmt.run(mergedId, id, 1.0, now, 'semantic', 1.0, 'safe', 'merge source', now);
+        edgeStmt.run(id, mergedId, 1.0, now, 'semantic', 1.0, 'safe', 'merged into', now);
       }
 
       return {
@@ -1350,7 +1738,387 @@ function createMcpServer() {
     }
   );
 
-  // 16. propose_memory_candidates — raw_events -> reviewed candidate proposals only
+  // 16. consolidate_raw_events — X-axis raw events -> event chunks
+  mcp.tool(
+    'consolidate_raw_events',
+    'X-axis: group unchunked raw_events into event_chunks. dry_run=true previews only; no memories are written.',
+    {
+      since_hours: z.number().min(1).max(720).default(24),
+      source: z.string().default('all'),
+      channel: z.enum(['cc', 'daily', 'intimate', 'private', 'group', 'normal', 'all']).default('all'),
+      window_size: z.number().int().min(5).max(100).default(30),
+      limit: z.number().int().min(1).max(1000).default(500),
+      dry_run: z.boolean().default(true),
+    },
+    async ({ since_hours = 24, source = 'all', channel = 'all', window_size = 30, limit = 500, dry_run = true }) => {
+      const now = new Date().toISOString();
+      const rawRows = loadUnchunkedRawEvents({ since_hours, source, channel, limit });
+      const drafts = buildEventChunkDrafts(rawRows, window_size);
+      let inserted = 0;
+      let runId = null;
+      if (!dry_run) {
+        db.exec('BEGIN IMMEDIATE');
+        try {
+          inserted = insertEventChunkDrafts(drafts, now);
+          runId = uuidv4();
+          const since = new Date(Date.now() - Number(since_hours) * 60 * 60 * 1000).toISOString();
+          db.prepare('INSERT INTO consolidation_runs (id,source,channel,since_time,until_time,dry_run,raw_count,chunk_count,candidate_count,error,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)')
+            .run(runId, source, channel, since, now, 0, rawRows.length, inserted, 0, null, now);
+          db.exec('COMMIT');
+        } catch (err) {
+          db.exec('ROLLBACK');
+          throw err;
+        }
+      }
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            dry_run,
+            run_id: runId,
+            raw_count: rawRows.length,
+            chunk_count: dry_run ? drafts.length : inserted,
+            chunks: drafts.slice(0, 20).map(d => ({ ...d, events: undefined })).map(fmtEventChunk),
+            note: dry_run ? 'dry_run=true: no event_chunks were written.' : 'event_chunks and chunk_events were written; memories were not written.',
+          }, null, 2),
+        }],
+      };
+    }
+  );
+
+  // 17. list_event_chunks — read chunk layer
+  mcp.tool(
+    'list_event_chunks',
+    'List event_chunks created by consolidate_raw_events.',
+    {
+      status: z.enum(['open', 'reviewed', 'archived', 'all']).default('open'),
+      limit: z.number().int().min(1).max(100).default(20),
+    },
+    async ({ status = 'open', limit = 20 }) => {
+      const rows = status === 'all'
+        ? db.prepare('SELECT * FROM event_chunks ORDER BY created_at DESC LIMIT ?').all(limit)
+        : db.prepare('SELECT * FROM event_chunks WHERE status = ? ORDER BY created_at DESC LIMIT ?').all(status, limit);
+      return { content: [{ type: 'text', text: JSON.stringify({ chunks: rows.map(fmtEventChunk), count: rows.length }, null, 2) }] };
+    }
+  );
+
+  // 18. propose_chunk_candidates — hippocampus candidates from chunks
+  mcp.tool(
+    'propose_chunk_candidates',
+    'Hippocampus: propose memory_candidates from event_chunks. Does not write formal memories.',
+    {
+      status: z.enum(['open', 'reviewed', 'archived', 'all']).default('open'),
+      limit: z.number().int().min(1).max(50).default(20),
+      dry_run: z.boolean().default(true),
+    },
+    async ({ status = 'open', limit = 20, dry_run = true }) => {
+      const now = new Date().toISOString();
+      markStaleCandidates(now);
+      const chunks = status === 'all'
+        ? db.prepare('SELECT * FROM event_chunks ORDER BY created_at DESC LIMIT ?').all(limit)
+        : db.prepare('SELECT * FROM event_chunks WHERE status = ? ORDER BY created_at DESC LIMIT ?').all(status, limit);
+      const insert = db.prepare(`
+        INSERT OR IGNORE INTO memory_candidates
+          (id,raw_event_ids,source_chunk_ids,dedupe_key,source,channel,speaker,summary,suggested_category,candidate_type,reason,confidence,importance,suggested_tags,evidence_preview,status,created_at,updated_at,expires_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+      `);
+      const proposals = [];
+      for (const chunk of chunks) {
+        const events = db.prepare(`
+          SELECT re.*
+          FROM chunk_events ce
+          JOIN raw_events re ON re.id = ce.raw_event_id
+          WHERE ce.chunk_id = ?
+          ORDER BY ce.position ASC
+        `).all(chunk.id);
+        const classification = classifyChunk(chunk, events);
+        if (!classification) continue;
+        const rawIds = events.map(e => e.id);
+        const dedupeKey = crypto.createHash('sha256').update(`chunk:${chunk.id}:${classification.type}`).digest('hex');
+        const existing = db.prepare('SELECT id FROM memory_candidates WHERE dedupe_key = ? LIMIT 1').get(dedupeKey);
+        if (existing) continue;
+        const candidate = {
+          id: uuidv4(),
+          raw_event_ids: rawIds,
+          source_chunk_ids: [chunk.id],
+          dedupe_key: dedupeKey,
+          source: chunk.source,
+          channel: chunk.channel,
+          speaker: '',
+          summary: buildChunkCandidateSummary(chunk, classification),
+          suggested_category: classification.category,
+          suggested_category_label: candidateCategoryLabel(classification.category),
+          candidate_type: classification.type,
+          reason: classification.reason,
+          confidence: classification.confidence,
+          importance: classification.importance,
+          suggested_tags: classification.tags,
+          evidence_preview: ['private', 'intimate'].includes(chunk.channel) ? '' : truncateText(events.map(e => e.content).join(' / '), 240),
+          status: 'pending',
+          created_at: now,
+          updated_at: now,
+          reviewed_at: null,
+          review_note: null,
+          expires_at: candidateExpiresAt(now, 7),
+        };
+        proposals.push(candidate);
+        if (!dry_run) {
+          insert.run(
+            candidate.id,
+            JSON.stringify(candidate.raw_event_ids),
+            JSON.stringify(candidate.source_chunk_ids),
+            candidate.dedupe_key,
+            candidate.source,
+            candidate.channel,
+            candidate.speaker,
+            candidate.summary,
+            candidate.suggested_category,
+            candidate.candidate_type,
+            candidate.reason,
+            candidate.confidence,
+            candidate.importance,
+            JSON.stringify(candidate.suggested_tags),
+            candidate.evidence_preview,
+            candidate.status,
+            candidate.created_at,
+            candidate.updated_at,
+            candidate.expires_at
+          );
+        }
+        if (proposals.length >= limit) break;
+      }
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            dry_run,
+            proposed_count: proposals.length,
+            candidates: proposals,
+            note: dry_run ? 'dry_run=true: no candidates were written.' : 'Chunk candidates were written; formal memories were not written.',
+          }, null, 2),
+        }],
+      };
+    }
+  );
+
+  // 19. upsert_memory_relation — Y-axis typed relation
+  mcp.tool(
+    'upsert_memory_relation',
+    'Y-axis: create/update a typed relation edge between two memories. Review relation types are stored but not used by default graph recall.',
+    {
+      source_id: z.string().min(1),
+      target_id: z.string().min(1),
+      relation_type: z.string().default('same_topic'),
+      strength: z.number().min(0).max(1).default(0.7),
+      status: z.enum(['safe', 'review', 'rejected']).default('safe'),
+      reason: z.string().optional(),
+    },
+    async ({ source_id, target_id, relation_type = 'same_topic', strength = 0.7, status = 'safe', reason = '' }) => {
+      if (source_id === target_id) return { content: [{ type: 'text', text: JSON.stringify({ error: 'self_loop_refused' }, null, 2) }] };
+      const s = db.prepare('SELECT id FROM memories WHERE id = ?').get(source_id);
+      const t = db.prepare('SELECT id FROM memories WHERE id = ?').get(target_id);
+      if (!s || !t) return { content: [{ type: 'text', text: JSON.stringify({ error: 'memory_not_found', source_exists: !!s, target_exists: !!t }, null, 2) }] };
+      const type = normalizeRelationType(relation_type);
+      const edgeStatus = REVIEW_RELATION_TYPES.has(type) && status === 'safe' ? 'review' : status;
+      const now = new Date().toISOString();
+      db.prepare(`
+        INSERT INTO memory_edges (source_id,target_id,weight,created_at,relation_type,strength,status,reason,updated_at)
+        VALUES (?,?,?,?,?,?,?,?,?)
+        ON CONFLICT(source_id,target_id) DO UPDATE SET
+          weight=excluded.weight,
+          relation_type=excluded.relation_type,
+          strength=excluded.strength,
+          status=excluded.status,
+          reason=excluded.reason,
+          updated_at=excluded.updated_at
+      `).run(source_id, target_id, strength, now, type, strength, edgeStatus, reason || '', now);
+      const row = db.prepare('SELECT * FROM memory_edges WHERE source_id = ? AND target_id = ?').get(source_id, target_id);
+      return { content: [{ type: 'text', text: JSON.stringify({ relation: fmtMemoryEdge(row), default_graph_eligible: relationIsSafe(type, edgeStatus) }, null, 2) }] };
+    }
+  );
+
+  // 20. list_z_audits — pending fact conflict review
+  mcp.tool(
+    'list_z_audits',
+    'Z-axis: list pending/reviewed fact conflict audits. Read-only.',
+    {
+      status: z.enum(['pending', 'approved', 'rejected', 'all']).default('pending'),
+      limit: z.number().int().min(1).max(100).default(20),
+    },
+    async ({ status = 'pending', limit = 20 }) => {
+      const rows = status === 'all'
+        ? db.prepare('SELECT * FROM z_conflict_audits ORDER BY created_at DESC LIMIT ?').all(limit)
+        : db.prepare('SELECT * FROM z_conflict_audits WHERE status = ? ORDER BY created_at DESC LIMIT ?').all(status, limit);
+      return { content: [{ type: 'text', text: JSON.stringify({ audits: rows.map(fmtZAudit), count: rows.length }, null, 2) }] };
+    }
+  );
+
+  // 21. score_e_axis_shadow — E-axis shadow scoring
+  mcp.tool(
+    'score_e_axis_shadow',
+    'E-axis shadow scorer. Stores bounded valence/arousal/tension/confidence/risk/urgency; does not affect ranking yet.',
+    {
+      memory_id: z.string().optional().describe('Score one memory id, or omit to score recent memories'),
+      limit: z.number().int().min(1).max(100).default(20),
+      dry_run: z.boolean().default(true),
+    },
+    async ({ memory_id, limit = 20, dry_run = true }) => {
+      const now = new Date().toISOString();
+      const rows = memory_id
+        ? db.prepare('SELECT * FROM memories WHERE id = ?').all(memory_id)
+        : db.prepare(`SELECT * FROM memories WHERE (expires_at IS NULL OR expires_at > ?) AND ${currentMemorySql()} ORDER BY created_at DESC LIMIT ?`).all(now, limit);
+      const scores = rows.map(mem => ({ memory_id: mem.id, ...eAxisScoreForMemory(mem), scorer_version: 'rules-v1', shadow: true, updated_at: now }));
+      if (!dry_run) {
+        const stmt = db.prepare(`
+          INSERT INTO e_axis_scores (memory_id,valence,arousal,tension,confidence,risk_level,urgency,scorer_version,shadow,updated_at)
+          VALUES (?,?,?,?,?,?,?,?,?,?)
+          ON CONFLICT(memory_id) DO UPDATE SET
+            valence=excluded.valence, arousal=excluded.arousal, tension=excluded.tension,
+            confidence=excluded.confidence, risk_level=excluded.risk_level, urgency=excluded.urgency,
+            scorer_version=excluded.scorer_version, shadow=excluded.shadow, updated_at=excluded.updated_at
+        `);
+        for (const s of scores) {
+          stmt.run(
+            s.memory_id,
+            validateEAxisNumber(s.valence, -1, 1, 'valence'),
+            validateEAxisNumber(s.arousal, 0, 1, 'arousal'),
+            validateEAxisNumber(s.tension, 0, 1, 'tension'),
+            validateEAxisNumber(s.confidence, 0, 1, 'confidence'),
+            validateEAxisNumber(s.risk_level, 0, 1, 'risk_level'),
+            validateEAxisNumber(s.urgency, 0, 1, 'urgency'),
+            s.scorer_version,
+            1,
+            s.updated_at
+          );
+        }
+      }
+      return { content: [{ type: 'text', text: JSON.stringify({ dry_run, count: scores.length, scores, note: 'E-axis is shadow-only; recall ranking is unchanged.' }, null, 2) }] };
+    }
+  );
+
+  // 22. recall_lmc — unified LMC recall
+  mcp.tool(
+    'recall_lmc',
+    'Unified LMC recall: curated keyword/semantic, optional exact raw fallback, chunk fallback, safe Y two-hop expansion, and compact injection text.',
+    {
+      query: z.string().min(1),
+      limit: z.number().int().min(1).max(20).default(8),
+      fallback_to_raw: z.boolean().default(false),
+      include_chunks: z.boolean().default(true),
+      graph_hops: z.number().int().min(0).max(2).default(2),
+    },
+    async ({ query, limit = 8, fallback_to_raw = false, include_chunks = true, graph_hops = 2 }) => {
+      cleanExpired();
+      const now = new Date().toISOString();
+      let kSql = `SELECT * FROM memories WHERE content LIKE ? AND (expires_at IS NULL OR expires_at > ?) AND ${currentMemorySql()} ORDER BY pinned DESC, created_at DESC LIMIT ?`;
+      const keywordRows = db.prepare(kSql).all(`%${query}%`, now, Math.max(limit * 4, 20));
+      let semanticRows = [];
+      const embedding = await getEmbedding(query);
+      if (embedding) {
+        semanticRows = db.prepare(`SELECT * FROM memories WHERE embedding IS NOT NULL AND (expires_at IS NULL OR expires_at > ?) AND ${currentMemorySql()}`).all(now)
+          .map(r => { try { return { ...r, score: cosineSim(embedding, JSON.parse(r.embedding)) }; } catch { return null; } })
+          .filter(Boolean)
+          .sort((a, b) => b.score - a.score)
+          .slice(0, Math.max(limit * 4, 20));
+      }
+      const K = 60;
+      const fuse = new Map();
+      keywordRows.forEach((r, i) => {
+        const e = fuse.get(r.id) || { row: r, score: 0, channels: [] };
+        e.score += 1 / (K + i + 1);
+        e.channels.push('keyword');
+        fuse.set(r.id, e);
+      });
+      semanticRows.forEach((r, i) => {
+        const e = fuse.get(r.id) || { row: r, score: 0, channels: [] };
+        e.score += 1 / (K + i + 1);
+        e.channels.push('semantic');
+        fuse.set(r.id, e);
+      });
+      const primary = [...fuse.values()]
+        .sort((a, b) => b.score - a.score)
+        .slice(0, limit)
+        .map(e => ({ ...fmt(e.row), recall_score: +e.score.toFixed(4), recall_channels: [...new Set(e.channels)] }));
+      const graph = graph_hops > 0 ? graphExpand(primary.map(r => r.id), { hops: graph_hops, limit }) : [];
+      const raw = fallback_to_raw ? rawEventSearch({ query, mode: 'exact', channel: 'all', limit: 5 }).rows.map(fmtRawEvent) : [];
+      const chunks = include_chunks
+        ? db.prepare('SELECT * FROM event_chunks WHERE summary LIKE ? ORDER BY created_at DESC LIMIT ?').all(`%${query}%`, Math.min(5, limit)).map(fmtEventChunk)
+        : [];
+      const lines = [];
+      for (const mem of primary.slice(0, 5)) lines.push(`- ${mem.category} ${mem.id.slice(0, 8)}：${truncateText(mem.content, 220)}`);
+      for (const mem of graph.slice(0, 3)) lines.push(`- 关联 ${mem.category} ${mem.id.slice(0, 8)}：${truncateText(mem.content, 180)}`);
+      if (raw.length) lines.push(`- 原始证据命中 ${raw.length} 条，可按需查看 raw_fallback。`);
+      if (chunks.length) lines.push(`- 片段命中 ${chunks.length} 条，可按需查看 chunks。`);
+      const injection_text = lines.join('\n').slice(0, 5000);
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            query,
+            primary,
+            graph,
+            raw_fallback: raw,
+            chunks,
+            injection_text,
+            semantic_enabled: !!embedding,
+            note: 'Z-axis filters current memories by default; E-axis is still shadow-only.',
+          }, null, 2),
+        }],
+      };
+    }
+  );
+
+  // 23. run_memory_patrol — local LMC patrol report
+  mcp.tool(
+    'run_memory_patrol',
+    'Read-only LMC patrol: reports candidates, chunks, edge health, fact conflicts, and E-axis shadow coverage. Does not repair data.',
+    {
+      save_report: z.boolean().default(true),
+      edge_issue_limit: z.number().int().min(1).max(200).default(50),
+    },
+    async ({ save_report = true, edge_issue_limit = 50 }) => {
+      const now = new Date().toISOString();
+      const edge = inspectMemoryEdges(edge_issue_limit);
+      const factGroups = db.prepare("SELECT fact_key, SUM(CASE WHEN COALESCE(status, 'current') = 'current' AND superseded_by IS NULL THEN 1 ELSE 0 END) as current_count FROM memories WHERE fact_key IS NOT NULL GROUP BY fact_key").all();
+      const conflicts = factGroups.filter(g => g.current_count > 1);
+      const payload = {
+        checked_at: now,
+        memories: db.prepare('SELECT COUNT(*) as c FROM memories').get().c,
+        raw_events: db.prepare('SELECT COUNT(*) as c FROM raw_events').get().c,
+        event_chunks: db.prepare('SELECT COUNT(*) as c FROM event_chunks').get().c,
+        pending_candidates: db.prepare("SELECT COUNT(*) as c FROM memory_candidates WHERE status='pending'").get().c,
+        pending_z_audits: db.prepare("SELECT COUNT(*) as c FROM z_conflict_audits WHERE status='pending'").get().c,
+        e_axis_scored: db.prepare('SELECT COUNT(*) as c FROM e_axis_scores').get().c,
+        edge_health: edge,
+        fact_conflicts: conflicts,
+      };
+      const status = edge.issue_count || conflicts.length ? 'needs_review' : 'ok';
+      const summary = `mem=${payload.memories}, raw=${payload.raw_events}, chunks=${payload.event_chunks}, pending_candidates=${payload.pending_candidates}, edge_issues=${edge.issue_count}, fact_conflicts=${conflicts.length}`;
+      let reportId = null;
+      if (save_report) {
+        reportId = uuidv4();
+        db.prepare('INSERT INTO memory_patrol_reports (id,status,summary,payload,created_at) VALUES (?,?,?,?,?)')
+          .run(reportId, status, summary, JSON.stringify(payload), now);
+      }
+      return { content: [{ type: 'text', text: JSON.stringify({ report_id: reportId, status, summary, payload, note: 'Patrol is read-only.' }, null, 2) }] };
+    }
+  );
+
+  // 24. list_memory_patrol_reports — patrol history
+  mcp.tool(
+    'list_memory_patrol_reports',
+    'List recent read-only memory patrol reports.',
+    {
+      limit: z.number().int().min(1).max(50).default(10),
+    },
+    async ({ limit = 10 }) => {
+      const rows = db.prepare('SELECT * FROM memory_patrol_reports ORDER BY created_at DESC LIMIT ?').all(limit)
+        .map(r => ({ id: r.id, status: r.status, summary: r.summary, payload: parseObjectField(r.payload), created_at: r.created_at }));
+      return { content: [{ type: 'text', text: JSON.stringify({ reports: rows, count: rows.length }, null, 2) }] };
+    }
+  );
+
+  // 25. propose_memory_candidates — raw_events -> reviewed candidate proposals only
   mcp.tool(
     'propose_memory_candidates',
     'Propose memory candidates from raw_events. Does not write memories. dry_run=true returns proposals without saving candidates.',
@@ -1859,7 +2627,7 @@ app.get('/health', (_req, res) => res.json({ status: 'ok' }));
 app.get('/api/memories', auth, (req, res) => {
   cleanExpired();
   const { category, keyword, limit = 50 } = req.query;
-  let sql = 'SELECT * FROM memories WHERE (expires_at IS NULL OR expires_at > ?)';
+  let sql = `SELECT * FROM memories WHERE (expires_at IS NULL OR expires_at > ?) AND ${currentMemorySql()}`;
   const p = [new Date().toISOString()];
   if (category && category !== 'all') { sql += ' AND category = ?'; p.push(category); }
   if (keyword) { sql += ' AND content LIKE ?'; p.push(`%${keyword}%`); }
@@ -1875,6 +2643,8 @@ app.post('/api/memories', auth, async (req, res) => {
   const dupe = db.prepare('SELECT * FROM memories WHERE content_hash = ? AND (expires_at IS NULL OR expires_at > ?)').get(hash, new Date().toISOString());
   if (dupe) return res.json({ id: dupe.id, duplicate: true, message: 'Duplicate content, skipped' });
   const id = uuidv4(), now = new Date().toISOString();
+  const status = 'current';
+  const activeFact = factActiveValue(fact_key, status, null);
   const expires_at = pinned ? null : expiryFor(category);
   const protectedFlag = resolveProtectedFlag(category, protectedArg, 0);
   const evidenceIds = JSON.stringify(evidence_raw_ids);
@@ -1883,11 +2653,18 @@ app.post('/api/memories', auth, async (req, res) => {
 
   let oldFactRows = [];
   if (fact_key) {
-    oldFactRows = db.prepare('SELECT * FROM memories WHERE fact_key = ? AND id != ? AND superseded_by IS NULL').all(fact_key, id);
+    oldFactRows = db.prepare(`SELECT * FROM memories WHERE fact_key = ? AND id != ? AND ${currentMemorySql()}`).all(fact_key, id);
     const blocked = oldFactRows.filter(rowIsProtected);
     if (blocked.length) {
+      const audit_id = createZAudit({
+        fact_key,
+        current_id: id,
+        protected_ids: blocked.map(m => m.id),
+        reason: 'REST write refused to auto-supersede protected current fact',
+      });
       return res.status(409).json({
         error: 'protected_fact_conflict',
+        audit_id,
         fact_key,
         protected_ids: blocked.map(m => m.id),
         message: 'Refusing to auto-supersede protected memories.',
@@ -1895,20 +2672,23 @@ app.post('/api/memories', auth, async (req, res) => {
     }
   }
 
-  db.prepare('INSERT INTO memories (id,content,category,tags,source,mood,created_at,updated_at,expires_at,embedding,pinned,content_hash,fact_key,protected,evidence_raw_ids) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)')
+  db.prepare('INSERT INTO memories (id,content,category,tags,source,mood,created_at,updated_at,expires_at,embedding,pinned,content_hash,fact_key,protected,evidence_raw_ids,status,active_fact) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)')
     .run(id, content, category, JSON.stringify(tags), source, mood, now, now, expires_at,
-      embedding ? JSON.stringify(embedding) : null, pinned ? 1 : 0, hash, fact_key, protectedFlag, evidenceIds);
+      embedding ? JSON.stringify(embedding) : null, pinned ? 1 : 0, hash, fact_key, protectedFlag, evidenceIds, status, activeFact);
   // Z-axis: auto-supersede old versions
   let superseded = [];
   if (fact_key) {
-    const superStmt = db.prepare('UPDATE memories SET superseded_by = ?, updated_at = ? WHERE id = ?');
+    const superStmt = db.prepare("UPDATE memories SET superseded_by = ?, status = 'historical', active_fact = 0, updated_at = ? WHERE id = ? AND protected = 0");
     for (const o of oldFactRows) { superStmt.run(id, now, o.id); superseded.push(o.id); }
   }
   if (related.length) {
-    const edgeStmt = db.prepare('INSERT OR IGNORE INTO memory_edges (source_id, target_id, weight, created_at) VALUES (?, ?, ?, ?)');
+    const edgeStmt = db.prepare(
+      'INSERT OR IGNORE INTO memory_edges (source_id,target_id,weight,created_at,relation_type,strength,status,reason,updated_at) VALUES (?,?,?,?,?,?,?,?,?)'
+    );
     for (const r of related) {
-      edgeStmt.run(id, r.id, r.similarity ?? 0.5, now);
-      edgeStmt.run(r.id, id, r.similarity ?? 0.5, now);
+      const weight = r.similarity ?? 0.5;
+      edgeStmt.run(id, r.id, weight, now, 'semantic', weight, 'safe', 'auto semantic association', now);
+      edgeStmt.run(r.id, id, weight, now, 'semantic', weight, 'safe', 'auto semantic association', now);
     }
   }
   res.json({ id, message: 'Memory saved', fact_key, superseded_ids: superseded, related_memories: related, edges_created: related.length * 2 });
@@ -1929,7 +2709,9 @@ app.put('/api/memories/:id', auth, (req, res) => {
     expires_at = newPinned ? null : expiryFor(newCategory);
   }
   const newFactKey = fact_key !== undefined ? fact_key : row.fact_key;
-  db.prepare('UPDATE memories SET content=?,category=?,tags=?,source=?,mood=?,pinned=?,updated_at=?,expires_at=?,content_hash=?,fact_key=?,protected=?,evidence_raw_ids=? WHERE id=?').run(
+  const newStatus = row.status || 'current';
+  const newActiveFact = factActiveValue(newFactKey, newStatus, row.superseded_by);
+  db.prepare('UPDATE memories SET content=?,category=?,tags=?,source=?,mood=?,pinned=?,updated_at=?,expires_at=?,content_hash=?,fact_key=?,protected=?,evidence_raw_ids=?,active_fact=? WHERE id=?').run(
     content ?? row.content,
     newCategory,
     tags !== undefined ? JSON.stringify(tags) : row.tags,
@@ -1942,6 +2724,7 @@ app.put('/api/memories/:id', auth, (req, res) => {
     newFactKey ?? null,
     newProtected,
     newEvidenceIds,
+    newActiveFact,
     req.params.id
   );
   res.json({ message: 'Updated' });
@@ -1971,11 +2754,11 @@ app.get('/api/facts', auth, (req, res) => {
     const rows = db.prepare(
       'SELECT * FROM memories WHERE fact_key = ? AND (expires_at IS NULL OR expires_at > ?) ORDER BY created_at DESC'
     ).all(fact_key, now).map(fmt);
-    const current = rows.filter(r => !r.superseded_by);
+    const current = rows.filter(r => r.status === 'current' && !r.superseded_by);
     return res.json({ fact_key, total_versions: rows.length, current_count: current.length, conflict: current.length > 1, current, superseded: rows.filter(r => r.superseded_by) });
   }
   const groups = db.prepare(
-    "SELECT fact_key, COUNT(*) as total, SUM(CASE WHEN superseded_by IS NULL THEN 1 ELSE 0 END) as current_count FROM memories WHERE fact_key IS NOT NULL AND (expires_at IS NULL OR expires_at > ?) GROUP BY fact_key ORDER BY fact_key"
+    "SELECT fact_key, COUNT(*) as total, SUM(CASE WHEN COALESCE(status, 'current') = 'current' AND superseded_by IS NULL THEN 1 ELSE 0 END) as current_count FROM memories WHERE fact_key IS NOT NULL AND (expires_at IS NULL OR expires_at > ?) GROUP BY fact_key ORDER BY fact_key"
   ).all(now);
   res.json({ total_fact_keys: groups.length, conflicts: groups.filter(g => g.current_count > 1).length, fact_keys: groups });
 });
@@ -2009,7 +2792,7 @@ app.post('/api/search/find_related', auth, async (req, res) => {
       return res.json({ results: [], count: 0, note: 'Embedding unavailable (set VOYAGE_API_KEY)' });
     }
 
-    let sql = 'SELECT * FROM memories WHERE embedding IS NOT NULL AND (expires_at IS NULL OR expires_at > ?)';
+    let sql = `SELECT * FROM memories WHERE embedding IS NOT NULL AND (expires_at IS NULL OR expires_at > ?) AND ${currentMemorySql()}`;
     const p = [new Date().toISOString()];
     if (category) { sql += ' AND category = ?'; p.push(category); }
     const rows = db.prepare(sql).all(...p);
@@ -2040,7 +2823,7 @@ app.post('/api/search/hybrid', auth, async (req, res) => {
     const now = new Date().toISOString();
 
     // keyword half
-    let kSql = 'SELECT * FROM memories WHERE content LIKE ? AND (expires_at IS NULL OR expires_at > ?)';
+    let kSql = `SELECT * FROM memories WHERE content LIKE ? AND (expires_at IS NULL OR expires_at > ?) AND ${currentMemorySql()}`;
     const kp = [`%${query}%`, now];
     if (category) { kSql += ' AND category = ?'; kp.push(category); }
     kSql += ' ORDER BY created_at DESC LIMIT 50';
@@ -2050,7 +2833,7 @@ app.post('/api/search/hybrid', auth, async (req, res) => {
     let semanticRows = [];
     const embedding = await getEmbedding(query);
     if (embedding) {
-      let sSql = 'SELECT * FROM memories WHERE embedding IS NOT NULL AND (expires_at IS NULL OR expires_at > ?)';
+      let sSql = `SELECT * FROM memories WHERE embedding IS NOT NULL AND (expires_at IS NULL OR expires_at > ?) AND ${currentMemorySql()}`;
       const sp = [now];
       if (category) { sSql += ' AND category = ?'; sp.push(category); }
       semanticRows = db.prepare(sSql).all(...sp)
@@ -2100,6 +2883,12 @@ const EDGES_BACKUP_PATH = 'backups/memory_edges.jsonl';
 const RAW_EVENTS_BACKUP_PATH = 'backups/raw_events.jsonl';
 const MEMORY_CANDIDATES_BACKUP_PATH = 'backups/memory_candidates.jsonl';
 const SOMATIC_HOOKS_BACKUP_PATH = 'backups/somatic_hooks.jsonl';
+const EVENT_CHUNKS_BACKUP_PATH = 'backups/event_chunks.jsonl';
+const CHUNK_EVENTS_BACKUP_PATH = 'backups/chunk_events.jsonl';
+const CONSOLIDATION_RUNS_BACKUP_PATH = 'backups/consolidation_runs.jsonl';
+const Z_AUDITS_BACKUP_PATH = 'backups/z_conflict_audits.jsonl';
+const E_AXIS_BACKUP_PATH = 'backups/e_axis_scores.jsonl';
+const PATROL_REPORTS_BACKUP_PATH = 'backups/memory_patrol_reports.jsonl';
 const BACKUP_TOKEN = process.env.BACKUP_GITHUB_TOKEN;
 const BACKUP_INCLUDE_INTIMATE = ['1', 'true', 'yes', 'on'].includes(String(process.env.BACKUP_INCLUDE_INTIMATE || '').toLowerCase());
 
@@ -2115,6 +2904,18 @@ async function ghRequest(method, path, body) {
     body: body ? JSON.stringify(body) : undefined,
   });
   return res;
+}
+
+async function backupJsonl(path, rows, label) {
+  const contentB64 = Buffer.from(rows.map(r => JSON.stringify(r)).join('\n')).toString('base64');
+  let sha = null;
+  const existing = await ghRequest('GET', path);
+  if (existing.ok) sha = (await existing.json()).sha;
+  await ghRequest('PUT', path, {
+    message: `backup: ${new Date().toISOString().slice(0, 10)} (${rows.length} ${label}) [zeabur skip]`,
+    content: contentB64,
+    ...(sha ? { sha } : {}),
+  });
 }
 
 async function runBackup() {
@@ -2185,7 +2986,15 @@ async function runBackup() {
       ...(hookSha ? { sha: hookSha } : {}),
     });
 
-    console.log(`[backup] ${rows.length} memories, ${edgeRows.length} edges, ${rawRows.length} raw events (${BACKUP_INCLUDE_INTIMATE ? 'including' : 'excluding'} intimate), ${candidateRows.length} memory candidates, and ${hookRows.length} somatic hooks backed up to GitHub`);
+    const chunkRows = db.prepare('SELECT * FROM event_chunks ORDER BY created_at DESC').all().map(fmtEventChunk);
+    await backupJsonl(EVENT_CHUNKS_BACKUP_PATH, chunkRows, 'event chunks');
+    await backupJsonl(CHUNK_EVENTS_BACKUP_PATH, db.prepare('SELECT * FROM chunk_events ORDER BY chunk_id, position').all(), 'chunk events');
+    await backupJsonl(CONSOLIDATION_RUNS_BACKUP_PATH, db.prepare('SELECT * FROM consolidation_runs ORDER BY created_at DESC').all(), 'consolidation runs');
+    await backupJsonl(Z_AUDITS_BACKUP_PATH, db.prepare('SELECT * FROM z_conflict_audits ORDER BY created_at DESC').all().map(fmtZAudit), 'z audits');
+    await backupJsonl(E_AXIS_BACKUP_PATH, db.prepare('SELECT * FROM e_axis_scores ORDER BY created_at DESC').all().map(fmtEAxisScore), 'e-axis scores');
+    await backupJsonl(PATROL_REPORTS_BACKUP_PATH, db.prepare('SELECT * FROM memory_patrol_reports ORDER BY created_at DESC').all(), 'patrol reports');
+
+    console.log(`[backup] ${rows.length} memories, ${edgeRows.length} edges, ${rawRows.length} raw events (${BACKUP_INCLUDE_INTIMATE ? 'including' : 'excluding'} intimate), ${candidateRows.length} memory candidates, ${hookRows.length} somatic hooks, and ${chunkRows.length} event chunks backed up to GitHub`);
   } catch (e) {
     console.error('[backup] failed:', e.message);
   }
@@ -2263,12 +3072,14 @@ async function restoreMemoryCandidatesIfEmpty() {
     const content = Buffer.from(data.content.replace(/\n/g, ''), 'base64').toString('utf-8');
     const lines = content.split('\n').filter(l => l.trim());
     const stmt = db.prepare(
-      'INSERT OR IGNORE INTO memory_candidates (id,raw_event_ids,dedupe_key,source,channel,speaker,summary,suggested_category,reason,confidence,status,created_at,updated_at,reviewed_at,review_note,expires_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)'
+      'INSERT OR IGNORE INTO memory_candidates (id,raw_event_ids,dedupe_key,source,channel,speaker,summary,suggested_category,reason,confidence,status,created_at,updated_at,reviewed_at,review_note,expires_at,source_chunk_ids,candidate_type,importance,suggested_tags,evidence_preview) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)'
     );
     let restored = 0;
     for (const line of lines) {
       const c = JSON.parse(line);
       const rawIds = Array.isArray(c.raw_event_ids) ? c.raw_event_ids : parseArrayField(c.raw_event_ids);
+      const chunkIds = Array.isArray(c.source_chunk_ids) ? c.source_chunk_ids : parseArrayField(c.source_chunk_ids);
+      const tags = Array.isArray(c.suggested_tags) ? c.suggested_tags : parseArrayField(c.suggested_tags);
       const now = new Date().toISOString();
       const status = VALID_CANDIDATE_STATUS.has(c.status) ? c.status : 'pending';
       stmt.run(
@@ -2287,7 +3098,12 @@ async function restoreMemoryCandidatesIfEmpty() {
         c.updated_at || c.created_at || now,
         c.reviewed_at || null,
         c.review_note || null,
-        c.expires_at || candidateExpiresAt(now, 7)
+        c.expires_at || candidateExpiresAt(now, 7),
+        JSON.stringify(chunkIds),
+        c.candidate_type || '',
+        Number(c.importance || 0),
+        JSON.stringify(tags),
+        c.evidence_preview || ''
       );
       restored++;
     }
@@ -2297,11 +3113,124 @@ async function restoreMemoryCandidatesIfEmpty() {
   }
 }
 
+async function readBackupJsonl(path) {
+  const r = await ghRequest('GET', path);
+  if (!r.ok) return [];
+  const data = await r.json();
+  const content = Buffer.from(data.content.replace(/\n/g, ''), 'base64').toString('utf-8');
+  return content.split('\n').filter(l => l.trim()).map(line => JSON.parse(line));
+}
+
+async function restoreLmcTablesIfEmpty() {
+  if (!BACKUP_TOKEN) return;
+  try {
+    const chunkCount = db.prepare('SELECT COUNT(*) as c FROM event_chunks').get().c;
+    if (chunkCount === 0) {
+      const chunkStmt = db.prepare(
+        'INSERT OR IGNORE INTO event_chunks (id,dedupe_key,source,channel,session_id,start_event_id,end_event_id,start_time,end_time,event_count,summary,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)'
+      );
+      const linkStmt = db.prepare(
+        'INSERT OR IGNORE INTO chunk_events (chunk_id,raw_event_id,position) VALUES (?,?,?)'
+      );
+      let chunks = 0;
+      for (const c of await readBackupJsonl(EVENT_CHUNKS_BACKUP_PATH)) {
+        chunkStmt.run(c.id, c.dedupe_key, c.source || '', c.channel || '', c.session_id || '', c.start_event_id || '', c.end_event_id || '', c.start_time || '', c.end_time || '', Number(c.event_count || 0), c.summary || '', c.status || 'open', c.created_at || new Date().toISOString(), c.updated_at || c.created_at || new Date().toISOString());
+        chunks++;
+      }
+      for (const ce of await readBackupJsonl(CHUNK_EVENTS_BACKUP_PATH)) {
+        linkStmt.run(ce.chunk_id, ce.raw_event_id, Number(ce.position || 0));
+      }
+      if (chunks) console.log(`[backup] auto-restored ${chunks} event chunks from GitHub`);
+    } else {
+      console.log(`[backup] DB has ${chunkCount} event chunks — skipping chunk restore`);
+    }
+
+    const runCount = db.prepare('SELECT COUNT(*) as c FROM consolidation_runs').get().c;
+    if (runCount === 0) {
+      const stmt = db.prepare(
+        'INSERT OR IGNORE INTO consolidation_runs (id,source,channel,since_time,until_time,dry_run,raw_count,chunk_count,candidate_count,error,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)'
+      );
+      let restored = 0;
+      for (const r of await readBackupJsonl(CONSOLIDATION_RUNS_BACKUP_PATH)) {
+        stmt.run(
+          r.id,
+          r.source || '',
+          r.channel || '',
+          r.since_time || r.started_at || null,
+          r.until_time || r.ended_at || null,
+          r.dry_run ? 1 : 0,
+          Number(r.raw_count ?? r.raw_event_count ?? 0),
+          Number(r.chunk_count || 0),
+          Number(r.candidate_count || 0),
+          r.error || r.note || null,
+          r.created_at || new Date().toISOString()
+        );
+        restored++;
+      }
+      if (restored) console.log(`[backup] auto-restored ${restored} consolidation runs from GitHub`);
+    }
+
+    const auditCount = db.prepare('SELECT COUNT(*) as c FROM z_conflict_audits').get().c;
+    if (auditCount === 0) {
+      const stmt = db.prepare(
+        'INSERT OR IGNORE INTO z_conflict_audits (id,fact_key,stale_id,current_id,protected_ids,reason,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?)'
+      );
+      let restored = 0;
+      for (const a of await readBackupJsonl(Z_AUDITS_BACKUP_PATH)) {
+        const protectedIds = Array.isArray(a.protected_ids) ? a.protected_ids : parseArrayField(a.protected_ids);
+        stmt.run(a.id, a.fact_key || '', a.stale_id || null, a.current_id || null, JSON.stringify(protectedIds), a.reason || '', a.status || 'pending', a.created_at || new Date().toISOString(), a.updated_at || a.created_at || new Date().toISOString());
+        restored++;
+      }
+      if (restored) console.log(`[backup] auto-restored ${restored} z audits from GitHub`);
+    }
+
+    const eCount = db.prepare('SELECT COUNT(*) as c FROM e_axis_scores').get().c;
+    if (eCount === 0) {
+      const stmt = db.prepare(
+        'INSERT OR IGNORE INTO e_axis_scores (memory_id,valence,arousal,tension,confidence,risk_level,urgency,scorer_version,shadow,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)'
+      );
+      let restored = 0;
+      for (const e of await readBackupJsonl(E_AXIS_BACKUP_PATH)) {
+        stmt.run(
+          e.memory_id || e.id,
+          e.valence === null || e.valence === undefined ? null : validateEAxisNumber(e.valence, -1, 1, 'valence'),
+          e.arousal === null || e.arousal === undefined ? null : validateEAxisNumber(e.arousal, 0, 1, 'arousal'),
+          e.tension === null || e.tension === undefined ? null : validateEAxisNumber(e.tension, 0, 1, 'tension'),
+          e.confidence === null || e.confidence === undefined ? null : validateEAxisNumber(e.confidence, 0, 1, 'confidence'),
+          e.risk_level === null || e.risk_level === undefined ? null : validateEAxisNumber(e.risk_level, 0, 1, 'risk_level'),
+          e.urgency === null || e.urgency === undefined ? null : validateEAxisNumber(e.urgency, 0, 1, 'urgency'),
+          e.scorer_version || 'rules-v1',
+          e.shadow === false ? 0 : 1,
+          e.updated_at || new Date().toISOString()
+        );
+        restored++;
+      }
+      if (restored) console.log(`[backup] auto-restored ${restored} e-axis scores from GitHub`);
+    }
+
+    const reportCount = db.prepare('SELECT COUNT(*) as c FROM memory_patrol_reports').get().c;
+    if (reportCount === 0) {
+      const stmt = db.prepare(
+        'INSERT OR IGNORE INTO memory_patrol_reports (id,status,summary,payload,created_at) VALUES (?,?,?,?,?)'
+      );
+      let restored = 0;
+      for (const p of await readBackupJsonl(PATROL_REPORTS_BACKUP_PATH)) {
+        stmt.run(p.id, p.status || 'ok', p.summary || '', typeof p.payload === 'string' ? p.payload : JSON.stringify(p.payload || p.details || {}), p.created_at || new Date().toISOString());
+        restored++;
+      }
+      if (restored) console.log(`[backup] auto-restored ${restored} patrol reports from GitHub`);
+    }
+  } catch (e) {
+    console.error('[backup] LMC table restore failed:', e.message);
+  }
+}
+
 async function autoRestore() {
   if (!BACKUP_TOKEN) return;
   await restoreSomaticHooksIfEmpty();
   await restoreRawEventsIfEmpty();
   await restoreMemoryCandidatesIfEmpty();
+  await restoreLmcTablesIfEmpty();
   // Disaster recovery only: restore when the DB is EMPTY. Restoring into a
   // populated DB would resurrect deliberately deleted/expired memories.
   const count = db.prepare('SELECT COUNT(*) as c FROM memories').get().c;
@@ -2320,8 +3249,10 @@ async function autoRestore() {
       const m = JSON.parse(line);
       const exists = db.prepare('SELECT id FROM memories WHERE id = ?').get(m.id);
       if (!exists) {
-        db.prepare('INSERT INTO memories (id,content,category,tags,source,mood,created_at,updated_at,expires_at,pinned,content_hash,activation_score,fact_key,superseded_by,protected,evidence_raw_ids) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)')
-          .run(m.id, m.content, m.category, JSON.stringify(m.tags || []), m.source || '', m.mood, m.created_at, m.updated_at, m.expires_at || null, m.pinned ? 1 : 0, m.content_hash || contentHash(m.content, m.category), Number(m.activation_score || 0), m.fact_key || null, m.superseded_by || null, resolveProtectedFlag(m.category, m.protected, 0), JSON.stringify(m.evidence_raw_ids || []));
+        const status = ['current', 'historical', 'archived', 'deleted'].includes(m.status) ? m.status : (m.superseded_by ? 'historical' : 'current');
+        const activeFact = m.fact_key && status === 'current' && !m.superseded_by ? 1 : 0;
+        db.prepare('INSERT INTO memories (id,content,category,tags,source,mood,created_at,updated_at,expires_at,pinned,content_hash,activation_score,fact_key,superseded_by,protected,evidence_raw_ids,status,active_fact) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)')
+          .run(m.id, m.content, m.category, JSON.stringify(m.tags || []), m.source || '', m.mood, m.created_at, m.updated_at, m.expires_at || null, m.pinned ? 1 : 0, m.content_hash || contentHash(m.content, m.category), Number(m.activation_score || 0), m.fact_key || null, m.superseded_by || null, resolveProtectedFlag(m.category, m.protected, 0), JSON.stringify(m.evidence_raw_ids || []), status, Number(m.active_fact ?? activeFact));
         restored++;
       }
     }
@@ -2331,10 +3262,12 @@ async function autoRestore() {
       const edgeData = await er.json();
       const edgeContent = Buffer.from(edgeData.content.replace(/\n/g, ''), 'base64').toString('utf-8');
       const edgeLines = edgeContent.split('\n').filter(l => l.trim());
-      const edgeStmt = db.prepare('INSERT OR IGNORE INTO memory_edges (source_id,target_id,weight,created_at) VALUES (?,?,?,?)');
+      const edgeStmt = db.prepare('INSERT OR IGNORE INTO memory_edges (source_id,target_id,weight,created_at,relation_type,strength,status,reason,updated_at) VALUES (?,?,?,?,?,?,?,?,?)');
       for (const line of edgeLines) {
         const e = JSON.parse(line);
-        edgeStmt.run(e.source_id, e.target_id, Number(e.weight || 0), e.created_at);
+        const relationType = normalizeRelationType(e.relation_type || 'semantic');
+        const edgeStatus = ['safe', 'review', 'blocked'].includes(e.status) ? e.status : (relationIsSafe(relationType) ? 'safe' : 'review');
+        edgeStmt.run(e.source_id, e.target_id, Number(e.weight || e.strength || 0), e.created_at, relationType, Number(e.strength ?? e.weight ?? 0), edgeStatus, e.reason || '', e.updated_at || e.created_at || null);
         restoredEdges++;
       }
     }

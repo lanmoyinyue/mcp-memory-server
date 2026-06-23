@@ -5,7 +5,8 @@
   "type": "module",
   "scripts": {
     "start": "node server.js",
-    "dev": "node --watch server.js"
+    "dev": "node --watch server.js",
+    "test:lmc5": "node server/test_lmc5.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.11.0",
