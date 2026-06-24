@@ -111,13 +111,20 @@ try {
     category: 'work',
     tags: ['测试'],
   });
+  const riskMemory = await callTool(client, 'write_memory', {
+    content: '测试 E 轴：这里涉及 token、鉴权、越权和红线，必须谨慎。',
+    category: 'work',
+    tags: ['测试'],
+  });
   const fakeScore = await callTool(client, 'score_e_axis_shadow', { memory_id: fakeHeart.saved.id });
   const realScore = await callTool(client, 'score_e_axis_shadow', { memory_id: realHeart.saved.id });
+  const riskScore = await callTool(client, 'score_e_axis_shadow', { memory_id: riskMemory.saved.id });
   assert.ok(fakeScore.scores[0].valence < 0, JSON.stringify(fakeScore, null, 2));
   assert.equal(fakeScore.scores[0].urgency, 0.2, JSON.stringify(fakeScore, null, 2));
   assert.ok(realScore.scores[0].valence > 0, JSON.stringify(realScore, null, 2));
   assert.equal(realScore.scores[0].urgency, 0.75, JSON.stringify(realScore, null, 2));
   assert.equal(realScore.scores[0].scorer_version, 'rules-v2');
+  assert.ok(riskScore.scores[0].risk_level > 0.6, JSON.stringify(riskScore, null, 2));
 
   const currentRead = await callTool(client, 'read_memories', { keyword: '项目状态', limit: 10 });
   assert.equal(currentRead.length, 1);
@@ -232,7 +239,10 @@ try {
   assert.ok(eAxis.scores.every(s => s.valence >= -1 && s.valence <= 1));
 
   const patrol = await callTool(client, 'run_memory_patrol', { save_report: true });
-  assert.ok(patrol.summary.includes('mem='));
+  assert.ok(patrol.summary.includes('近24小时新增'), JSON.stringify(patrol, null, 2));
+  assert.equal(typeof patrol.daily_summary.text, 'string');
+  assert.ok(patrol.daily_summary.e_axis_alerts.some(alert => alert.memory_id === riskMemory.saved.id), JSON.stringify(patrol, null, 2));
+  assert.ok(Number.isInteger(patrol.daily_summary.edge_health.orphan_count), JSON.stringify(patrol, null, 2));
   const reports = await callTool(client, 'list_memory_patrol_reports', { limit: 5 });
   assert.ok(reports.count >= 1);
 

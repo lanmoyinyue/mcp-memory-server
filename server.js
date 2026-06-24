@@ -504,6 +504,25 @@ function inspectMemoryEdges(limit = 50) {
     if (issues.length >= limit) return;
     issues.push({ type, severity, source_id, target_id, description });
   };
+  const countRow = (sql, ...params) => Number(db.prepare(sql).get(...params).c || 0);
+  const orphan_count = countRow(`
+    SELECT COUNT(*) AS c
+    FROM memory_edges e
+    LEFT JOIN memories s ON s.id = e.source_id
+    LEFT JOIN memories t ON t.id = e.target_id
+    WHERE s.id IS NULL OR t.id IS NULL
+  `);
+  const self_loop_count = countRow('SELECT COUNT(*) AS c FROM memory_edges WHERE source_id = target_id');
+  const non_live_endpoint_count = countRow(`
+    SELECT COUNT(*) AS c
+    FROM memory_edges e
+    JOIN memories s ON s.id = e.source_id
+    JOIN memories t ON t.id = e.target_id
+    WHERE s.superseded_by IS NOT NULL
+       OR t.superseded_by IS NOT NULL
+       OR (s.expires_at IS NOT NULL AND s.expires_at <= ?)
+       OR (t.expires_at IS NOT NULL AND t.expires_at <= ?)
+  `, now, now);
 
   const orphanRows = db.prepare(`
     SELECT e.source_id, e.target_id
@@ -553,12 +572,91 @@ function inspectMemoryEdges(limit = 50) {
   }
 
   const total_edges = db.prepare('SELECT COUNT(*) as c FROM memory_edges').get().c;
+  const issue_count = orphan_count + self_loop_count + non_live_endpoint_count;
   return {
     total_edges,
-    issue_count: issues.length,
+    issue_count,
+    orphan_count,
+    self_loop_count,
+    non_live_endpoint_count,
+    bad_edge_count: self_loop_count + non_live_endpoint_count,
     checked_at: now,
     issues,
     note: '只读巡逻报告：不删除、不归档、不修改 memory_edges。',
+  };
+}
+
+function countTableWhere(table, where = '1=1', params = []) {
+  return Number(db.prepare(`SELECT COUNT(*) AS c FROM ${table} WHERE ${where}`).get(...params).c || 0);
+}
+
+function candidateStatusCounts() {
+  const rows = db.prepare('SELECT status, COUNT(*) AS c FROM memory_candidates GROUP BY status').all();
+  const counts = { pending: 0, accepted: 0, rejected: 0, stale: 0, merged: 0 };
+  for (const row of rows) counts[row.status || 'pending'] = Number(row.c || 0);
+  return counts;
+}
+
+function highRiskEAxisAlerts(threshold = 0.6, limit = 10) {
+  return db.prepare(`
+    SELECT e.*, m.category, m.content
+    FROM e_axis_scores e
+    JOIN memories m ON m.id = e.memory_id
+    WHERE e.risk_level > ?
+      AND (m.expires_at IS NULL OR m.expires_at > ?)
+      AND ${currentMemorySql('m')}
+    ORDER BY e.risk_level DESC, e.urgency DESC, e.updated_at DESC
+    LIMIT ?
+  `).all(Number(threshold), new Date().toISOString(), Math.max(1, Math.min(50, Number(limit) || 10)))
+    .map(row => ({
+      memory_id: row.memory_id,
+      category: row.category,
+      risk_level: Number(row.risk_level || 0),
+      urgency: Number(row.urgency || 0),
+      tension: Number(row.tension || 0),
+      confidence: Number(row.confidence || 0),
+      scorer_version: row.scorer_version || 'rules-v1',
+      updated_at: row.updated_at,
+      preview: truncateText(row.content || '', 120),
+    }));
+}
+
+function buildPatrolDailySummary({ now, sinceHours, edge, conflicts, eAxisRiskThreshold }) {
+  const since = new Date(Date.now() - Number(sinceHours) * 60 * 60 * 1000).toISOString();
+  const latestPatrol = db.prepare('SELECT id, status, created_at FROM memory_patrol_reports ORDER BY created_at DESC LIMIT 1').get() || null;
+  const candidate_counts = candidateStatusCounts();
+  const recent = {
+    since,
+    since_hours: Number(sinceHours),
+    raw_events: countTableWhere('raw_events', 'timestamp >= ?', [since]),
+    event_chunks: countTableWhere('event_chunks', 'created_at >= ?', [since]),
+    memory_candidates: countTableWhere('memory_candidates', 'created_at >= ?', [since]),
+  };
+  const e_axis_alerts = highRiskEAxisAlerts(eAxisRiskThreshold, 10);
+  const lines = [
+    `近${recent.since_hours}小时新增：raw ${recent.raw_events} 条 / chunk ${recent.event_chunks} 段 / 候选 ${recent.memory_candidates} 个`,
+    `候选状态：pending ${candidate_counts.pending} / accepted ${candidate_counts.accepted} / rejected ${candidate_counts.rejected} / stale ${candidate_counts.stale}`,
+    `E轴警报：${e_axis_alerts.length} 条高风险记忆（risk > ${eAxisRiskThreshold}）`,
+    `关系边健康：孤儿边 ${edge.orphan_count} / 坏边 ${edge.bad_edge_count}`,
+    `事实冲突：pending 审计 ${conflicts.pending_z_audits} 个，当前 fact_key 冲突 ${conflicts.current_fact_conflicts.length} 个`,
+    `最近巡逻：${latestPatrol ? `${latestPatrol.created_at}（${latestPatrol.status}）` : '暂无历史巡逻记录'}`,
+  ];
+  return {
+    checked_at: now,
+    recent,
+    candidate_counts,
+    e_axis_alerts,
+    edge_health: {
+      total_edges: edge.total_edges,
+      orphan_count: edge.orphan_count,
+      bad_edge_count: edge.bad_edge_count,
+      self_loop_count: edge.self_loop_count,
+      non_live_endpoint_count: edge.non_live_endpoint_count,
+      sample_issues: edge.issues.slice(0, 10),
+    },
+    fact_conflicts: conflicts,
+    latest_patrol: latestPatrol,
+    text: lines.join('\n'),
   };
 }
 
@@ -2185,33 +2283,47 @@ function createMcpServer() {
     'Read-only LMC patrol: reports candidates, chunks, edge health, fact conflicts, and E-axis shadow coverage. Does not repair data.',
     {
       save_report: z.boolean().default(true),
+      since_hours: z.number().min(1).max(720).default(24).describe('Daily summary window. Default is recent 24 hours.'),
       edge_issue_limit: z.number().int().min(1).max(200).default(50),
+      e_axis_risk_threshold: z.number().min(0).max(1).default(0.6).describe('Report E-axis alerts above this risk level.'),
     },
-    async ({ save_report = true, edge_issue_limit = 50 }) => {
+    async ({ save_report = true, since_hours = 24, edge_issue_limit = 50, e_axis_risk_threshold = 0.6 }) => {
       const now = new Date().toISOString();
       const edge = inspectMemoryEdges(edge_issue_limit);
       const factGroups = db.prepare("SELECT fact_key, SUM(CASE WHEN COALESCE(status, 'current') = 'current' AND superseded_by IS NULL THEN 1 ELSE 0 END) as current_count FROM memories WHERE fact_key IS NOT NULL GROUP BY fact_key").all();
-      const conflicts = factGroups.filter(g => g.current_count > 1);
+      const currentFactConflicts = factGroups.filter(g => g.current_count > 1);
+      const conflicts = {
+        pending_z_audits: db.prepare("SELECT COUNT(*) as c FROM z_conflict_audits WHERE status='pending'").get().c,
+        current_fact_conflicts: currentFactConflicts,
+      };
+      const dailySummary = buildPatrolDailySummary({
+        now,
+        sinceHours: since_hours,
+        edge,
+        conflicts,
+        eAxisRiskThreshold: e_axis_risk_threshold,
+      });
       const payload = {
         checked_at: now,
         memories: db.prepare('SELECT COUNT(*) as c FROM memories').get().c,
         raw_events: db.prepare('SELECT COUNT(*) as c FROM raw_events').get().c,
         event_chunks: db.prepare('SELECT COUNT(*) as c FROM event_chunks').get().c,
         pending_candidates: db.prepare("SELECT COUNT(*) as c FROM memory_candidates WHERE status='pending'").get().c,
-        pending_z_audits: db.prepare("SELECT COUNT(*) as c FROM z_conflict_audits WHERE status='pending'").get().c,
+        pending_z_audits: conflicts.pending_z_audits,
         e_axis_scored: db.prepare('SELECT COUNT(*) as c FROM e_axis_scores').get().c,
         edge_health: edge,
-        fact_conflicts: conflicts,
+        fact_conflicts: currentFactConflicts,
+        daily_summary: dailySummary,
       };
-      const status = edge.issue_count || conflicts.length ? 'needs_review' : 'ok';
-      const summary = `mem=${payload.memories}, raw=${payload.raw_events}, chunks=${payload.event_chunks}, pending_candidates=${payload.pending_candidates}, edge_issues=${edge.issue_count}, fact_conflicts=${conflicts.length}`;
+      const status = edge.issue_count || currentFactConflicts.length || dailySummary.e_axis_alerts.length || conflicts.pending_z_audits ? 'needs_review' : 'ok';
+      const summary = dailySummary.text;
       let reportId = null;
       if (save_report) {
         reportId = uuidv4();
         db.prepare('INSERT INTO memory_patrol_reports (id,status,summary,payload,created_at) VALUES (?,?,?,?,?)')
           .run(reportId, status, summary, JSON.stringify(payload), now);
       }
-      return { content: [{ type: 'text', text: JSON.stringify({ report_id: reportId, status, summary, payload, note: 'Patrol is read-only.' }, null, 2) }] };
+      return { content: [{ type: 'text', text: JSON.stringify({ report_id: reportId, status, summary, daily_summary: dailySummary, payload, note: 'Patrol is read-only.' }, null, 2) }] };
     }
   );
 
