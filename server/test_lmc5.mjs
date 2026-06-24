@@ -3,6 +3,7 @@ import { spawn } from 'node:child_process';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { DatabaseSync as Database } from 'node:sqlite';
 import { fileURLToPath } from 'node:url';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
@@ -100,6 +101,24 @@ try {
   });
   assert.deepEqual(factV2.superseded_ids, [factV1.saved.id]);
 
+  const fakeHeart = await callTool(client, 'write_memory', {
+    content: '测试 E 轴：假装心动，没成功，也不紧急。',
+    category: 'work',
+    tags: ['测试'],
+  });
+  const realHeart = await callTool(client, 'write_memory', {
+    content: '测试 E 轴：真的心动，项目成功，现在很紧急。',
+    category: 'work',
+    tags: ['测试'],
+  });
+  const fakeScore = await callTool(client, 'score_e_axis_shadow', { memory_id: fakeHeart.saved.id });
+  const realScore = await callTool(client, 'score_e_axis_shadow', { memory_id: realHeart.saved.id });
+  assert.ok(fakeScore.scores[0].valence < 0, JSON.stringify(fakeScore, null, 2));
+  assert.equal(fakeScore.scores[0].urgency, 0.2, JSON.stringify(fakeScore, null, 2));
+  assert.ok(realScore.scores[0].valence > 0, JSON.stringify(realScore, null, 2));
+  assert.equal(realScore.scores[0].urgency, 0.75, JSON.stringify(realScore, null, 2));
+  assert.equal(realScore.scores[0].scorer_version, 'rules-v2');
+
   const currentRead = await callTool(client, 'read_memories', { keyword: '项目状态', limit: 10 });
   assert.equal(currentRead.length, 1);
   assert.equal(currentRead[0].id, factV2.saved.id);
@@ -146,6 +165,49 @@ try {
   const candidates = await callTool(client, 'propose_chunk_candidates', { dry_run: false, limit: 10 });
   assert.ok(candidates.proposed_count >= 1, JSON.stringify(candidates, null, 2));
   assert.ok(candidates.candidates.every(c => c.source_chunk_ids.length >= 1), JSON.stringify(candidates, null, 2));
+
+  const gapOne = await callTool(client, 'log_raw_event', {
+    session_id: 'lmc-gap-test',
+    source: 'kechat-light',
+    channel: 'normal',
+    role: 'user',
+    speaker: 'moon',
+    content: '静默间隔测试第一条。',
+  });
+  const gapTwo = await callTool(client, 'log_raw_event', {
+    session_id: 'lmc-gap-test',
+    source: 'kechat-light',
+    channel: 'normal',
+    role: 'assistant',
+    speaker: 'ke',
+    content: '静默间隔测试第二条，应该和第一条同片段。',
+  });
+  const gapThree = await callTool(client, 'log_raw_event', {
+    session_id: 'lmc-gap-test',
+    source: 'kechat-light',
+    channel: 'normal',
+    role: 'user',
+    speaker: 'moon',
+    content: '静默间隔测试第三条，应该被切到新片段。',
+  });
+  const testDb = new Database(path.join(dataDir, 'memories.db'));
+  const updateTs = testDb.prepare('UPDATE raw_events SET timestamp = ? WHERE id = ?');
+  const baseTime = Date.now();
+  updateTs.run(new Date(baseTime - 120 * 60 * 1000).toISOString(), gapOne.id);
+  updateTs.run(new Date(baseTime - 100 * 60 * 1000).toISOString(), gapTwo.id);
+  updateTs.run(new Date(baseTime - 20 * 60 * 1000).toISOString(), gapThree.id);
+  testDb.close();
+  const gapChunks = await callTool(client, 'consolidate_raw_events', {
+    dry_run: false,
+    since_hours: 24,
+    source: 'kechat-light',
+    channel: 'normal',
+    max_events_per_chunk: 5,
+    silence_gap_minutes: 30,
+  });
+  const gapDrafts = gapChunks.chunks.filter(c => c.session_id === 'lmc-gap-test');
+  assert.equal(gapDrafts.length, 2, JSON.stringify(gapChunks, null, 2));
+  assert.deepEqual(gapDrafts.map(c => c.event_count), [2, 1]);
 
   const rel = await callTool(client, 'upsert_memory_relation', {
     source_id: factV2.saved.id,

@@ -11,6 +11,31 @@ import fs from 'fs';
 import crypto from 'crypto';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const DEFAULT_E_AXIS_RULES = {
+  version: 'rules-v2',
+  negation_window_chars: 3,
+  negators: ['假装', '不', '没', '没有', '别'],
+  valence_positive: ['开心', '喜欢', '爱', '稳', '完成', '成功', '亲', '抱', '心动', '温柔'],
+  valence_negative: ['生气', '难过', '失败', '掉线', '错误', 'bug', '冲突', '风险'],
+  arousal_high: ['紧急', '立刻', '马上', '亲密', '欲望', '触觉', '心动', '生气', '崩', '炸'],
+  tension_high: ['冲突', '错误', '失败', '掉线', '风险', '越权', '不许', '不能', '红线'],
+  risk_high: ['删除', '覆盖', '重置', '隐私', 'token', '鉴权', '越权', '红线'],
+  urgency_high: ['现在', '立刻', '马上', '紧急', '挂了', '掉了', '炸了'],
+};
+
+function loadEAxisRules() {
+  const configPath = process.env.E_AXIS_RULES_FILE || path.join(__dirname, 'config', 'e_axis_rules.json');
+  try {
+    if (!fs.existsSync(configPath)) return DEFAULT_E_AXIS_RULES;
+    const parsed = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+    return { ...DEFAULT_E_AXIS_RULES, ...parsed };
+  } catch (err) {
+    console.error('[e-axis] failed to load rules:', err.message);
+    return DEFAULT_E_AXIS_RULES;
+  }
+}
+
+const E_AXIS_RULES = loadEAxisRules();
 
 // ── Database ──────────────────────────────────────────────────────────────────
 
@@ -687,8 +712,9 @@ function loadUnchunkedRawEvents({ since_hours = 24, source = 'all', channel = 'a
   return db.prepare(sql).all(...params);
 }
 
-function buildEventChunkDrafts(rawRows, windowSize = 30) {
+function buildEventChunkDrafts(rawRows, windowSize = 30, silenceGapMinutes = 30) {
   const maxSize = Math.max(5, Math.min(100, Number(windowSize) || 30));
+  const gapMs = Math.max(1, Math.min(24 * 60, Number(silenceGapMinutes) || 30)) * 60 * 1000;
   const groups = new Map();
   for (const row of rawRows) {
     const key = [row.source || '', row.channel || '', row.session_id || ''].join('\0');
@@ -698,9 +724,11 @@ function buildEventChunkDrafts(rawRows, windowSize = 30) {
   const drafts = [];
   for (const rows of groups.values()) {
     rows.sort((a, b) => String(a.timestamp).localeCompare(String(b.timestamp)));
-    for (let i = 0; i < rows.length; i += maxSize) {
-      const events = rows.slice(i, i + maxSize);
-      if (!events.length) continue;
+    let current = [];
+    const flush = () => {
+      const events = current;
+      current = [];
+      if (!events.length) return;
       const rawIds = events.map(e => e.id);
       drafts.push({
         id: uuidv4(),
@@ -718,7 +746,19 @@ function buildEventChunkDrafts(rawRows, windowSize = 30) {
         events,
         raw_event_ids: rawIds,
       });
+    };
+    for (const row of rows) {
+      const previous = current[current.length - 1];
+      const previousTime = previous ? Date.parse(previous.timestamp) : NaN;
+      const currentTime = Date.parse(row.timestamp);
+      const hasSilenceGap = previous
+        && Number.isFinite(previousTime)
+        && Number.isFinite(currentTime)
+        && currentTime - previousTime > gapMs;
+      if (current.length >= maxSize || hasSilenceGap) flush();
+      current.push(row);
     }
+    flush();
   }
   return drafts;
 }
@@ -788,6 +828,49 @@ function validateEAxisNumber(value, min, max, name) {
   return n;
 }
 
+function bounded(value, min, max) {
+  return Math.max(min, Math.min(max, value));
+}
+
+function roundAxis(value) {
+  return Number(value.toFixed(3));
+}
+
+function eAxisTerms(name) {
+  const terms = E_AXIS_RULES[name];
+  if (!Array.isArray(terms)) return [];
+  return terms.map(term => String(term || '').trim()).filter(Boolean);
+}
+
+function eAxisNegators() {
+  return eAxisTerms('negators').sort((a, b) => b.length - a.length);
+}
+
+function isEAxisNegated(text, index) {
+  const windowChars = Math.max(1, Math.min(12, Number(E_AXIS_RULES.negation_window_chars) || 3));
+  const before = String(text || '').slice(Math.max(0, index - windowChars), index);
+  return eAxisNegators().some(term => before.includes(term));
+}
+
+function findEAxisHits(text, terms) {
+  const source = String(text || '');
+  const hits = [];
+  for (const term of terms) {
+    let start = 0;
+    while (start < source.length) {
+      const index = source.indexOf(term, start);
+      if (index === -1) break;
+      hits.push({ term, index, negated: isEAxisNegated(source, index) });
+      start = index + Math.max(1, term.length);
+    }
+  }
+  return hits.sort((a, b) => a.index - b.index);
+}
+
+function hasUnnegatedHit(hits) {
+  return hits.some(hit => !hit.negated);
+}
+
 function graphExpand(seedIds, { hops = 2, limit = 12, minStrength = 0.35 } = {}) {
   const now = new Date().toISOString();
   const seen = new Set(seedIds);
@@ -830,12 +913,36 @@ function graphExpand(seedIds, { hops = 2, limit = 12, minStrength = 0.35 } = {})
 
 function eAxisScoreForMemory(mem) {
   const text = `${mem.content || ''} ${parseTags(mem.tags).join(' ')}`;
-  const valence = /开心|喜欢|爱|稳|完成|成功|亲|抱|心动|温柔/.test(text) ? 0.45 : (/生气|难过|失败|掉线|错误|bug|冲突|风险/.test(text) ? -0.35 : 0);
-  const arousal = /紧急|立刻|马上|亲密|欲望|触觉|心动|生气|崩|炸/.test(text) ? 0.7 : 0.25;
-  const tension = /冲突|错误|失败|掉线|风险|越权|不许|不能|红线/.test(text) ? 0.75 : 0.2;
-  const risk_level = /删除|覆盖|重置|隐私|token|鉴权|越权|红线/.test(text) ? 0.7 : 0.15;
-  const urgency = /现在|立刻|马上|紧急|挂了|掉了|炸了/.test(text) ? 0.75 : 0.2;
-  return { valence, arousal, tension, confidence: 0.55, risk_level, urgency };
+  const positiveHits = findEAxisHits(text, eAxisTerms('valence_positive'));
+  const negativeHits = findEAxisHits(text, eAxisTerms('valence_negative'));
+  const arousalHits = findEAxisHits(text, eAxisTerms('arousal_high'));
+  const tensionHits = findEAxisHits(text, eAxisTerms('tension_high'));
+  const riskHits = findEAxisHits(text, eAxisTerms('risk_high'));
+  const urgencyHits = findEAxisHits(text, eAxisTerms('urgency_high'));
+
+  const positiveScore =
+    positiveHits.filter(hit => !hit.negated).length * 0.45 +
+    negativeHits.filter(hit => hit.negated).length * 0.25;
+  const negativeScore =
+    negativeHits.filter(hit => !hit.negated).length * 0.35 +
+    positiveHits.filter(hit => hit.negated).length * 0.25;
+  const evidenceCount = [
+    ...positiveHits,
+    ...negativeHits,
+    ...arousalHits,
+    ...tensionHits,
+    ...riskHits,
+    ...urgencyHits,
+  ].length;
+
+  return {
+    valence: roundAxis(bounded(positiveScore - negativeScore, -1, 1)),
+    arousal: hasUnnegatedHit(arousalHits) ? 0.7 : 0.25,
+    tension: hasUnnegatedHit(tensionHits) ? 0.75 : 0.2,
+    confidence: roundAxis(bounded(0.45 + evidenceCount * 0.08, 0.45, 0.9)),
+    risk_level: hasUnnegatedHit(riskHits) ? 0.7 : 0.15,
+    urgency: hasUnnegatedHit(urgencyHits) ? 0.75 : 0.2,
+  };
 }
 
 const cleanExpired = () => {
@@ -1747,13 +1854,16 @@ function createMcpServer() {
       source: z.string().default('all'),
       channel: z.enum(['cc', 'daily', 'intimate', 'private', 'group', 'normal', 'all']).default('all'),
       window_size: z.number().int().min(5).max(100).default(30),
+      max_events_per_chunk: z.number().int().min(5).max(100).optional().describe('Alias for window_size.'),
+      silence_gap_minutes: z.number().min(1).max(1440).default(30).describe('Start a new chunk when adjacent raw_events are separated by this many minutes.'),
       limit: z.number().int().min(1).max(1000).default(500),
       dry_run: z.boolean().default(true),
     },
-    async ({ since_hours = 24, source = 'all', channel = 'all', window_size = 30, limit = 500, dry_run = true }) => {
+    async ({ since_hours = 24, source = 'all', channel = 'all', window_size = 30, max_events_per_chunk, silence_gap_minutes = 30, limit = 500, dry_run = true }) => {
       const now = new Date().toISOString();
       const rawRows = loadUnchunkedRawEvents({ since_hours, source, channel, limit });
-      const drafts = buildEventChunkDrafts(rawRows, window_size);
+      const chunkSize = max_events_per_chunk ?? window_size;
+      const drafts = buildEventChunkDrafts(rawRows, chunkSize, silence_gap_minutes);
       let inserted = 0;
       let runId = null;
       if (!dry_run) {
@@ -1967,7 +2077,8 @@ function createMcpServer() {
       const rows = memory_id
         ? db.prepare('SELECT * FROM memories WHERE id = ?').all(memory_id)
         : db.prepare(`SELECT * FROM memories WHERE (expires_at IS NULL OR expires_at > ?) AND ${currentMemorySql()} ORDER BY created_at DESC LIMIT ?`).all(now, limit);
-      const scores = rows.map(mem => ({ memory_id: mem.id, ...eAxisScoreForMemory(mem), scorer_version: 'rules-v1', shadow: true, updated_at: now }));
+      const scorerVersion = E_AXIS_RULES.version || 'rules-v2';
+      const scores = rows.map(mem => ({ memory_id: mem.id, ...eAxisScoreForMemory(mem), scorer_version: scorerVersion, shadow: true, updated_at: now }));
       if (!dry_run) {
         const stmt = db.prepare(`
           INSERT INTO e_axis_scores (memory_id,valence,arousal,tension,confidence,risk_level,urgency,scorer_version,shadow,updated_at)
