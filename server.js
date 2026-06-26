@@ -586,6 +586,52 @@ function inspectMemoryEdges(limit = 50) {
   };
 }
 
+function cleanupMemoryEdges({ dryRun = true, limit = 50 } = {}) {
+  const before = inspectMemoryEdges(limit);
+  if (dryRun) {
+    return {
+      dry_run: true,
+      planned_delete_count: before.issue_count,
+      before,
+      after: before,
+      deleted_count: 0,
+      note: 'Dry run only. Pass dry_run=false to delete bad memory_edges; memories are never modified.',
+    };
+  }
+
+  const now = new Date().toISOString();
+  const deleteBadEdges = db.transaction(() => {
+    const result = db.prepare(`
+      DELETE FROM memory_edges
+      WHERE source_id = target_id
+         OR source_id NOT IN (SELECT id FROM memories)
+         OR target_id NOT IN (SELECT id FROM memories)
+         OR EXISTS (
+              SELECT 1 FROM memories s
+              WHERE s.id = memory_edges.source_id
+                AND (s.superseded_by IS NOT NULL OR (s.expires_at IS NOT NULL AND s.expires_at <= ?))
+            )
+         OR EXISTS (
+              SELECT 1 FROM memories t
+              WHERE t.id = memory_edges.target_id
+                AND (t.superseded_by IS NOT NULL OR (t.expires_at IS NOT NULL AND t.expires_at <= ?))
+            )
+    `).run(now, now);
+    return result.changes || 0;
+  });
+
+  const deleted = deleteBadEdges();
+  const after = inspectMemoryEdges(limit);
+  return {
+    dry_run: false,
+    planned_delete_count: before.issue_count,
+    deleted_count: deleted,
+    before,
+    after,
+    note: 'Deleted only bad memory_edges. No memories, raw_events, candidates, or scores were modified.',
+  };
+}
+
 function countTableWhere(table, where = '1=1', params = []) {
   return Number(db.prepare(`SELECT COUNT(*) AS c FROM ${table} WHERE ${where}`).get(...params).c || 0);
 }
@@ -1524,6 +1570,20 @@ function createMcpServer() {
         recent_memories: recent,
       };
       if (include_edge_health) payload.edge_health = inspectMemoryEdges(edge_issue_limit);
+      return { content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }] };
+    }
+  );
+
+  // 7. cleanup_memory_edges
+  mcp.tool(
+    'cleanup_memory_edges',
+    'Clean bad memory_edges only: orphan edges, self-loops, and edges pointing to superseded/expired memories. Does not modify memories.',
+    {
+      dry_run: z.boolean().default(true).describe('true previews planned cleanup; false deletes only bad memory_edges'),
+      limit: z.number().int().min(1).max(200).default(50).describe('Max issue samples to return before/after cleanup'),
+    },
+    async ({ dry_run = true, limit = 50 }) => {
+      const payload = cleanupMemoryEdges({ dryRun: dry_run, limit });
       return { content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }] };
     }
   );
