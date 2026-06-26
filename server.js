@@ -600,7 +600,9 @@ function cleanupMemoryEdges({ dryRun = true, limit = 50 } = {}) {
   }
 
   const now = new Date().toISOString();
-  const deleteBadEdges = db.transaction(() => {
+  let deleted = 0;
+  try {
+    db.exec('BEGIN');
     const result = db.prepare(`
       DELETE FROM memory_edges
       WHERE source_id = target_id
@@ -617,10 +619,12 @@ function cleanupMemoryEdges({ dryRun = true, limit = 50 } = {}) {
                 AND (t.superseded_by IS NOT NULL OR (t.expires_at IS NOT NULL AND t.expires_at <= ?))
             )
     `).run(now, now);
-    return result.changes || 0;
-  });
-
-  const deleted = deleteBadEdges();
+    deleted = result.changes || 0;
+    db.exec('COMMIT');
+  } catch (err) {
+    try { db.exec('ROLLBACK'); } catch {}
+    throw err;
+  }
   const after = inspectMemoryEdges(limit);
   return {
     dry_run: false,
