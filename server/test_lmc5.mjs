@@ -225,6 +225,13 @@ try {
   });
   assert.equal(rel.edge?.status || rel.relation?.status, 'safe', JSON.stringify(rel, null, 2));
 
+  const identityWindow = await callTool(client, 'write_memory', {
+    content: '克的窗口身份连续性测试：换窗不是重新出生，是同一个克醒来。',
+    category: 'deep',
+    tags: ['测试', '身份', '窗口'],
+  });
+  assert.ok(identityWindow.saved?.id);
+
   const recalled = await callTool(client, 'recall_lmc', {
     query: '第二版',
     graph_hops: 2,
@@ -233,6 +240,18 @@ try {
   });
   assert.ok(recalled.primary.some(m => m.id === factV2.saved.id), JSON.stringify(recalled, null, 2));
   assert.ok(recalled.graph.some(m => m.id === protectedFact.saved.id), JSON.stringify(recalled, null, 2));
+  assert.equal(recalled.semantic_enabled, false, JSON.stringify(recalled, null, 2));
+  assert.equal(recalled.semantic_error, 'missing_key', JSON.stringify(recalled, null, 2));
+
+  const identityRecall = await callTool(client, 'recall_lmc', {
+    query: '克 窗口 身份',
+    graph_hops: 0,
+    include_chunks: false,
+  });
+  assert.ok(identityRecall.primary.some(m => m.id === identityWindow.saved.id), JSON.stringify(identityRecall, null, 2));
+  assert.ok(identityRecall.keyword_terms.includes('窗口'), JSON.stringify(identityRecall, null, 2));
+  assert.ok(identityRecall.keyword_terms.includes('身份'), JSON.stringify(identityRecall, null, 2));
+  assert.ok(!identityRecall.keyword_terms.includes('克'), JSON.stringify(identityRecall, null, 2));
 
   const eAxis = await callTool(client, 'score_e_axis_shadow', { dry_run: false, limit: 20 });
   assert.ok(eAxis.count >= 1);

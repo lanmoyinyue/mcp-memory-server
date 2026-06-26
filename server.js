@@ -472,6 +472,48 @@ function exactTermMatches(content, term) {
   return haystack.includes(needle);
 }
 
+function queryTerms(query) {
+  const text = String(query || '').trim();
+  if (!text) return [];
+  const exactTerms = extractExactTerms(text);
+  const terms = exactTerms.length === 1 && exactTerms[0] === text
+    ? text.split(/\s+/)
+    : exactTerms;
+  return [...new Set(terms.map(t => t.trim()).filter(Boolean))].slice(0, 8);
+}
+
+function charLength(text) {
+  return Array.from(String(text || '')).length;
+}
+
+function memoryKeywordSearch({ query, now = new Date().toISOString(), limit = 20, category = '' }) {
+  let terms = queryTerms(query);
+  if (terms.length > 1) {
+    terms = terms.filter(term => charLength(term) > 1 || /^[A-Za-z0-9_-]{2,}$/.test(term));
+  }
+  if (!terms.length) terms = [String(query || '').trim()].filter(Boolean);
+  if (!terms.length) return { rows: [], terms };
+
+  const params = [];
+  const clauses = terms.map(term => {
+    if (charLength(term) <= 2) {
+      params.push(term);
+      return 'INSTR(content, ?) > 0';
+    }
+    params.push(`%${term}%`);
+    return 'content LIKE ?';
+  });
+  let sql = `SELECT * FROM memories WHERE (${clauses.join(' OR ')}) AND (expires_at IS NULL OR expires_at > ?) AND ${currentMemorySql()}`;
+  params.push(now);
+  if (category) { sql += ' AND category = ?'; params.push(category); }
+  sql += ' ORDER BY pinned DESC, created_at DESC LIMIT ?';
+  params.push(Math.max(limit * 3, limit));
+
+  let rows = db.prepare(sql).all(...params);
+  rows = rows.filter(row => terms.some(term => charLength(term) <= 2 ? exactTermMatches(row.content, term) : String(row.content || '').includes(term)));
+  return { rows: rows.slice(0, limit), terms };
+}
+
 function rawEventSearch({ query, mode = 'fuzzy', channel = 'all', source = '', speaker = '', limit = 20 }) {
   const params = [];
   const where = [];
@@ -1273,19 +1315,63 @@ function somaticPromptText(items) {
 // ── Embedding & vector similarity ─────────────────────────────────────────────
 // Set VOYAGE_API_KEY env var to enable. Free at voyageai.com (200M tokens/month)
 
-async function getEmbedding(text) {
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function classifyEmbeddingStatus(status) {
+  if (status === 401 || status === 403) return 'api_key_invalid';
+  if (status === 429) return 'api_429';
+  if (status >= 500) return 'api_5xx';
+  return 'api_error';
+}
+
+async function getEmbeddingDetailed(text, { maxAttempts = 2, retryDelayMs = 100, timeoutMs = 8000 } = {}) {
   const apiKey = process.env.VOYAGE_API_KEY;
-  if (!apiKey) return null;
-  try {
-    const res = await fetch('https://api.voyageai.com/v1/embeddings', {
-      method: 'POST',
-      headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ input: [text], model: 'voyage-3-lite' }),
-    });
-    if (!res.ok) { console.error('[embed] API error', res.status, await res.text()); return null; }
-    const data = await res.json();
-    return data.data[0].embedding; // float[]
-  } catch (err) { console.error('[embed] error:', err.message); return null; }
+  if (!apiKey) return { embedding: null, error: 'missing_key', attempts: 0 };
+
+  let last = { embedding: null, error: 'unknown', attempts: 0 };
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const res = await fetch('https://api.voyageai.com/v1/embeddings', {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ input: [text], model: 'voyage-3-lite' }),
+        signal: controller.signal,
+      });
+      clearTimeout(timer);
+      if (!res.ok) {
+        const error = classifyEmbeddingStatus(res.status);
+        let body = '';
+        try { body = await res.text(); } catch {}
+        console.error('[embed] API error', res.status, error, body.slice(0, 300));
+        last = { embedding: null, error, status: res.status, attempts: attempt };
+        if (!['api_429', 'api_5xx'].includes(error) || attempt >= maxAttempts) return last;
+      } else {
+        const data = await res.json();
+        const embedding = data?.data?.[0]?.embedding;
+        if (Array.isArray(embedding)) return { embedding, error: null, attempts: attempt };
+        last = { embedding: null, error: 'bad_response', attempts: attempt };
+        console.error('[embed] bad response payload');
+        if (attempt >= maxAttempts) return last;
+      }
+    } catch (err) {
+      clearTimeout(timer);
+      const error = err?.name === 'AbortError' ? 'timeout' : 'network_error';
+      console.error('[embed] error:', error, err?.message || err);
+      last = { embedding: null, error, attempts: attempt };
+      if (attempt >= maxAttempts) return last;
+    }
+    await sleep(retryDelayMs);
+  }
+  return last;
+}
+
+async function getEmbedding(text) {
+  const result = await getEmbeddingDetailed(text);
+  return result.embedding;
 }
 
 function cosineSim(a, b) {
@@ -2283,10 +2369,11 @@ function createMcpServer() {
     async ({ query, limit = 8, fallback_to_raw = false, include_chunks = true, graph_hops = 2 }) => {
       cleanExpired();
       const now = new Date().toISOString();
-      let kSql = `SELECT * FROM memories WHERE content LIKE ? AND (expires_at IS NULL OR expires_at > ?) AND ${currentMemorySql()} ORDER BY pinned DESC, created_at DESC LIMIT ?`;
-      const keywordRows = db.prepare(kSql).all(`%${query}%`, now, Math.max(limit * 4, 20));
+      const keywordSearch = memoryKeywordSearch({ query, now, limit: Math.max(limit * 4, 20) });
+      const keywordRows = keywordSearch.rows;
       let semanticRows = [];
-      const embedding = await getEmbedding(query);
+      const embeddingResult = await getEmbeddingDetailed(query);
+      const embedding = embeddingResult.embedding;
       if (embedding) {
         semanticRows = db.prepare(`SELECT * FROM memories WHERE embedding IS NOT NULL AND (expires_at IS NULL OR expires_at > ?) AND ${currentMemorySql()}`).all(now)
           .map(r => { try { return { ...r, score: cosineSim(embedding, JSON.parse(r.embedding)) }; } catch { return null; } })
@@ -2334,6 +2421,9 @@ function createMcpServer() {
             chunks,
             injection_text,
             semantic_enabled: !!embedding,
+            semantic_error: embedding ? null : embeddingResult.error,
+            semantic_attempts: embeddingResult.attempts,
+            keyword_terms: keywordSearch.terms,
             note: 'Z-axis filters current memories by default; E-axis is still shadow-only.',
           }, null, 2),
         }],
