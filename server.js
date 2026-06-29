@@ -919,6 +919,7 @@ function buildEventChunkDrafts(rawRows, windowSize = 30, silenceGapMinutes = 30)
       const events = current;
       current = [];
       if (!events.length) return;
+      if (isTrivialSingletonChunk(events)) return;
       const rawIds = events.map(e => e.id);
       drafts.push({
         id: uuidv4(),
@@ -951,6 +952,14 @@ function buildEventChunkDrafts(rawRows, windowSize = 30, silenceGapMinutes = 30)
     flush();
   }
   return drafts;
+}
+
+function isTrivialSingletonChunk(events) {
+  if (!Array.isArray(events) || events.length !== 1) return false;
+  const text = String(events[0].content || '').trim();
+  if (!text) return true;
+  if (/记住|别忘|必须|只能|不要|不许|边界|权限|部署|上线|重启|同步|架构|记忆库|mcp|vps|zeabur|github|commit|bug|测试|审核/i.test(text)) return false;
+  return charLength(text) < 12;
 }
 
 function insertEventChunkDrafts(drafts, now = new Date().toISOString()) {

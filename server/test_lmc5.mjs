@@ -216,6 +216,24 @@ try {
   assert.equal(gapDrafts.length, 2, JSON.stringify(gapChunks, null, 2));
   assert.deepEqual(gapDrafts.map(c => c.event_count), [2, 1]);
 
+  await callTool(client, 'log_raw_event', {
+    session_id: 'lmc-trivial-singleton',
+    source: 'kechat-light',
+    channel: 'normal',
+    role: 'user',
+    speaker: 'moon',
+    content: '克',
+  });
+  const trivialChunks = await callTool(client, 'consolidate_raw_events', {
+    dry_run: true,
+    since_hours: 24,
+    source: 'kechat-light',
+    channel: 'normal',
+    max_events_per_chunk: 5,
+    silence_gap_minutes: 30,
+  });
+  assert.ok(!trivialChunks.chunks.some(c => c.session_id === 'lmc-trivial-singleton'), JSON.stringify(trivialChunks, null, 2));
+
   const rel = await callTool(client, 'upsert_memory_relation', {
     source_id: factV2.saved.id,
     target_id: protectedFact.saved.id,
