@@ -200,6 +200,32 @@ try {
   const duplicateChunkCandidates = await callTool(client, 'propose_chunk_candidates', { dry_run: true, status: 'open', limit: 50 });
   assert.ok(!duplicateChunkCandidates.candidates.some(c => c.raw_event_ids.includes(rawCandidateEvent.id)), JSON.stringify(duplicateChunkCandidates, null, 2));
 
+  const privateRaw = await callTool(client, 'log_raw_event', {
+    session_id: 'lmc-private-raw-default-skip',
+    source: 'privacy-skip-test',
+    channel: 'private',
+    role: 'user',
+    speaker: 'moon',
+    content: '这条私密 raw 默认不应该逐条生成候选。',
+  });
+  const privateDefault = await callTool(client, 'propose_memory_candidates', {
+    dry_run: true,
+    since_hours: 24,
+    source: 'privacy-skip-test',
+    channel: 'private',
+    limit: 10,
+  });
+  assert.equal(privateDefault.proposed_count, 0, JSON.stringify(privateDefault, null, 2));
+  const privateExplicit = await callTool(client, 'propose_memory_candidates', {
+    dry_run: true,
+    since_hours: 24,
+    source: 'privacy-skip-test',
+    channel: 'private',
+    include_private_raw: true,
+    limit: 10,
+  });
+  assert.ok(privateExplicit.candidates.some(c => c.raw_event_ids.includes(privateRaw.id)), JSON.stringify(privateExplicit, null, 2));
+
   const starvedOld = await callTool(client, 'log_raw_event', {
     session_id: 'lmc-candidate-starvation',
     source: 'starvation-test',

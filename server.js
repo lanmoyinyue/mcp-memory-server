@@ -2514,9 +2514,10 @@ function createMcpServer() {
       source: z.string().default('all').describe('Filter source, e.g. kechat-light/telegram/all'),
       channel: z.enum(['cc', 'daily', 'intimate', 'private', 'group', 'normal', 'all']).default('all').describe('Filter channel, or all'),
       limit: z.number().int().min(1).max(50).default(20),
+      include_private_raw: z.boolean().default(false).describe('false skips private/intimate raw_events; use chunk candidates for private review by default'),
       dry_run: z.boolean().default(true).describe('true returns proposals only; false writes memory_candidates'),
     },
-    async ({ since_hours = 24, source = 'all', channel = 'all', limit = 20, dry_run = true }) => {
+    async ({ since_hours = 24, source = 'all', channel = 'all', limit = 20, include_private_raw = false, dry_run = true }) => {
       const now = new Date().toISOString();
       markStaleCandidates(now);
       const since = new Date(Date.now() - Number(since_hours) * 60 * 60 * 1000).toISOString();
@@ -2524,6 +2525,7 @@ function createMcpServer() {
       const params = [since];
       if (source && source !== 'all') { sql += ' AND source = ?'; params.push(source); }
       if (channel !== 'all') { sql += ' AND channel = ?'; params.push(channel); }
+      if (!include_private_raw) sql += " AND channel NOT IN ('private', 'intimate')";
       sql += ' ORDER BY timestamp DESC LIMIT ?';
       params.push(Math.min(1000, Math.max(limit * 20, 500)));
 
