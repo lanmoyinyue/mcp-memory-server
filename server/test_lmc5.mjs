@@ -200,6 +200,62 @@ try {
   const duplicateChunkCandidates = await callTool(client, 'propose_chunk_candidates', { dry_run: true, status: 'open', limit: 50 });
   assert.ok(!duplicateChunkCandidates.candidates.some(c => c.raw_event_ids.includes(rawCandidateEvent.id)), JSON.stringify(duplicateChunkCandidates, null, 2));
 
+  const starvedOld = await callTool(client, 'log_raw_event', {
+    session_id: 'lmc-candidate-starvation',
+    source: 'starvation-test',
+    channel: 'normal',
+    role: 'user',
+    speaker: 'moon',
+    content: '请记住候选扫描饥饿测试：这条旧一点的 raw 事件不能被新候选挡住。',
+  });
+  const starvedNew = [];
+  for (let i = 0; i < 5; i++) {
+    starvedNew.push(await callTool(client, 'log_raw_event', {
+      session_id: 'lmc-candidate-starvation',
+      source: 'starvation-test',
+      channel: 'normal',
+      role: 'user',
+      speaker: 'moon',
+      content: `请记住候选扫描饥饿测试：这条较新的 raw 事件 ${i} 已经有候选。`,
+    }));
+  }
+  const starvationDb = new Database(path.join(dataDir, 'memories.db'));
+  const setRawTs = starvationDb.prepare('UPDATE raw_events SET timestamp = ? WHERE id = ?');
+  const starvationBase = Date.now();
+  setRawTs.run(new Date(starvationBase - 60 * 60 * 1000).toISOString(), starvedOld.id);
+  starvedNew.forEach((event, index) => {
+    setRawTs.run(new Date(starvationBase - (5 - index) * 60 * 1000).toISOString(), event.id);
+  });
+  const fakeCandidate = starvationDb.prepare(
+    'INSERT INTO memory_candidates (id,raw_event_ids,dedupe_key,source,channel,speaker,summary,suggested_category,reason,confidence,status,created_at,updated_at,expires_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)'
+  );
+  const fakeNow = new Date().toISOString();
+  starvedNew.forEach((event, index) => fakeCandidate.run(
+    `fake-starvation-${index}`,
+    JSON.stringify([event.id]),
+    `fake-starvation-${index}`,
+    'starvation-test',
+    'normal',
+    'moon',
+    `fake candidate ${index}`,
+    'preference_candidate',
+    'already covered',
+    0.9,
+    'pending',
+    fakeNow,
+    fakeNow,
+    null
+  ));
+  starvationDb.close();
+  const starvationCandidates = await callTool(client, 'propose_memory_candidates', {
+    dry_run: true,
+    since_hours: 24,
+    source: 'starvation-test',
+    channel: 'normal',
+    limit: 1,
+  });
+  assert.ok(starvationCandidates.candidates.some(c => c.raw_event_ids.includes(starvedOld.id)), JSON.stringify(starvationCandidates, null, 2));
+
   const gapOne = await callTool(client, 'log_raw_event', {
     session_id: 'lmc-gap-test',
     source: 'kechat-light',

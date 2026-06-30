@@ -2525,7 +2525,7 @@ function createMcpServer() {
       if (source && source !== 'all') { sql += ' AND source = ?'; params.push(source); }
       if (channel !== 'all') { sql += ' AND channel = ?'; params.push(channel); }
       sql += ' ORDER BY timestamp DESC LIMIT ?';
-      params.push(Math.max(limit * 5, limit));
+      params.push(Math.min(1000, Math.max(limit * 20, 500)));
 
       const rows = db.prepare(sql).all(...params);
       const proposals = [];
