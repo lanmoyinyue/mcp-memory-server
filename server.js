@@ -2201,6 +2201,7 @@ function createMcpServer() {
         const classification = classifyChunk(chunk, events);
         if (!classification) continue;
         const rawIds = events.map(e => e.id);
+        if (candidateHasExistingRawEvents(rawIds)) continue;
         const dedupeKey = crypto.createHash('sha256').update(`chunk:${chunk.id}:${classification.type}`).digest('hex');
         const existing = db.prepare('SELECT id FROM memory_candidates WHERE dedupe_key = ? LIMIT 1').get(dedupeKey);
         if (existing) continue;

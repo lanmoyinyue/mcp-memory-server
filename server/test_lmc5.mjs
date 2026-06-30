@@ -173,6 +173,33 @@ try {
   assert.ok(candidates.proposed_count >= 1, JSON.stringify(candidates, null, 2));
   assert.ok(candidates.candidates.every(c => c.source_chunk_ids.length >= 1), JSON.stringify(candidates, null, 2));
 
+  const rawCandidateEvent = await callTool(client, 'log_raw_event', {
+    session_id: 'lmc-candidate-duplicate-guard',
+    source: 'kechat-light',
+    channel: 'normal',
+    role: 'user',
+    speaker: 'moon',
+    content: '请记住候选重复护栏测试：这个 raw 事件已经生成候选，不要再从 chunk 重复生成。',
+  });
+  const rawCandidates = await callTool(client, 'propose_memory_candidates', {
+    dry_run: false,
+    since_hours: 24,
+    source: 'kechat-light',
+    channel: 'normal',
+    limit: 10,
+  });
+  assert.ok(rawCandidates.candidates.some(c => c.raw_event_ids.includes(rawCandidateEvent.id)), JSON.stringify(rawCandidates, null, 2));
+  await callTool(client, 'consolidate_raw_events', {
+    dry_run: false,
+    since_hours: 24,
+    source: 'kechat-light',
+    channel: 'normal',
+    max_events_per_chunk: 5,
+    silence_gap_minutes: 30,
+  });
+  const duplicateChunkCandidates = await callTool(client, 'propose_chunk_candidates', { dry_run: true, status: 'open', limit: 50 });
+  assert.ok(!duplicateChunkCandidates.candidates.some(c => c.raw_event_ids.includes(rawCandidateEvent.id)), JSON.stringify(duplicateChunkCandidates, null, 2));
+
   const gapOne = await callTool(client, 'log_raw_event', {
     session_id: 'lmc-gap-test',
     source: 'kechat-light',
