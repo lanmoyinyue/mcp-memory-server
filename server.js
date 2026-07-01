@@ -266,6 +266,7 @@ try { db.exec('CREATE INDEX IF NOT EXISTS idx_memories_status ON memories(status
 // Migrate: protected memories and curated-memory evidence links
 try { db.exec('ALTER TABLE memories ADD COLUMN protected INTEGER NOT NULL DEFAULT 0'); } catch {}
 try { db.exec("ALTER TABLE memories ADD COLUMN evidence_raw_ids TEXT NOT NULL DEFAULT '[]'"); } catch {}
+try { db.exec("ALTER TABLE memories ADD COLUMN evidence_chunk_ids TEXT NOT NULL DEFAULT '[]'"); } catch {}
 try { db.exec('CREATE INDEX IF NOT EXISTS idx_memories_protected ON memories(protected)'); } catch {}
 try { db.exec("ALTER TABLE memory_edges ADD COLUMN relation_type TEXT NOT NULL DEFAULT 'semantic'"); } catch {}
 try { db.exec('ALTER TABLE memory_edges ADD COLUMN strength REAL NOT NULL DEFAULT 1.0'); } catch {}
@@ -285,6 +286,10 @@ try { db.exec("ALTER TABLE memory_candidates ADD COLUMN candidate_type TEXT NOT 
 try { db.exec('ALTER TABLE memory_candidates ADD COLUMN importance REAL NOT NULL DEFAULT 0'); } catch {}
 try { db.exec("ALTER TABLE memory_candidates ADD COLUMN suggested_tags TEXT NOT NULL DEFAULT '[]'"); } catch {}
 try { db.exec("ALTER TABLE memory_candidates ADD COLUMN evidence_preview TEXT NOT NULL DEFAULT ''"); } catch {}
+try { db.exec("ALTER TABLE memory_candidates ADD COLUMN promoted_memory_id TEXT"); } catch {}
+try { db.exec("ALTER TABLE memory_candidates ADD COLUMN promoted_at TEXT"); } catch {}
+try { db.exec("ALTER TABLE memory_candidates ADD COLUMN promotion_note TEXT NOT NULL DEFAULT ''"); } catch {}
+try { db.exec("ALTER TABLE memory_candidates ADD COLUMN relation_hints TEXT NOT NULL DEFAULT '[]'"); } catch {}
 try { db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_candidate_dedupe ON memory_candidates(dedupe_key)'); } catch {}
 try { db.exec('CREATE INDEX IF NOT EXISTS idx_candidate_status ON memory_candidates(status, created_at)'); } catch {}
 try { db.exec('CREATE INDEX IF NOT EXISTS idx_candidate_expires ON memory_candidates(expires_at)'); } catch {}
@@ -367,6 +372,7 @@ const fmt = (r) => ({
   activation_score: +(r.activation_score || 0),
   protected: rowIsProtected(r),
   evidence_raw_ids: parseArrayField(r.evidence_raw_ids),
+  evidence_chunk_ids: parseArrayField(r.evidence_chunk_ids),
   status: r.status || 'current',
   active_fact: !!r.active_fact,
   fact_key: r.fact_key || null, superseded_by: r.superseded_by || null,
@@ -805,15 +811,134 @@ const fmtMemoryCandidate = (r) => ({
   importance: Number(r.importance || 0),
   suggested_tags: parseArrayField(r.suggested_tags),
   evidence_preview: r.evidence_preview || '',
+  relation_hints: parseArrayField(r.relation_hints),
   reason: r.reason || '',
   confidence: Number(r.confidence || 0),
   status: r.status,
+  promoted_memory_id: r.promoted_memory_id || null,
+  promoted_at: r.promoted_at || null,
+  promotion_note: r.promotion_note || '',
   created_at: r.created_at,
   updated_at: r.updated_at,
   reviewed_at: r.reviewed_at || null,
   review_note: r.review_note || null,
   expires_at: r.expires_at || null,
 });
+
+const PROMOTABLE_CANDIDATE_CATEGORIES = new Set([
+  'work',
+  'daily',
+  'fact',
+  'relationship',
+  'anchor',
+  'observation',
+  'preference_candidate',
+  'boundary_candidate',
+  'todo_candidate',
+]);
+const CANDIDATE_PROMOTION_CATEGORY_MAP = {
+  preference_candidate: 'preference',
+  boundary_candidate: 'boundary',
+  todo_candidate: 'todo',
+};
+const PRIVATE_CANDIDATE_CATEGORIES = new Set(['private_candidate', 'private_index', 'intimate']);
+const PROMOTION_MIN_CONFIDENCE = 0.55;
+
+function promotedCategoryForCandidate(candidate) {
+  const suggested = String(candidate.suggested_category || '').trim();
+  return CANDIDATE_PROMOTION_CATEGORY_MAP[suggested] || suggested;
+}
+
+function candidatePromotionEvidence(candidate) {
+  return {
+    rawIds: parseArrayField(candidate.raw_event_ids),
+    chunkIds: parseArrayField(candidate.source_chunk_ids),
+  };
+}
+
+function missingIds(table, ids) {
+  const unique = [...new Set(ids.map(id => String(id || '').trim()).filter(Boolean))];
+  if (!unique.length) return [];
+  const stmt = db.prepare(`SELECT id FROM ${table} WHERE id = ?`);
+  return unique.filter(id => !stmt.get(id));
+}
+
+function planCandidatePromotion(candidate) {
+  const formatted = fmtMemoryCandidate(candidate);
+  const suggested = formatted.suggested_category;
+  const targetCategory = promotedCategoryForCandidate(candidate);
+  const { rawIds, chunkIds } = candidatePromotionEvidence(candidate);
+  const skip = (reason) => ({ action: 'skip', reason, candidate: formatted });
+
+  if (formatted.status !== 'accepted') return skip('candidate status is not accepted');
+  if (formatted.promoted_memory_id) return skip('candidate already has promoted_memory_id');
+  if (PRIVATE_CANDIDATE_CATEGORIES.has(suggested) || PRIVATE_CANDIDATE_CATEGORIES.has(formatted.candidate_type)) {
+    return skip('private_candidate promotion is disabled in v1');
+  }
+  if (!PROMOTABLE_CANDIDATE_CATEGORIES.has(suggested) && !PROMOTABLE_CANDIDATE_CATEGORIES.has(formatted.candidate_type)) {
+    return skip(`unsupported candidate category: ${suggested || formatted.candidate_type || '(empty)'}`);
+  }
+  if (!String(candidate.summary || '').trim()) return skip('summary is empty');
+  if (formatted.confidence < PROMOTION_MIN_CONFIDENCE) return skip(`confidence below ${PROMOTION_MIN_CONFIDENCE}`);
+  if (!rawIds.length && !chunkIds.length) return skip('missing evidence ids');
+
+  const missingRawIds = missingIds('raw_events', rawIds);
+  if (missingRawIds.length) return skip(`missing raw_events: ${missingRawIds.join(',')}`);
+  const missingChunkIds = missingIds('event_chunks', chunkIds);
+  if (missingChunkIds.length) return skip(`missing event_chunks: ${missingChunkIds.join(',')}`);
+
+  const content = String(candidate.summary || '').trim();
+  const tags = [...new Set([...formatted.suggested_tags, 'candidate-promoted'])];
+  const now = new Date().toISOString();
+  const protectedFlag = resolveProtectedFlag(targetCategory, undefined, 0);
+  return {
+    action: 'promote',
+    candidate: formatted,
+    memory: {
+      id: uuidv4(),
+      content,
+      category: targetCategory,
+      tags,
+      source: `candidate:${candidate.source || ''}:${candidate.channel || ''}`,
+      mood: null,
+      created_at: now,
+      updated_at: now,
+      expires_at: null,
+      pinned: 0,
+      content_hash: contentHash(content, targetCategory),
+      fact_key: null,
+      superseded_by: null,
+      protected: protectedFlag,
+      evidence_raw_ids: rawIds,
+      evidence_chunk_ids: chunkIds,
+      status: 'review',
+      active_fact: 0,
+    },
+  };
+}
+
+function selectPromotionCandidates({ ids = [], match_status = 'accepted', suggested_category = '', source = '', channel = 'all', candidate_type = '', limit = 50 } = {}) {
+  const cleanIds = [...new Set((ids || []).map(id => String(id || '').trim()).filter(Boolean))];
+  if (cleanIds.length) {
+    const rows = [];
+    const stmt = db.prepare('SELECT * FROM memory_candidates WHERE id = ?');
+    for (const id of cleanIds.slice(0, 100)) {
+      const row = stmt.get(id);
+      if (row) rows.push(row);
+    }
+    return rows;
+  }
+
+  const where = ['status = ?'];
+  const params = [match_status];
+  if (suggested_category) { where.push('suggested_category = ?'); params.push(suggested_category); }
+  if (source) { where.push('source = ?'); params.push(source); }
+  if (channel !== 'all') { where.push('channel = ?'); params.push(channel); }
+  if (candidate_type) { where.push('candidate_type = ?'); params.push(candidate_type); }
+  const cappedLimit = Math.max(1, Math.min(100, Number(limit) || 50));
+  return db.prepare(`SELECT * FROM memory_candidates WHERE ${where.join(' AND ')} ORDER BY reviewed_at ASC, created_at ASC LIMIT ?`)
+    .all(...params, cappedLimit);
+}
 
 function rawEventDisplaySource(row) {
   if (row.source === 'telegram') return row.channel === 'private' ? 'TG 私聊' : 'TG';
@@ -1427,8 +1552,9 @@ function createMcpServer() {
       fact_key: z.string().optional().describe('Z-axis fact key (e.g. "闻川部署位置"). Same fact_key = same evolving fact; old version auto-superseded'),
       protected: z.boolean().optional().describe('Lock this memory so automation cannot mutate it'),
       evidence_raw_ids: z.array(z.string()).optional().describe('raw_event ids used as evidence for this curated memory'),
+      evidence_chunk_ids: z.array(z.string()).optional().describe('event_chunk ids used as evidence for this curated memory'),
     },
-    async ({ content, category, tags, source, mood, pinned, fact_key, protected: protectedArg, evidence_raw_ids }) => {
+    async ({ content, category, tags, source, mood, pinned, fact_key, protected: protectedArg, evidence_raw_ids, evidence_chunk_ids }) => {
       const hash = contentHash(content, category);
       const dupe = db.prepare('SELECT * FROM memories WHERE content_hash = ? AND (expires_at IS NULL OR expires_at > ?)').get(hash, new Date().toISOString());
       if (dupe) {
@@ -1451,6 +1577,7 @@ function createMcpServer() {
       const expires_at = pinned ? null : expiryFor(category);
       const protectedFlag = resolveProtectedFlag(category, protectedArg, 0);
       const evidenceIds = JSON.stringify(evidence_raw_ids ?? []);
+      const evidenceChunkIds = JSON.stringify(evidence_chunk_ids ?? []);
       // Compute embedding and find related BEFORE inserting (so new memory is excluded)
       const embedding = await getEmbedding(content);
       const related = findRelated(embedding, id);
@@ -1485,9 +1612,9 @@ function createMcpServer() {
       }
 
       db.prepare(
-        'INSERT INTO memories (id,content,category,tags,source,mood,created_at,updated_at,expires_at,embedding,pinned,content_hash,fact_key,protected,evidence_raw_ids,status,active_fact) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)'
+        'INSERT INTO memories (id,content,category,tags,source,mood,created_at,updated_at,expires_at,embedding,pinned,content_hash,fact_key,protected,evidence_raw_ids,evidence_chunk_ids,status,active_fact) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)'
       ).run(id, content, category, JSON.stringify(tags ?? []), source ?? '', mood ?? null, now, now, expires_at,
-        embedding ? JSON.stringify(embedding) : null, pinned ? 1 : 0, hash, fact_key ?? null, protectedFlag, evidenceIds, status, activeFact);
+        embedding ? JSON.stringify(embedding) : null, pinned ? 1 : 0, hash, fact_key ?? null, protectedFlag, evidenceIds, evidenceChunkIds, status, activeFact);
 
       // Z-axis: auto-supersede old versions of the same fact
       let superseded = [];
@@ -1607,14 +1734,16 @@ function createMcpServer() {
       fact_key: z.string().optional().describe('Set or change the Z-axis fact key for this memory'),
       protected: z.boolean().optional().describe('Lock/unlock automation protection; protected categories stay locked'),
       evidence_raw_ids: z.array(z.string()).optional().describe('Replace linked raw_event evidence ids'),
+      evidence_chunk_ids: z.array(z.string()).optional().describe('Replace linked event_chunk evidence ids'),
     },
-    async ({ id, content, category, tags, source, mood, pinned, fact_key, protected: protectedArg, evidence_raw_ids }) => {
+    async ({ id, content, category, tags, source, mood, pinned, fact_key, protected: protectedArg, evidence_raw_ids, evidence_chunk_ids }) => {
       const row = db.prepare('SELECT * FROM memories WHERE id = ?').get(id);
       if (!row) return { content: [{ type: 'text', text: `Not found: ${id}` }] };
       const newCategory = category ?? row.category;
       const newPinned = pinned !== undefined ? (pinned ? 1 : 0) : row.pinned;
       const newProtected = resolveProtectedFlag(newCategory, protectedArg, row.protected);
       const newEvidenceIds = evidence_raw_ids !== undefined ? JSON.stringify(evidence_raw_ids) : row.evidence_raw_ids;
+      const newEvidenceChunkIds = evidence_chunk_ids !== undefined ? JSON.stringify(evidence_chunk_ids) : row.evidence_chunk_ids;
       let expires_at = row.expires_at;
       const categoryChanged = category !== undefined && category !== row.category;
       const pinnedChanged = pinned !== undefined && (pinned ? 1 : 0) !== row.pinned;
@@ -1624,7 +1753,7 @@ function createMcpServer() {
       const newFactKey = fact_key !== undefined ? fact_key : row.fact_key;
       const newStatus = row.status || 'current';
       const newActiveFact = factActiveValue(newFactKey, newStatus, row.superseded_by);
-      db.prepare('UPDATE memories SET content=?,category=?,tags=?,source=?,mood=?,pinned=?,updated_at=?,expires_at=?,content_hash=?,fact_key=?,protected=?,evidence_raw_ids=?,active_fact=? WHERE id=?').run(
+      db.prepare('UPDATE memories SET content=?,category=?,tags=?,source=?,mood=?,pinned=?,updated_at=?,expires_at=?,content_hash=?,fact_key=?,protected=?,evidence_raw_ids=?,evidence_chunk_ids=?,active_fact=? WHERE id=?').run(
         content ?? row.content,
         newCategory,
         tags !== undefined ? JSON.stringify(tags) : row.tags,
@@ -1637,6 +1766,7 @@ function createMcpServer() {
         newFactKey ?? null,
         newProtected,
         newEvidenceIds,
+        newEvidenceChunkIds,
         newActiveFact,
         id
       );
@@ -1646,6 +1776,7 @@ function createMcpServer() {
       if (fact_key !== undefined) notes.push(`fact_key=${fact_key || '(cleared)'}`);
       if (protectedArg !== undefined || newProtected !== row.protected) notes.push(newProtected ? 'protected' : 'unprotected');
       if (evidence_raw_ids !== undefined) notes.push(`evidence_raw_ids=${evidence_raw_ids.length}`);
+      if (evidence_chunk_ids !== undefined) notes.push(`evidence_chunk_ids=${evidence_chunk_ids.length}`);
       return { content: [{ type: 'text', text: notes.length ? `Updated ${id} (${notes.join(', ')}).` : `Updated ${id}.` }] };
     }
   );
@@ -2082,21 +2213,30 @@ function createMcpServer() {
   // 15. get_evidence — curated memory → linked raw events
   mcp.tool(
     'get_evidence',
-    'Return raw_events linked from one curated memory via evidence_raw_ids.',
+    'Return raw_events and event_chunks linked from one curated memory via evidence_raw_ids/evidence_chunk_ids.',
     {
       memory_id: z.string().describe('Curated memory id'),
     },
     async ({ memory_id }) => {
-      const mem = db.prepare('SELECT evidence_raw_ids FROM memories WHERE id = ?').get(memory_id);
+      const mem = db.prepare('SELECT evidence_raw_ids,evidence_chunk_ids FROM memories WHERE id = ?').get(memory_id);
       if (!mem) return { content: [{ type: 'text', text: JSON.stringify({ error: 'memory not found' }, null, 2) }] };
-      const ids = parseArrayField(mem.evidence_raw_ids);
-      if (!ids.length) return { content: [{ type: 'text', text: JSON.stringify({ evidence: [], count: 0 }, null, 2) }] };
-      const placeholders = ids.map(() => '?').join(',');
-      const rows = db.prepare(`SELECT * FROM raw_events WHERE id IN (${placeholders}) ORDER BY timestamp ASC`).all(...ids);
+      const rawIds = parseArrayField(mem.evidence_raw_ids);
+      const chunkIds = parseArrayField(mem.evidence_chunk_ids);
+      const rawRows = rawIds.length
+        ? db.prepare(`SELECT * FROM raw_events WHERE id IN (${rawIds.map(() => '?').join(',')}) ORDER BY timestamp ASC`).all(...rawIds)
+        : [];
+      const chunkRows = chunkIds.length
+        ? db.prepare(`SELECT * FROM event_chunks WHERE id IN (${chunkIds.map(() => '?').join(',')}) ORDER BY start_time ASC`).all(...chunkIds)
+        : [];
       return {
         content: [{
           type: 'text',
-          text: JSON.stringify({ evidence: rows.map(fmtRawEvent), count: rows.length }, null, 2),
+          text: JSON.stringify({
+            evidence: rawRows.map(fmtRawEvent),
+            chunks: chunkRows.map(fmtEventChunk),
+            count: rawRows.length,
+            chunk_count: chunkRows.length,
+          }, null, 2),
         }],
       };
     }
@@ -2776,6 +2916,157 @@ function createMcpServer() {
   );
 
   // 20. somatic_ignite — shared short-lived body-state trigger
+  // 21. promote_memory_candidates — accepted candidates -> review memories
+  mcp.tool(
+    'promote_memory_candidates',
+    'Promote accepted non-private memory_candidates into formal memories with status=review. Conservative v1: dry_run=true by default, private candidates are skipped, no relation edges are written.',
+    {
+      ids: z.array(z.string()).optional().describe('Optional exact candidate ids. If present, filters are ignored.'),
+      match_status: z.enum(['accepted']).default('accepted').describe('Only accepted candidates can be promoted in v1.'),
+      suggested_category: z.string().optional().describe('Optional exact suggested_category filter, e.g. work or daily'),
+      source: z.string().optional().describe('Optional exact source filter'),
+      channel: z.enum(['cc', 'daily', 'intimate', 'private', 'group', 'normal', 'all']).default('all').describe('Optional channel filter'),
+      candidate_type: z.string().optional().describe('Optional exact candidate_type filter'),
+      limit: z.number().int().min(1).max(100).default(50),
+      dry_run: z.boolean().default(true),
+    },
+    async ({ ids = [], match_status = 'accepted', suggested_category = '', source = '', channel = 'all', candidate_type = '', limit = 50, dry_run = true }) => {
+      const rows = selectPromotionCandidates({ ids, match_status, suggested_category, source, channel, candidate_type, limit });
+      const plans = rows.map(planCandidatePromotion);
+      const promotePlans = plans.filter(p => p.action === 'promote');
+      const skipPlans = plans.filter(p => p.action !== 'promote');
+
+      if (dry_run) {
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              dry_run: true,
+              matched_count: rows.length,
+              would_promote_count: promotePlans.length,
+              would_skip_count: skipPlans.length,
+              plans: promotePlans.map(p => ({
+                candidate_id: p.candidate.id,
+                action: 'promote',
+                memory_preview: {
+                  id: p.memory.id,
+                  category: p.memory.category,
+                  status: p.memory.status,
+                  protected: !!p.memory.protected,
+                  evidence_raw_ids: p.memory.evidence_raw_ids,
+                  evidence_chunk_ids: p.memory.evidence_chunk_ids,
+                  content: truncateText(p.memory.content, 220),
+                },
+              })),
+              skips: skipPlans.map(p => ({ candidate_id: p.candidate.id, action: 'skip', reason: p.reason })),
+              note: 'dry_run=true: no memories or candidate statuses were changed. v1 skips private_candidate and writes no relations.',
+            }, null, 2),
+          }],
+        };
+      }
+
+      const embeddings = new Map();
+      for (const plan of promotePlans) {
+        embeddings.set(plan.candidate.id, await getEmbedding(plan.memory.content));
+      }
+
+      const promoted = [];
+      const linkedExisting = [];
+      const skipped = [];
+      db.exec('BEGIN IMMEDIATE');
+      try {
+        for (const original of rows) {
+          const current = db.prepare('SELECT * FROM memory_candidates WHERE id = ?').get(original.id);
+          if (!current) {
+            skipped.push({ candidate_id: original.id, reason: 'candidate disappeared before apply' });
+            continue;
+          }
+          const plan = planCandidatePromotion(current);
+          if (plan.action !== 'promote') {
+            skipped.push({ candidate_id: current.id, reason: plan.reason });
+            continue;
+          }
+
+          const now = new Date().toISOString();
+          const existing = db.prepare('SELECT * FROM memories WHERE content_hash = ? AND (expires_at IS NULL OR expires_at > ?)').get(plan.memory.content_hash, now);
+          if (existing) {
+            const r = db.prepare(`
+              UPDATE memory_candidates
+              SET status='merged', promoted_memory_id=?, promoted_at=?, promotion_note=?, updated_at=?
+              WHERE id=? AND status='accepted' AND (promoted_memory_id IS NULL OR promoted_memory_id = '')
+            `).run(existing.id, now, 'linked to existing memory with same content_hash', now, current.id);
+            if (r.changes) linkedExisting.push({ candidate_id: current.id, memory_id: existing.id });
+            else skipped.push({ candidate_id: current.id, reason: 'candidate already promoted by another run' });
+            continue;
+          }
+
+          const memory = plan.memory;
+          const embedding = embeddings.get(current.id);
+          const r = db.prepare(`
+            UPDATE memory_candidates
+            SET status='merged', promoted_memory_id=?, promoted_at=?, promotion_note=?, updated_at=?
+            WHERE id=? AND status='accepted' AND (promoted_memory_id IS NULL OR promoted_memory_id = '')
+          `).run(memory.id, now, 'promoted to review memory', now, current.id);
+          if (!r.changes) {
+            skipped.push({ candidate_id: current.id, reason: 'candidate already promoted by another run' });
+            continue;
+          }
+          db.prepare(`
+            INSERT INTO memories
+              (id,content,category,tags,source,mood,created_at,updated_at,expires_at,embedding,pinned,content_hash,fact_key,superseded_by,protected,evidence_raw_ids,evidence_chunk_ids,status,active_fact)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+          `).run(
+            memory.id,
+            memory.content,
+            memory.category,
+            JSON.stringify(memory.tags),
+            memory.source,
+            memory.mood,
+            now,
+            now,
+            null,
+            embedding ? JSON.stringify(embedding) : null,
+            0,
+            memory.content_hash,
+            null,
+            null,
+            memory.protected,
+            JSON.stringify(memory.evidence_raw_ids),
+            JSON.stringify(memory.evidence_chunk_ids),
+            'review',
+            0
+          );
+          promoted.push({ candidate_id: current.id, memory_id: memory.id, category: memory.category });
+        }
+        db.exec('COMMIT');
+      } catch (err) {
+        db.exec('ROLLBACK');
+        throw err;
+      }
+
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            dry_run: false,
+            matched_count: rows.length,
+            promoted_count: promoted.length,
+            linked_existing_count: linkedExisting.length,
+            skipped_count: skipped.length,
+            created_memory_ids: promoted.map(p => p.memory_id),
+            updated_candidate_ids: [...promoted.map(p => p.candidate_id), ...linkedExisting.map(p => p.candidate_id)],
+            promoted,
+            linked_existing: linkedExisting,
+            skips: skipped,
+            relations_written: 0,
+            review_relations_queued: 0,
+            note: 'Promoted candidates were written as status=review. v1 writes no relation edges and skips private candidates.',
+          }, null, 2),
+        }],
+      };
+    }
+  );
+
   mcp.tool(
     'somatic_ignite',
     'Shared somatic state: record a short-lived body sensation trigger for ke. Caller must parse text and pass labels; this server stores/decays state only and does not write ordinary memories.',
@@ -3090,7 +3381,7 @@ app.get('/api/memories', auth, (req, res) => {
 });
 
 app.post('/api/memories', auth, async (req, res) => {
-  const { content, category, tags = [], source = '', mood = null, pinned = false, fact_key = null, protected: protectedArg, evidence_raw_ids = [] } = req.body;
+  const { content, category, tags = [], source = '', mood = null, pinned = false, fact_key = null, protected: protectedArg, evidence_raw_ids = [], evidence_chunk_ids = [] } = req.body;
   if (!content || !category) return res.status(400).json({ error: 'content and category required' });
   const hash = contentHash(content, category);
   const dupe = db.prepare('SELECT * FROM memories WHERE content_hash = ? AND (expires_at IS NULL OR expires_at > ?)').get(hash, new Date().toISOString());
@@ -3101,6 +3392,7 @@ app.post('/api/memories', auth, async (req, res) => {
   const expires_at = pinned ? null : expiryFor(category);
   const protectedFlag = resolveProtectedFlag(category, protectedArg, 0);
   const evidenceIds = JSON.stringify(evidence_raw_ids);
+  const evidenceChunkIds = JSON.stringify(evidence_chunk_ids);
   const embedding = await getEmbedding(content);
   const related = findRelated(embedding, id);
 
@@ -3125,9 +3417,9 @@ app.post('/api/memories', auth, async (req, res) => {
     }
   }
 
-  db.prepare('INSERT INTO memories (id,content,category,tags,source,mood,created_at,updated_at,expires_at,embedding,pinned,content_hash,fact_key,protected,evidence_raw_ids,status,active_fact) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)')
+  db.prepare('INSERT INTO memories (id,content,category,tags,source,mood,created_at,updated_at,expires_at,embedding,pinned,content_hash,fact_key,protected,evidence_raw_ids,evidence_chunk_ids,status,active_fact) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)')
     .run(id, content, category, JSON.stringify(tags), source, mood, now, now, expires_at,
-      embedding ? JSON.stringify(embedding) : null, pinned ? 1 : 0, hash, fact_key, protectedFlag, evidenceIds, status, activeFact);
+      embedding ? JSON.stringify(embedding) : null, pinned ? 1 : 0, hash, fact_key, protectedFlag, evidenceIds, evidenceChunkIds, status, activeFact);
   // Z-axis: auto-supersede old versions
   let superseded = [];
   if (fact_key) {
@@ -3150,11 +3442,12 @@ app.post('/api/memories', auth, async (req, res) => {
 app.put('/api/memories/:id', auth, (req, res) => {
   const row = db.prepare('SELECT * FROM memories WHERE id = ?').get(req.params.id);
   if (!row) return res.status(404).json({ error: 'Not found' });
-  const { content, category, tags, source, mood, pinned, fact_key, protected: protectedArg, evidence_raw_ids } = req.body;
+  const { content, category, tags, source, mood, pinned, fact_key, protected: protectedArg, evidence_raw_ids, evidence_chunk_ids } = req.body;
   const newCategory = category ?? row.category;
   const newPinned = pinned !== undefined ? (pinned ? 1 : 0) : row.pinned;
   const newProtected = resolveProtectedFlag(newCategory, protectedArg, row.protected);
   const newEvidenceIds = evidence_raw_ids !== undefined ? JSON.stringify(evidence_raw_ids) : row.evidence_raw_ids;
+  const newEvidenceChunkIds = evidence_chunk_ids !== undefined ? JSON.stringify(evidence_chunk_ids) : row.evidence_chunk_ids;
   let expires_at = row.expires_at;
   const categoryChanged = category !== undefined && category !== row.category;
   const pinnedChanged = pinned !== undefined && (pinned ? 1 : 0) !== row.pinned;
@@ -3164,7 +3457,7 @@ app.put('/api/memories/:id', auth, (req, res) => {
   const newFactKey = fact_key !== undefined ? fact_key : row.fact_key;
   const newStatus = row.status || 'current';
   const newActiveFact = factActiveValue(newFactKey, newStatus, row.superseded_by);
-  db.prepare('UPDATE memories SET content=?,category=?,tags=?,source=?,mood=?,pinned=?,updated_at=?,expires_at=?,content_hash=?,fact_key=?,protected=?,evidence_raw_ids=?,active_fact=? WHERE id=?').run(
+  db.prepare('UPDATE memories SET content=?,category=?,tags=?,source=?,mood=?,pinned=?,updated_at=?,expires_at=?,content_hash=?,fact_key=?,protected=?,evidence_raw_ids=?,evidence_chunk_ids=?,active_fact=? WHERE id=?').run(
     content ?? row.content,
     newCategory,
     tags !== undefined ? JSON.stringify(tags) : row.tags,
@@ -3177,6 +3470,7 @@ app.put('/api/memories/:id', auth, (req, res) => {
     newFactKey ?? null,
     newProtected,
     newEvidenceIds,
+    newEvidenceChunkIds,
     newActiveFact,
     req.params.id
   );
@@ -3525,7 +3819,7 @@ async function restoreMemoryCandidatesIfEmpty() {
     const content = Buffer.from(data.content.replace(/\n/g, ''), 'base64').toString('utf-8');
     const lines = content.split('\n').filter(l => l.trim());
     const stmt = db.prepare(
-      'INSERT OR IGNORE INTO memory_candidates (id,raw_event_ids,dedupe_key,source,channel,speaker,summary,suggested_category,reason,confidence,status,created_at,updated_at,reviewed_at,review_note,expires_at,source_chunk_ids,candidate_type,importance,suggested_tags,evidence_preview) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)'
+      'INSERT OR IGNORE INTO memory_candidates (id,raw_event_ids,dedupe_key,source,channel,speaker,summary,suggested_category,reason,confidence,status,created_at,updated_at,reviewed_at,review_note,expires_at,source_chunk_ids,candidate_type,importance,suggested_tags,evidence_preview,promoted_memory_id,promoted_at,promotion_note,relation_hints) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)'
     );
     let restored = 0;
     for (const line of lines) {
@@ -3533,6 +3827,7 @@ async function restoreMemoryCandidatesIfEmpty() {
       const rawIds = Array.isArray(c.raw_event_ids) ? c.raw_event_ids : parseArrayField(c.raw_event_ids);
       const chunkIds = Array.isArray(c.source_chunk_ids) ? c.source_chunk_ids : parseArrayField(c.source_chunk_ids);
       const tags = Array.isArray(c.suggested_tags) ? c.suggested_tags : parseArrayField(c.suggested_tags);
+      const relationHints = Array.isArray(c.relation_hints) ? c.relation_hints : parseArrayField(c.relation_hints);
       const now = new Date().toISOString();
       const status = VALID_CANDIDATE_STATUS.has(c.status) ? c.status : 'pending';
       stmt.run(
@@ -3556,7 +3851,11 @@ async function restoreMemoryCandidatesIfEmpty() {
         c.candidate_type || '',
         Number(c.importance || 0),
         JSON.stringify(tags),
-        c.evidence_preview || ''
+        c.evidence_preview || '',
+        c.promoted_memory_id || null,
+        c.promoted_at || null,
+        c.promotion_note || '',
+        JSON.stringify(relationHints)
       );
       restored++;
     }
@@ -3702,10 +4001,10 @@ async function autoRestore() {
       const m = JSON.parse(line);
       const exists = db.prepare('SELECT id FROM memories WHERE id = ?').get(m.id);
       if (!exists) {
-        const status = ['current', 'historical', 'archived', 'deleted'].includes(m.status) ? m.status : (m.superseded_by ? 'historical' : 'current');
+        const status = ['current', 'review', 'historical', 'archived', 'deleted'].includes(m.status) ? m.status : (m.superseded_by ? 'historical' : 'current');
         const activeFact = m.fact_key && status === 'current' && !m.superseded_by ? 1 : 0;
-        db.prepare('INSERT INTO memories (id,content,category,tags,source,mood,created_at,updated_at,expires_at,pinned,content_hash,activation_score,fact_key,superseded_by,protected,evidence_raw_ids,status,active_fact) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)')
-          .run(m.id, m.content, m.category, JSON.stringify(m.tags || []), m.source || '', m.mood, m.created_at, m.updated_at, m.expires_at || null, m.pinned ? 1 : 0, m.content_hash || contentHash(m.content, m.category), Number(m.activation_score || 0), m.fact_key || null, m.superseded_by || null, resolveProtectedFlag(m.category, m.protected, 0), JSON.stringify(m.evidence_raw_ids || []), status, Number(m.active_fact ?? activeFact));
+        db.prepare('INSERT INTO memories (id,content,category,tags,source,mood,created_at,updated_at,expires_at,pinned,content_hash,activation_score,fact_key,superseded_by,protected,evidence_raw_ids,evidence_chunk_ids,status,active_fact) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)')
+          .run(m.id, m.content, m.category, JSON.stringify(m.tags || []), m.source || '', m.mood, m.created_at, m.updated_at, m.expires_at || null, m.pinned ? 1 : 0, m.content_hash || contentHash(m.content, m.category), Number(m.activation_score || 0), m.fact_key || null, m.superseded_by || null, resolveProtectedFlag(m.category, m.protected, 0), JSON.stringify(m.evidence_raw_ids || []), JSON.stringify(m.evidence_chunk_ids || []), status, Number(m.active_fact ?? activeFact));
         restored++;
       }
     }

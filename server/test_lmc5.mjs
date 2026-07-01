@@ -47,6 +47,11 @@ async function callTool(client, name, args = {}) {
   return JSON.parse(text);
 }
 
+async function callToolText(client, name, args = {}) {
+  const result = await client.callTool({ name, arguments: args });
+  return result.content?.[0]?.text || '';
+}
+
 try {
   await waitForServer();
   const transport = new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${port}/mcp`));
@@ -66,6 +71,7 @@ try {
     'run_memory_patrol',
     'list_memory_patrol_reports',
     'batch_review_memory_candidates_by_filter',
+    'promote_memory_candidates',
   ]) {
     assert.ok(toolNames.includes(name), `missing MCP tool: ${name}`);
   }
@@ -312,6 +318,125 @@ try {
     limit: 10,
   });
   assert.ok(rejectedPreview.matched_count >= 2, JSON.stringify(rejectedPreview, null, 2));
+
+  const promoDb = new Database(path.join(dataDir, 'memories.db'));
+  const promoChunk = promoDb.prepare('SELECT chunk_id FROM chunk_events WHERE raw_event_id = ? LIMIT 1').get(rawCandidateEvent.id);
+  assert.ok(promoChunk?.chunk_id, 'promotion test needs a chunk evidence id');
+  const insertCandidate = promoDb.prepare(`
+    INSERT INTO memory_candidates
+      (id,raw_event_ids,source_chunk_ids,dedupe_key,source,channel,speaker,summary,suggested_category,candidate_type,reason,confidence,importance,suggested_tags,evidence_preview,status,created_at,updated_at,reviewed_at,review_note,expires_at)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+  `);
+  const promoNow = new Date().toISOString();
+  const promoSummary = 'candidate promotion durable work summary unique alpha';
+  insertCandidate.run(
+    'promo-work-1',
+    JSON.stringify([rawCandidateEvent.id]),
+    JSON.stringify([promoChunk.chunk_id]),
+    'promo-work-1',
+    'promotion-test',
+    'normal',
+    'moon',
+    promoSummary,
+    'work',
+    'work',
+    'accepted work candidate',
+    0.9,
+    0.8,
+    JSON.stringify(['work']),
+    'preview',
+    'accepted',
+    promoNow,
+    promoNow,
+    promoNow,
+    'accepted for promotion test',
+    null
+  );
+  promoDb.close();
+
+  const promoteDry = await callTool(client, 'promote_memory_candidates', { ids: ['promo-work-1'], dry_run: true });
+  assert.equal(promoteDry.would_promote_count, 1, JSON.stringify(promoteDry, null, 2));
+  assert.equal(promoteDry.would_skip_count, 0, JSON.stringify(promoteDry, null, 2));
+  {
+    const dbCheck = new Database(path.join(dataDir, 'memories.db'));
+    assert.equal(dbCheck.prepare('SELECT COUNT(*) AS c FROM memories WHERE content = ?').get(promoSummary).c, 0);
+    assert.equal(dbCheck.prepare('SELECT status FROM memory_candidates WHERE id = ?').get('promo-work-1').status, 'accepted');
+    dbCheck.close();
+  }
+
+  const promoteApply = await callTool(client, 'promote_memory_candidates', { ids: ['promo-work-1'], dry_run: false });
+  assert.equal(promoteApply.promoted_count, 1, JSON.stringify(promoteApply, null, 2));
+  assert.equal(promoteApply.relations_written, 0, JSON.stringify(promoteApply, null, 2));
+  const promotedId = promoteApply.created_memory_ids[0];
+  {
+    const dbCheck = new Database(path.join(dataDir, 'memories.db'));
+    const mem = dbCheck.prepare('SELECT * FROM memories WHERE id = ?').get(promotedId);
+    assert.equal(mem.status, 'review');
+    assert.equal(mem.expires_at, null);
+    assert.equal(mem.category, 'work');
+    assert.deepEqual(JSON.parse(mem.evidence_raw_ids), [rawCandidateEvent.id]);
+    assert.deepEqual(JSON.parse(mem.evidence_chunk_ids), [promoChunk.chunk_id]);
+    const cand = dbCheck.prepare('SELECT * FROM memory_candidates WHERE id = ?').get('promo-work-1');
+    assert.equal(cand.status, 'merged');
+    assert.equal(cand.promoted_memory_id, promotedId);
+    assert.ok(cand.promoted_at);
+    dbCheck.close();
+  }
+
+  const evidence = await callTool(client, 'get_evidence', { memory_id: promotedId });
+  assert.equal(evidence.count, 1, JSON.stringify(evidence, null, 2));
+  assert.equal(evidence.chunk_count, 1, JSON.stringify(evidence, null, 2));
+
+  const readReviewText = await callToolText(client, 'read_memories', { keyword: promoSummary, limit: 5 });
+  assert.equal(readReviewText, 'No memories found.');
+  const searchReviewText = await callToolText(client, 'search_memories', { query: promoSummary });
+  assert.ok(searchReviewText.includes('No results'), searchReviewText);
+  const hybridReviewText = await callToolText(client, 'hybrid_search', { query: promoSummary, limit: 5 });
+  assert.ok(hybridReviewText.includes('No results'), hybridReviewText);
+  const recallReview = await callTool(client, 'recall_lmc', { query: promoSummary, graph_hops: 0, include_chunks: false });
+  assert.ok(!recallReview.primary.some(m => m.id === promotedId), JSON.stringify(recallReview, null, 2));
+
+  const repeatPromotion = await callTool(client, 'promote_memory_candidates', { ids: ['promo-work-1'], dry_run: false });
+  assert.equal(repeatPromotion.promoted_count, 0, JSON.stringify(repeatPromotion, null, 2));
+
+  {
+    const dbCheck = new Database(path.join(dataDir, 'memories.db'));
+    const insert = dbCheck.prepare(`
+      INSERT INTO memory_candidates
+        (id,raw_event_ids,source_chunk_ids,dedupe_key,source,channel,speaker,summary,suggested_category,candidate_type,reason,confidence,importance,suggested_tags,evidence_preview,status,created_at,updated_at,reviewed_at,review_note,expires_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+    `);
+    const now = new Date().toISOString();
+    insert.run('promo-private-1', JSON.stringify([rawCandidateEvent.id]), JSON.stringify([promoChunk.chunk_id]), 'promo-private-1', 'promotion-test', 'private', 'moon', 'private candidate should not promote', 'private_candidate', 'private_candidate', 'private skip', 0.95, 0.9, JSON.stringify(['private']), '', 'accepted', now, now, now, 'accepted private', null);
+    insert.run('promo-missing-raw-1', JSON.stringify(['missing-raw-event-id']), JSON.stringify([promoChunk.chunk_id]), 'promo-missing-raw-1', 'promotion-test', 'normal', 'moon', 'missing raw evidence should skip', 'work', 'work', 'missing raw', 0.95, 0.9, JSON.stringify(['work']), '', 'accepted', now, now, now, 'accepted missing raw', null);
+    insert.run('promo-unknown-1', JSON.stringify([rawCandidateEvent.id]), JSON.stringify([promoChunk.chunk_id]), 'promo-unknown-1', 'promotion-test', 'normal', 'moon', 'unknown category should skip', 'unknown_candidate', 'unknown_candidate', 'unknown category', 0.95, 0.9, JSON.stringify(['unknown']), '', 'accepted', now, now, now, 'accepted unknown', null);
+    insert.run('promo-duplicate-1', JSON.stringify([rawCandidateEvent.id]), JSON.stringify([promoChunk.chunk_id]), 'promo-duplicate-1', 'promotion-test', 'normal', 'moon', promoSummary, 'work', 'work', 'duplicate content', 0.95, 0.9, JSON.stringify(['work']), '', 'accepted', now, now, now, 'accepted duplicate', null);
+    insert.run('promo-concurrent-1', JSON.stringify([rawCandidateEvent.id]), JSON.stringify([promoChunk.chunk_id]), 'promo-concurrent-1', 'promotion-test', 'normal', 'moon', 'candidate promotion concurrent summary unique beta', 'work', 'work', 'concurrent test', 0.95, 0.9, JSON.stringify(['work']), '', 'accepted', now, now, now, 'accepted concurrent', null);
+    dbCheck.close();
+  }
+
+  const privateSkip = await callTool(client, 'promote_memory_candidates', { ids: ['promo-private-1'], dry_run: true });
+  assert.equal(privateSkip.would_promote_count, 0, JSON.stringify(privateSkip, null, 2));
+  assert.ok(privateSkip.skips[0].reason.includes('private_candidate'), JSON.stringify(privateSkip, null, 2));
+  const missingRawSkip = await callTool(client, 'promote_memory_candidates', { ids: ['promo-missing-raw-1'], dry_run: true });
+  assert.ok(missingRawSkip.skips[0].reason.includes('missing raw_events'), JSON.stringify(missingRawSkip, null, 2));
+  const unknownSkip = await callTool(client, 'promote_memory_candidates', { ids: ['promo-unknown-1'], dry_run: true });
+  assert.ok(unknownSkip.skips[0].reason.includes('unsupported candidate category'), JSON.stringify(unknownSkip, null, 2));
+  const duplicatePromotion = await callTool(client, 'promote_memory_candidates', { ids: ['promo-duplicate-1'], dry_run: false });
+  assert.equal(duplicatePromotion.promoted_count, 0, JSON.stringify(duplicatePromotion, null, 2));
+  assert.equal(duplicatePromotion.linked_existing_count, 1, JSON.stringify(duplicatePromotion, null, 2));
+
+  const concurrentResults = await Promise.all([
+    callTool(client, 'promote_memory_candidates', { ids: ['promo-concurrent-1'], dry_run: false }),
+    callTool(client, 'promote_memory_candidates', { ids: ['promo-concurrent-1'], dry_run: false }),
+  ]);
+  assert.equal(concurrentResults.reduce((sum, r) => sum + r.promoted_count, 0), 1, JSON.stringify(concurrentResults, null, 2));
+  {
+    const dbCheck = new Database(path.join(dataDir, 'memories.db'));
+    assert.equal(dbCheck.prepare('SELECT COUNT(*) AS c FROM memories WHERE content = ?').get('candidate promotion concurrent summary unique beta').c, 1);
+    assert.equal(dbCheck.prepare('SELECT status FROM memory_candidates WHERE id = ?').get('promo-concurrent-1').status, 'merged');
+    dbCheck.close();
+  }
 
   const gapOne = await callTool(client, 'log_raw_event', {
     session_id: 'lmc-gap-test',
