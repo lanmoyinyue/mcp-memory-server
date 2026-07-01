@@ -72,6 +72,8 @@ try {
     'list_memory_patrol_reports',
     'batch_review_memory_candidates_by_filter',
     'promote_memory_candidates',
+    'list_review_memories',
+    'publish_review_memories',
   ]) {
     assert.ok(toolNames.includes(name), `missing MCP tool: ${name}`);
   }
@@ -395,6 +397,137 @@ try {
   assert.ok(hybridReviewText.includes('No results'), hybridReviewText);
   const recallReview = await callTool(client, 'recall_lmc', { query: promoSummary, graph_hops: 0, include_chunks: false });
   assert.ok(!recallReview.primary.some(m => m.id === promotedId), JSON.stringify(recallReview, null, 2));
+
+  const reviewList = await callTool(client, 'list_review_memories', { keyword: promoSummary, limit: 10 });
+  assert.equal(reviewList.count, 1, JSON.stringify(reviewList, null, 2));
+  assert.equal(reviewList.memories[0].id, promotedId, JSON.stringify(reviewList, null, 2));
+
+  const publishDry = await callTool(client, 'publish_review_memories', {
+    ids: [promotedId],
+    action: 'publish',
+    dry_run: true,
+    review_note: 'publish dry-run test',
+  });
+  assert.equal(publishDry.actionable_count, 1, JSON.stringify(publishDry, null, 2));
+  {
+    const dbCheck = new Database(path.join(dataDir, 'memories.db'));
+    assert.equal(dbCheck.prepare('SELECT status FROM memories WHERE id = ?').get(promotedId).status, 'review');
+    dbCheck.close();
+  }
+
+  const publishApply = await callTool(client, 'publish_review_memories', {
+    ids: [promotedId],
+    action: 'publish',
+    dry_run: false,
+    review_note: 'approved for current recall',
+  });
+  assert.equal(publishApply.published_count, 1, JSON.stringify(publishApply, null, 2));
+  assert.deepEqual(publishApply.published_ids, [promotedId], JSON.stringify(publishApply, null, 2));
+  {
+    const dbCheck = new Database(path.join(dataDir, 'memories.db'));
+    const mem = dbCheck.prepare('SELECT * FROM memories WHERE id = ?').get(promotedId);
+    assert.equal(mem.status, 'current');
+    assert.ok(mem.reviewed_at);
+    assert.equal(mem.review_note, 'approved for current recall');
+    dbCheck.close();
+  }
+  const readPublishedText = await callToolText(client, 'read_memories', { keyword: promoSummary, limit: 5 });
+  assert.ok(readPublishedText.includes(promotedId), readPublishedText);
+  const searchPublishedText = await callToolText(client, 'search_memories', { query: promoSummary });
+  assert.ok(searchPublishedText.includes(promotedId), searchPublishedText);
+
+  {
+    const dbCheck = new Database(path.join(dataDir, 'memories.db'));
+    const now = new Date().toISOString();
+    dbCheck.prepare(`
+      INSERT INTO memories
+        (id,content,category,tags,source,mood,created_at,updated_at,expires_at,pinned,content_hash,activation_score,fact_key,superseded_by,protected,evidence_raw_ids,evidence_chunk_ids,status,active_fact)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+    `).run(
+      'review-archive-1',
+      'review archive unique gamma',
+      'work',
+      JSON.stringify(['review']),
+      'review-test',
+      null,
+      now,
+      now,
+      null,
+      0,
+      'review-archive-hash',
+      0,
+      null,
+      null,
+      0,
+      '[]',
+      '[]',
+      'review',
+      0
+    );
+    dbCheck.close();
+  }
+  const archiveApply = await callTool(client, 'publish_review_memories', {
+    ids: ['review-archive-1'],
+    action: 'archive',
+    dry_run: false,
+    review_note: 'not worth publishing',
+  });
+  assert.equal(archiveApply.archived_count, 1, JSON.stringify(archiveApply, null, 2));
+  const archivedReadText = await callToolText(client, 'read_memories', { keyword: 'review archive unique gamma', limit: 5 });
+  assert.equal(archivedReadText, 'No memories found.');
+  const archivedList = await callTool(client, 'list_review_memories', { status: 'archived', keyword: 'review archive unique gamma', limit: 5 });
+  assert.equal(archivedList.count, 1, JSON.stringify(archivedList, null, 2));
+
+  const liveFact = await callTool(client, 'write_memory', {
+    content: 'review publish fact guard current fact',
+    category: 'work',
+    fact_key: 'review:publish-guard',
+  });
+  assert.ok(liveFact.saved?.id);
+  {
+    const dbCheck = new Database(path.join(dataDir, 'memories.db'));
+    const now = new Date().toISOString();
+    dbCheck.prepare(`
+      INSERT INTO memories
+        (id,content,category,tags,source,mood,created_at,updated_at,expires_at,pinned,content_hash,activation_score,fact_key,superseded_by,protected,evidence_raw_ids,evidence_chunk_ids,status,active_fact)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+    `).run(
+      'review-fact-conflict-1',
+      'review publish fact guard conflicting review fact',
+      'work',
+      JSON.stringify(['review']),
+      'review-test',
+      null,
+      now,
+      now,
+      null,
+      0,
+      'review-fact-conflict-hash',
+      0,
+      'review:publish-guard',
+      null,
+      0,
+      '[]',
+      '[]',
+      'review',
+      0
+    );
+    dbCheck.close();
+  }
+  const factPublish = await callTool(client, 'publish_review_memories', {
+    ids: ['review-fact-conflict-1'],
+    action: 'publish',
+    dry_run: false,
+    review_note: 'should require z audit',
+  });
+  assert.equal(factPublish.published_count, 0, JSON.stringify(factPublish, null, 2));
+  assert.equal(factPublish.z_audits.length, 1, JSON.stringify(factPublish, null, 2));
+  {
+    const dbCheck = new Database(path.join(dataDir, 'memories.db'));
+    assert.equal(dbCheck.prepare('SELECT status FROM memories WHERE id = ?').get('review-fact-conflict-1').status, 'review');
+    assert.equal(dbCheck.prepare("SELECT COUNT(*) AS c FROM z_conflict_audits WHERE fact_key = 'review:publish-guard' AND status = 'pending'").get().c, 1);
+    dbCheck.close();
+  }
 
   const repeatPromotion = await callTool(client, 'promote_memory_candidates', { ids: ['promo-work-1'], dry_run: false });
   assert.equal(repeatPromotion.promoted_count, 0, JSON.stringify(repeatPromotion, null, 2));

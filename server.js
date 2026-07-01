@@ -267,6 +267,8 @@ try { db.exec('CREATE INDEX IF NOT EXISTS idx_memories_status ON memories(status
 try { db.exec('ALTER TABLE memories ADD COLUMN protected INTEGER NOT NULL DEFAULT 0'); } catch {}
 try { db.exec("ALTER TABLE memories ADD COLUMN evidence_raw_ids TEXT NOT NULL DEFAULT '[]'"); } catch {}
 try { db.exec("ALTER TABLE memories ADD COLUMN evidence_chunk_ids TEXT NOT NULL DEFAULT '[]'"); } catch {}
+try { db.exec("ALTER TABLE memories ADD COLUMN reviewed_at TEXT"); } catch {}
+try { db.exec("ALTER TABLE memories ADD COLUMN review_note TEXT NOT NULL DEFAULT ''"); } catch {}
 try { db.exec('CREATE INDEX IF NOT EXISTS idx_memories_protected ON memories(protected)'); } catch {}
 try { db.exec("ALTER TABLE memory_edges ADD COLUMN relation_type TEXT NOT NULL DEFAULT 'semantic'"); } catch {}
 try { db.exec('ALTER TABLE memory_edges ADD COLUMN strength REAL NOT NULL DEFAULT 1.0'); } catch {}
@@ -376,6 +378,8 @@ const fmt = (r) => ({
   status: r.status || 'current',
   active_fact: !!r.active_fact,
   fact_key: r.fact_key || null, superseded_by: r.superseded_by || null,
+  reviewed_at: r.reviewed_at || null,
+  review_note: r.review_note || '',
   created_at: r.created_at, updated_at: r.updated_at, expires_at: r.expires_at || null,
 });
 
@@ -938,6 +942,55 @@ function selectPromotionCandidates({ ids = [], match_status = 'accepted', sugges
   const cappedLimit = Math.max(1, Math.min(100, Number(limit) || 50));
   return db.prepare(`SELECT * FROM memory_candidates WHERE ${where.join(' AND ')} ORDER BY reviewed_at ASC, created_at ASC LIMIT ?`)
     .all(...params, cappedLimit);
+}
+
+function selectReviewMemories({ ids = [], status = 'review', category = '', keyword = '', limit = 50 } = {}) {
+  const cleanIds = [...new Set((ids || []).map(id => String(id || '').trim()).filter(Boolean))];
+  if (cleanIds.length) {
+    const rows = [];
+    const stmt = db.prepare('SELECT * FROM memories WHERE id = ?');
+    for (const id of cleanIds.slice(0, 100)) {
+      const row = stmt.get(id);
+      if (row) rows.push(row);
+    }
+    return rows;
+  }
+
+  const where = ['1=1'];
+  const params = [];
+  if (status !== 'all') { where.push("COALESCE(status, 'current') = ?"); params.push(status); }
+  if (category) { where.push('category = ?'); params.push(category); }
+  if (keyword) { where.push('content LIKE ?'); params.push(`%${keyword}%`); }
+  const cappedLimit = Math.max(1, Math.min(100, Number(limit) || 50));
+  return db.prepare(`SELECT * FROM memories WHERE ${where.join(' AND ')} ORDER BY updated_at DESC, created_at DESC LIMIT ?`)
+    .all(...params, cappedLimit);
+}
+
+function planReviewMemoryAction(memory, action = 'publish') {
+  const formatted = fmt(memory);
+  const skip = (reason, extra = {}) => ({ action: 'skip', reason, memory: formatted, ...extra });
+  if ((memory.status || 'current') !== 'review') return skip('memory status is not review');
+  if (action === 'archive') return { action: 'archive', memory: formatted };
+  if (action !== 'publish') return skip(`unsupported action: ${action}`);
+
+  const factKey = String(memory.fact_key || '').trim();
+  if (factKey) {
+    const conflicts = db.prepare(`
+      SELECT * FROM memories
+      WHERE fact_key = ?
+        AND id != ?
+        AND superseded_by IS NULL
+        AND COALESCE(status, 'current') = 'current'
+        AND (expires_at IS NULL OR expires_at > ?)
+    `).all(factKey, memory.id, new Date().toISOString());
+    if (conflicts.length) {
+      return skip('fact_key conflict requires Z-axis review before publish', {
+        conflict_ids: conflicts.map(m => m.id),
+      });
+    }
+  }
+
+  return { action: 'publish', memory: formatted };
 }
 
 function rawEventDisplaySource(row) {
@@ -3068,6 +3121,156 @@ function createMcpServer() {
   );
 
   mcp.tool(
+    'list_review_memories',
+    'List formal memories waiting in status=review, or archived review outcomes. Read-only.',
+    {
+      status: z.enum(['review', 'archived', 'all']).default('review'),
+      category: z.string().optional().describe('Optional exact category filter'),
+      keyword: z.string().optional().describe('Optional content keyword filter'),
+      limit: z.number().int().min(1).max(100).default(50),
+    },
+    async ({ status = 'review', category = '', keyword = '', limit = 50 }) => {
+      const rows = selectReviewMemories({ status, category, keyword, limit });
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            status,
+            count: rows.length,
+            memories: rows.map(fmt),
+            note: 'Review memories are excluded from default recall/search until published.',
+          }, null, 2),
+        }],
+      };
+    }
+  );
+
+  mcp.tool(
+    'publish_review_memories',
+    'Publish status=review memories into current recall, or archive them. dry_run=true by default. Does not auto-supersede fact_key conflicts.',
+    {
+      ids: z.array(z.string()).min(1).max(100).describe('Review memory ids'),
+      action: z.enum(['publish', 'archive']).default('publish'),
+      dry_run: z.boolean().default(true),
+      review_note: z.string().optional().describe('Human review note saved onto the memory'),
+    },
+    async ({ ids, action = 'publish', dry_run = true, review_note = '' }) => {
+      const rows = selectReviewMemories({ ids });
+      const foundIds = new Set(rows.map(r => r.id));
+      const missing = [...new Set(ids.map(id => String(id || '').trim()).filter(Boolean))].filter(id => !foundIds.has(id));
+      const plans = rows.map(row => planReviewMemoryAction(row, action));
+      const actionable = plans.filter(p => p.action === 'publish' || p.action === 'archive');
+      const skipped = plans.filter(p => p.action === 'skip');
+
+      if (dry_run) {
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              dry_run: true,
+              action,
+              matched_count: rows.length,
+              actionable_count: actionable.length,
+              skipped_count: skipped.length + missing.length,
+              plans: actionable.map(p => ({
+                memory_id: p.memory.id,
+                action: p.action,
+                category: p.memory.category,
+                fact_key: p.memory.fact_key,
+                evidence_raw_ids: p.memory.evidence_raw_ids,
+                evidence_chunk_ids: p.memory.evidence_chunk_ids,
+                content: truncateText(p.memory.content, 220),
+              })),
+              skips: [
+                ...skipped.map(p => ({ memory_id: p.memory.id, reason: p.reason, conflict_ids: p.conflict_ids || [] })),
+                ...missing.map(id => ({ memory_id: id, reason: 'memory not found' })),
+              ],
+              note: 'dry_run=true: no memory statuses were changed.',
+            }, null, 2),
+          }],
+        };
+      }
+
+      const now = new Date().toISOString();
+      const published = [];
+      const archived = [];
+      const zAudits = [];
+      const applySkips = missing.map(id => ({ memory_id: id, reason: 'memory not found' }));
+      db.exec('BEGIN IMMEDIATE');
+      try {
+        for (const row of rows) {
+          const fresh = db.prepare('SELECT * FROM memories WHERE id = ?').get(row.id);
+          if (!fresh) {
+            applySkips.push({ memory_id: row.id, reason: 'memory disappeared before apply' });
+            continue;
+          }
+          const plan = planReviewMemoryAction(fresh, action);
+          if (plan.action === 'skip') {
+            let auditId = null;
+            if (String(plan.reason || '').includes('fact_key conflict') && fresh.fact_key) {
+              auditId = createZAudit({
+                fact_key: fresh.fact_key,
+                current_id: fresh.id,
+                protected_ids: plan.conflict_ids || [],
+                reason: 'review memory publish blocked by existing current fact_key',
+              });
+              zAudits.push({ memory_id: fresh.id, audit_id: auditId, conflict_ids: plan.conflict_ids || [] });
+            }
+            applySkips.push({ memory_id: fresh.id, reason: plan.reason, conflict_ids: plan.conflict_ids || [], audit_id: auditId });
+            continue;
+          }
+
+          if (plan.action === 'archive') {
+            const r = db.prepare(`
+              UPDATE memories
+              SET status='archived', active_fact=0, reviewed_at=?, review_note=?, updated_at=?
+              WHERE id=? AND COALESCE(status, 'current')='review'
+            `).run(now, review_note || '', now, fresh.id);
+            if (r.changes) archived.push(fresh.id);
+            else applySkips.push({ memory_id: fresh.id, reason: 'memory status changed before archive' });
+            continue;
+          }
+
+          const expiresAt = fresh.pinned ? null : expiryFor(fresh.category);
+          const activeFact = factActiveValue(fresh.fact_key, 'current', fresh.superseded_by);
+          const r = db.prepare(`
+            UPDATE memories
+            SET status='current', active_fact=?, expires_at=?, reviewed_at=?, review_note=?, updated_at=?
+            WHERE id=? AND COALESCE(status, 'current')='review'
+          `).run(activeFact, expiresAt, now, review_note || '', now, fresh.id);
+          if (r.changes) published.push(fresh.id);
+          else applySkips.push({ memory_id: fresh.id, reason: 'memory status changed before publish' });
+        }
+        db.exec('COMMIT');
+      } catch (err) {
+        db.exec('ROLLBACK');
+        throw err;
+      }
+
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            dry_run: false,
+            action,
+            matched_count: rows.length,
+            published_count: published.length,
+            archived_count: archived.length,
+            skipped_count: applySkips.length,
+            published_ids: published,
+            archived_ids: archived,
+            skips: applySkips,
+            z_audits: zAudits,
+            note: action === 'publish'
+              ? 'Published review memories are now status=current and can appear in normal recall.'
+              : 'Archived review memories remain stored but are excluded from normal recall.',
+          }, null, 2),
+        }],
+      };
+    }
+  );
+
+  mcp.tool(
     'somatic_ignite',
     'Shared somatic state: record a short-lived body sensation trigger for ke. Caller must parse text and pass labels; this server stores/decays state only and does not write ordinary memories.',
     {
@@ -4003,8 +4206,8 @@ async function autoRestore() {
       if (!exists) {
         const status = ['current', 'review', 'historical', 'archived', 'deleted'].includes(m.status) ? m.status : (m.superseded_by ? 'historical' : 'current');
         const activeFact = m.fact_key && status === 'current' && !m.superseded_by ? 1 : 0;
-        db.prepare('INSERT INTO memories (id,content,category,tags,source,mood,created_at,updated_at,expires_at,pinned,content_hash,activation_score,fact_key,superseded_by,protected,evidence_raw_ids,evidence_chunk_ids,status,active_fact) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)')
-          .run(m.id, m.content, m.category, JSON.stringify(m.tags || []), m.source || '', m.mood, m.created_at, m.updated_at, m.expires_at || null, m.pinned ? 1 : 0, m.content_hash || contentHash(m.content, m.category), Number(m.activation_score || 0), m.fact_key || null, m.superseded_by || null, resolveProtectedFlag(m.category, m.protected, 0), JSON.stringify(m.evidence_raw_ids || []), JSON.stringify(m.evidence_chunk_ids || []), status, Number(m.active_fact ?? activeFact));
+        db.prepare('INSERT INTO memories (id,content,category,tags,source,mood,created_at,updated_at,expires_at,pinned,content_hash,activation_score,fact_key,superseded_by,protected,evidence_raw_ids,evidence_chunk_ids,status,active_fact,reviewed_at,review_note) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)')
+          .run(m.id, m.content, m.category, JSON.stringify(m.tags || []), m.source || '', m.mood, m.created_at, m.updated_at, m.expires_at || null, m.pinned ? 1 : 0, m.content_hash || contentHash(m.content, m.category), Number(m.activation_score || 0), m.fact_key || null, m.superseded_by || null, resolveProtectedFlag(m.category, m.protected, 0), JSON.stringify(m.evidence_raw_ids || []), JSON.stringify(m.evidence_chunk_ids || []), status, Number(m.active_fact ?? activeFact), m.reviewed_at || null, m.review_note || '');
         restored++;
       }
     }
