@@ -3738,7 +3738,7 @@ async function runBackup() {
     await backupJsonl(CHUNK_EVENTS_BACKUP_PATH, db.prepare('SELECT * FROM chunk_events ORDER BY chunk_id, position').all(), 'chunk events');
     await backupJsonl(CONSOLIDATION_RUNS_BACKUP_PATH, db.prepare('SELECT * FROM consolidation_runs ORDER BY created_at DESC').all(), 'consolidation runs');
     await backupJsonl(Z_AUDITS_BACKUP_PATH, db.prepare('SELECT * FROM z_conflict_audits ORDER BY created_at DESC').all().map(fmtZAudit), 'z audits');
-    await backupJsonl(E_AXIS_BACKUP_PATH, db.prepare('SELECT * FROM e_axis_scores ORDER BY created_at DESC').all().map(fmtEAxisScore), 'e-axis scores');
+    await backupJsonl(E_AXIS_BACKUP_PATH, db.prepare('SELECT * FROM e_axis_scores ORDER BY updated_at DESC').all().map(fmtEAxisScore), 'e-axis scores');
     await backupJsonl(PATROL_REPORTS_BACKUP_PATH, db.prepare('SELECT * FROM memory_patrol_reports ORDER BY created_at DESC').all(), 'patrol reports');
 
     console.log(`[backup] ${rows.length} memories, ${edgeRows.length} edges, ${rawRows.length} raw events (${BACKUP_INCLUDE_INTIMATE ? 'including' : 'excluding'} intimate), ${candidateRows.length} memory candidates, ${hookRows.length} somatic hooks, and ${chunkRows.length} event chunks backed up to GitHub`);
