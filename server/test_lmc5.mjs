@@ -65,6 +65,7 @@ try {
     'recall_lmc',
     'run_memory_patrol',
     'list_memory_patrol_reports',
+    'batch_review_memory_candidates_by_filter',
   ]) {
     assert.ok(toolNames.includes(name), `missing MCP tool: ${name}`);
   }
@@ -281,6 +282,36 @@ try {
     limit: 1,
   });
   assert.ok(starvationCandidates.candidates.some(c => c.raw_event_ids.includes(starvedOld.id)), JSON.stringify(starvationCandidates, null, 2));
+
+  const batchPreview = await callTool(client, 'batch_review_memory_candidates_by_filter', {
+    dry_run: true,
+    match_status: 'pending',
+    target_status: 'rejected',
+    source: 'starvation-test',
+    channel: 'normal',
+    limit: 2,
+  });
+  assert.equal(batchPreview.matched_count, 2, JSON.stringify(batchPreview, null, 2));
+  assert.equal(batchPreview.updated_count, 0, JSON.stringify(batchPreview, null, 2));
+  const batchUpdate = await callTool(client, 'batch_review_memory_candidates_by_filter', {
+    dry_run: false,
+    match_status: 'pending',
+    target_status: 'rejected',
+    source: 'starvation-test',
+    channel: 'normal',
+    limit: 2,
+    review_note: 'local filter batch test',
+  });
+  assert.equal(batchUpdate.updated_count, 2, JSON.stringify(batchUpdate, null, 2));
+  const rejectedPreview = await callTool(client, 'batch_review_memory_candidates_by_filter', {
+    dry_run: true,
+    match_status: 'rejected',
+    target_status: 'pending',
+    source: 'starvation-test',
+    channel: 'normal',
+    limit: 10,
+  });
+  assert.ok(rejectedPreview.matched_count >= 2, JSON.stringify(rejectedPreview, null, 2));
 
   const gapOne = await callTool(client, 'log_raw_event', {
     session_id: 'lmc-gap-test',

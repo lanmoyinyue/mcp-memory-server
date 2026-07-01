@@ -2711,6 +2711,70 @@ function createMcpServer() {
     }
   );
 
+  // 20. batch_review_memory_candidates_by_filter — dry-run first batch review
+  mcp.tool(
+    'batch_review_memory_candidates_by_filter',
+    'Preview or batch-review memory candidates by filters. Does not write formal memories. dry_run=true by default.',
+    {
+      match_status: z.enum(['pending', 'accepted', 'rejected', 'merged', 'stale']).default('pending').describe('Only candidates currently in this status are matched'),
+      target_status: z.enum(['pending', 'accepted', 'rejected', 'merged', 'stale']).describe('New status to apply when dry_run=false'),
+      suggested_category: z.string().optional().describe('Optional exact suggested_category filter, e.g. private_candidate'),
+      source: z.string().optional().describe('Optional exact source filter, e.g. telegram'),
+      channel: z.enum(['cc', 'daily', 'intimate', 'private', 'group', 'normal', 'all']).default('all').describe('Optional channel filter'),
+      candidate_type: z.string().optional().describe('Optional exact candidate_type filter'),
+      created_before: z.string().optional().describe('Optional ISO timestamp upper bound'),
+      created_after: z.string().optional().describe('Optional ISO timestamp lower bound'),
+      limit: z.number().int().min(1).max(200).default(100),
+      dry_run: z.boolean().default(true),
+      review_note: z.string().optional().describe('Optional review note applied when dry_run=false'),
+    },
+    async ({ match_status = 'pending', target_status, suggested_category = '', source = '', channel = 'all', candidate_type = '', created_before = '', created_after = '', limit = 100, dry_run = true, review_note = '' }) => {
+      if (!VALID_CANDIDATE_STATUS.has(match_status) || !VALID_CANDIDATE_STATUS.has(target_status)) {
+        return { content: [{ type: 'text', text: JSON.stringify({ error: 'invalid status' }, null, 2) }] };
+      }
+      const where = ['status = ?'];
+      const params = [match_status];
+      if (suggested_category) { where.push('suggested_category = ?'); params.push(suggested_category); }
+      if (source) { where.push('source = ?'); params.push(source); }
+      if (channel !== 'all') { where.push('channel = ?'); params.push(channel); }
+      if (candidate_type) { where.push('candidate_type = ?'); params.push(candidate_type); }
+      if (created_before) { where.push('created_at < ?'); params.push(created_before); }
+      if (created_after) { where.push('created_at > ?'); params.push(created_after); }
+      const cappedLimit = Math.max(1, Math.min(200, Number(limit) || 100));
+      const rows = db.prepare(`SELECT * FROM memory_candidates WHERE ${where.join(' AND ')} ORDER BY created_at DESC LIMIT ?`)
+        .all(...params, cappedLimit);
+      const ids = rows.map(r => r.id);
+      if (!dry_run && ids.length) {
+        const now = new Date().toISOString();
+        const reviewedAt = target_status === 'pending' ? null : now;
+        const update = db.prepare('UPDATE memory_candidates SET status=?, review_note=?, reviewed_at=?, updated_at=? WHERE id=?');
+        db.exec('BEGIN IMMEDIATE');
+        try {
+          for (const id of ids) update.run(target_status, review_note || null, reviewedAt, now, id);
+          db.exec('COMMIT');
+        } catch (err) {
+          db.exec('ROLLBACK');
+          throw err;
+        }
+      }
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            dry_run,
+            matched_count: rows.length,
+            updated_count: dry_run ? 0 : ids.length,
+            matched_ids: ids,
+            target_status,
+            filters: { match_status, suggested_category, source, channel, candidate_type, created_before, created_after, limit: cappedLimit },
+            candidates: rows.slice(0, 20).map(fmtMemoryCandidate),
+            note: dry_run ? 'dry_run=true: no candidate status was changed.' : 'Candidate statuses updated; memories were not written.',
+          }, null, 2),
+        }],
+      };
+    }
+  );
+
   // 20. somatic_ignite — shared short-lived body-state trigger
   mcp.tool(
     'somatic_ignite',
