@@ -1384,6 +1384,99 @@ function relationIsSafe(type, status = 'safe') {
   return status === 'safe' && SAFE_RELATION_TYPES.has(t) && !REVIEW_RELATION_TYPES.has(t);
 }
 
+function relationHintTargetId(hint = {}) {
+  return String(
+    hint.target_id
+    || hint.target_memory_id
+    || hint.memory_id
+    || hint.id
+    || ''
+  ).trim();
+}
+
+function relationHintDirection(hint = {}) {
+  return String(hint.direction || hint.dir || 'outgoing').trim().toLowerCase();
+}
+
+function relationHintStrength(hint = {}) {
+  const n = Number(hint.strength ?? hint.weight ?? 0.65);
+  if (!Number.isFinite(n)) return 0.65;
+  return Math.max(0, Math.min(1, n));
+}
+
+function planCandidateRelationHints(plan) {
+  const safe = [];
+  const review = [];
+  const skipped = [];
+  const candidateId = plan?.candidate?.id || '';
+  const memoryId = plan?.memory?.id || '';
+  const hints = Array.isArray(plan?.candidate?.relation_hints) ? plan.candidate.relation_hints : [];
+
+  for (const hint of hints) {
+    if (!hint || typeof hint !== 'object') {
+      skipped.push({ candidate_id: candidateId, reason: 'relation hint is not an object' });
+      continue;
+    }
+    const targetId = relationHintTargetId(hint);
+    if (!targetId) {
+      skipped.push({ candidate_id: candidateId, reason: 'relation hint missing target_id' });
+      continue;
+    }
+    if (targetId === memoryId) {
+      skipped.push({ candidate_id: candidateId, target_id: targetId, reason: 'self-loop refused' });
+      continue;
+    }
+
+    const target = db.prepare('SELECT id, status, superseded_by, expires_at FROM memories WHERE id = ?').get(targetId);
+    if (!target) {
+      skipped.push({ candidate_id: candidateId, target_id: targetId, reason: 'target memory not found' });
+      continue;
+    }
+
+    const now = new Date().toISOString();
+    const targetLive = (target.status || 'current') === 'current'
+      && !target.superseded_by
+      && (!target.expires_at || target.expires_at > now);
+    const relationType = normalizeRelationType(hint.relation_type || hint.type || hint.relation || 'semantic');
+    const requestedStatus = String(hint.status || '').trim();
+    const edgeStatus = REVIEW_RELATION_TYPES.has(relationType)
+      ? 'review'
+      : (relationIsSafe(relationType, requestedStatus || 'safe') && targetLive ? 'safe' : 'review');
+    const direction = relationHintDirection(hint);
+    const incoming = ['incoming', 'reverse', 'target_to_memory', 'to_candidate'].includes(direction);
+    const relationPlan = {
+      candidate_id: candidateId,
+      source_id: incoming ? targetId : memoryId,
+      target_id: incoming ? memoryId : targetId,
+      relation_type: relationType,
+      strength: relationHintStrength(hint),
+      status: edgeStatus,
+      reason: String(hint.reason || hint.note || `candidate:${candidateId}`).slice(0, 500),
+    };
+    if (relationPlan.source_id === relationPlan.target_id) {
+      skipped.push({ candidate_id: candidateId, target_id: targetId, reason: 'self-loop refused' });
+      continue;
+    }
+    if (edgeStatus === 'safe') safe.push(relationPlan);
+    else review.push(relationPlan);
+  }
+  return { safe, review, skipped };
+}
+
+function insertMemoryRelationPlan(edge, now = new Date().toISOString()) {
+  db.prepare(`
+    INSERT INTO memory_edges (source_id,target_id,weight,created_at,relation_type,strength,status,reason,updated_at)
+    VALUES (?,?,?,?,?,?,?,?,?)
+    ON CONFLICT(source_id,target_id) DO UPDATE SET
+      weight=excluded.weight,
+      relation_type=excluded.relation_type,
+      strength=excluded.strength,
+      status=excluded.status,
+      reason=excluded.reason,
+      updated_at=excluded.updated_at
+  `).run(edge.source_id, edge.target_id, edge.strength, now, edge.relation_type, edge.strength, edge.status, edge.reason || '', now);
+}
+
 function ensureSomaticTarget(target = SOMATIC_TARGET) {
   const normalized = String(target || SOMATIC_TARGET).trim();
   if (normalized !== SOMATIC_TARGET) {
@@ -2986,7 +3079,7 @@ function createMcpServer() {
   // 21. promote_memory_candidates — accepted candidates -> review memories
   mcp.tool(
     'promote_memory_candidates',
-    'Promote accepted non-private memory_candidates into formal memories with status=review. Conservative v1: dry_run=true by default, private candidates are skipped, no relation edges are written.',
+    'Promote accepted non-private memory_candidates into formal memories with status=review. dry_run=true by default. Safe relation_hints are written; risky relation_hints are queued as review edges.',
     {
       ids: z.array(z.string()).optional().describe('Optional exact candidate ids. If present, filters are ignored.'),
       match_status: z.enum(['accepted']).default('accepted').describe('Only accepted candidates can be promoted in v1.'),
@@ -3004,6 +3097,7 @@ function createMcpServer() {
       const skipPlans = plans.filter(p => p.action !== 'promote');
 
       if (dry_run) {
+        const relationPlans = promotePlans.map(plan => planCandidateRelationHints(plan));
         return {
           content: [{
             type: 'text',
@@ -3024,9 +3118,13 @@ function createMcpServer() {
                   evidence_chunk_ids: p.memory.evidence_chunk_ids,
                   content: truncateText(p.memory.content, 220),
                 },
+                relation_preview: planCandidateRelationHints(p),
               })),
+              would_write_relations: relationPlans.reduce((n, p) => n + p.safe.length, 0),
+              would_queue_review_relations: relationPlans.reduce((n, p) => n + p.review.length, 0),
+              relation_skips: relationPlans.flatMap(p => p.skipped),
               skips: skipPlans.map(p => ({ candidate_id: p.candidate.id, action: 'skip', reason: p.reason })),
-              note: 'dry_run=true: no memories or candidate statuses were changed. v1 skips private_candidate and writes no relations.',
+              note: 'dry_run=true: no memories, relation edges, or candidate statuses were changed. private_candidate is still skipped.',
             }, null, 2),
           }],
         };
@@ -3040,6 +3138,9 @@ function createMcpServer() {
       const promoted = [];
       const linkedExisting = [];
       const skipped = [];
+      const relationsWritten = [];
+      const reviewRelationsQueued = [];
+      const relationSkips = [];
       db.exec('BEGIN IMMEDIATE');
       try {
         for (const original of rows) {
@@ -3103,7 +3204,23 @@ function createMcpServer() {
             'review',
             0
           );
-          promoted.push({ candidate_id: current.id, memory_id: memory.id, category: memory.category });
+          const relationPlan = planCandidateRelationHints(plan);
+          for (const edge of relationPlan.safe) {
+            insertMemoryRelationPlan(edge, now);
+            relationsWritten.push(edge);
+          }
+          for (const edge of relationPlan.review) {
+            insertMemoryRelationPlan(edge, now);
+            reviewRelationsQueued.push(edge);
+          }
+          relationSkips.push(...relationPlan.skipped);
+          promoted.push({
+            candidate_id: current.id,
+            memory_id: memory.id,
+            category: memory.category,
+            relations_written: relationPlan.safe.length,
+            review_relations_queued: relationPlan.review.length,
+          });
         }
         db.exec('COMMIT');
       } catch (err) {
@@ -3125,9 +3242,10 @@ function createMcpServer() {
             promoted,
             linked_existing: linkedExisting,
             skips: skipped,
-            relations_written: 0,
-            review_relations_queued: 0,
-            note: 'Promoted candidates were written as status=review. v1 writes no relation edges and skips private candidates.',
+            relations_written: relationsWritten.length,
+            review_relations_queued: reviewRelationsQueued.length,
+            relation_skips: relationSkips,
+            note: 'Promoted candidates were written as status=review. Safe relation_hints were written; review relation_hints are stored but excluded from default graph recall. Private candidates are skipped.',
           }, null, 2),
         }],
       };

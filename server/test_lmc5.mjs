@@ -326,8 +326,8 @@ try {
   assert.ok(promoChunk?.chunk_id, 'promotion test needs a chunk evidence id');
   const insertCandidate = promoDb.prepare(`
     INSERT INTO memory_candidates
-      (id,raw_event_ids,source_chunk_ids,dedupe_key,source,channel,speaker,summary,suggested_category,candidate_type,reason,confidence,importance,suggested_tags,evidence_preview,status,created_at,updated_at,reviewed_at,review_note,expires_at)
-    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+      (id,raw_event_ids,source_chunk_ids,dedupe_key,source,channel,speaker,summary,suggested_category,candidate_type,reason,confidence,importance,suggested_tags,evidence_preview,relation_hints,status,created_at,updated_at,reviewed_at,review_note,expires_at)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
   `);
   const promoNow = new Date().toISOString();
   const promoSummary = 'candidate promotion durable work summary unique alpha';
@@ -347,6 +347,10 @@ try {
     0.8,
     JSON.stringify(['work']),
     'preview',
+    JSON.stringify([
+      { target_id: protectedFact.saved.id, relation_type: 'same_project', strength: 0.8, reason: 'safe relation hint test' },
+      { target_id: factV2.saved.id, relation_type: 'emotional_link', strength: 0.6, reason: 'review relation hint test' },
+    ]),
     'accepted',
     promoNow,
     promoNow,
@@ -359,6 +363,8 @@ try {
   const promoteDry = await callTool(client, 'promote_memory_candidates', { ids: ['promo-work-1'], dry_run: true });
   assert.equal(promoteDry.would_promote_count, 1, JSON.stringify(promoteDry, null, 2));
   assert.equal(promoteDry.would_skip_count, 0, JSON.stringify(promoteDry, null, 2));
+  assert.equal(promoteDry.would_write_relations, 1, JSON.stringify(promoteDry, null, 2));
+  assert.equal(promoteDry.would_queue_review_relations, 1, JSON.stringify(promoteDry, null, 2));
   {
     const dbCheck = new Database(path.join(dataDir, 'memories.db'));
     assert.equal(dbCheck.prepare('SELECT COUNT(*) AS c FROM memories WHERE content = ?').get(promoSummary).c, 0);
@@ -368,7 +374,8 @@ try {
 
   const promoteApply = await callTool(client, 'promote_memory_candidates', { ids: ['promo-work-1'], dry_run: false });
   assert.equal(promoteApply.promoted_count, 1, JSON.stringify(promoteApply, null, 2));
-  assert.equal(promoteApply.relations_written, 0, JSON.stringify(promoteApply, null, 2));
+  assert.equal(promoteApply.relations_written, 1, JSON.stringify(promoteApply, null, 2));
+  assert.equal(promoteApply.review_relations_queued, 1, JSON.stringify(promoteApply, null, 2));
   const promotedId = promoteApply.created_memory_ids[0];
   {
     const dbCheck = new Database(path.join(dataDir, 'memories.db'));
@@ -382,6 +389,12 @@ try {
     assert.equal(cand.status, 'merged');
     assert.equal(cand.promoted_memory_id, promotedId);
     assert.ok(cand.promoted_at);
+    const safeEdge = dbCheck.prepare('SELECT * FROM memory_edges WHERE source_id = ? AND target_id = ?').get(promotedId, protectedFact.saved.id);
+    assert.equal(safeEdge.status, 'safe');
+    assert.equal(safeEdge.relation_type, 'same_project');
+    const reviewEdge = dbCheck.prepare('SELECT * FROM memory_edges WHERE source_id = ? AND target_id = ?').get(promotedId, factV2.saved.id);
+    assert.equal(reviewEdge.status, 'review');
+    assert.equal(reviewEdge.relation_type, 'emotional_link');
     dbCheck.close();
   }
 
