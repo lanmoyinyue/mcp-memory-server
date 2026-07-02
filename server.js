@@ -1004,6 +1004,19 @@ function truncateText(text, max = 180) {
   return clean.length > max ? `${clean.slice(0, max - 1)}…` : clean;
 }
 
+// 工作类判定分两档：strong 词单独出现即算工作；weak 词太容易出现在闲聊里
+// （"测试一下新衣服"曾被误判成 work），需要命中两个或与 strong 词同现。
+// ASCII 词加边界，避免 git/api 匹配进别的单词。
+const WORK_STRONG_RE = /部署|架构|记忆库|服务器|数据库|前端|后端|脚本|代码|排错|报错|raw_events|(?<![a-z0-9])(mcp|vps|zeabur|github|commit)(?![a-z0-9])/i;
+const WORK_WEAK_RE = /项目|方案|审核|上线|重启|同步|测试|推送|修复|候选|(?<![a-z0-9])(git|api|bug)(?![a-z0-9])/gi;
+
+function looksLikeWorkText(text) {
+  const s = String(text || '');
+  if (WORK_STRONG_RE.test(s)) return true;
+  const weakHits = s.match(WORK_WEAK_RE);
+  return !!weakHits && weakHits.length >= 2;
+}
+
 function classifyRawEvent(row) {
   const text = String(row.content || '');
   const lower = text.toLowerCase();
@@ -1020,7 +1033,7 @@ function classifyRawEvent(row) {
   if (/待办|下一步|接下来|TODO|todo|要做|之后做/.test(text)) {
     return { category: 'todo_candidate', reason: '包含后续行动或待办线索。', confidence: 0.78 };
   }
-  if (/项目|方案|审核|部署|上线|重启|同步|架构|记忆库|raw_events|候选|mcp|git|github|vps|zeabur|api|bug|修|测试|推送|commit/i.test(lower)) {
+  if (looksLikeWorkText(text)) {
     return { category: 'work', reason: '包含项目、部署、架构、测试或排错信息。', confidence: 0.76 };
   }
   if (/喜欢|偏好|我会|我不|我只|我想|我需要/.test(text)) {
@@ -1136,7 +1149,8 @@ function isTrivialSingletonChunk(events) {
   if (!Array.isArray(events) || events.length !== 1) return false;
   const text = String(events[0].content || '').trim();
   if (!text) return true;
-  if (/记住|别忘|必须|只能|不要|不许|边界|权限|部署|上线|重启|同步|架构|记忆库|mcp|vps|zeabur|github|commit|bug|测试|审核/i.test(text)) return false;
+  if (/记住|别忘|必须|只能|不要|不许|边界|权限/.test(text)) return false;
+  if (looksLikeWorkText(text)) return false;
   return charLength(text) < 12;
 }
 
@@ -1165,7 +1179,7 @@ function classifyChunk(chunk, events = []) {
   const text = `${chunk.summary || ''}\n${events.map(e => e.content).join('\n')}`;
   const privateLike = ['private', 'intimate'].includes(chunk.channel);
   if (privateLike) return { category: 'private_candidate', type: 'private_candidate', reason: '私密片段，只生成元数据候选。', confidence: 0.74, importance: 0.62, tags: ['私密候选'] };
-  if (/部署|上线|重启|同步|架构|记忆库|mcp|vps|zeabur|github|commit|bug|测试|审核/i.test(text)) {
+  if (looksLikeWorkText(text)) {
     return { category: 'work', type: 'work', reason: '片段包含项目、部署、排错或审核。', confidence: 0.78, importance: 0.7, tags: ['工作候选'] };
   }
   if (/边界|权限|不能|不要|不许|只能|必须|严格|越权/.test(text)) {
