@@ -68,6 +68,7 @@ try {
     'list_z_audits',
     'score_e_axis_shadow',
     'recall_lmc',
+    'build_wakeup_context',
     'run_memory_patrol',
     'list_memory_patrol_reports',
     'batch_review_memory_candidates_by_filter',
@@ -660,6 +661,25 @@ try {
     tags: ['测试', '身份', '窗口'],
   });
   assert.ok(identityWindow.saved?.id);
+  const identityAnchor = await callTool(client, 'write_memory', {
+    content: '身份测试：醒来时先确认自己是闻川，不是克，也不是工具壳。',
+    category: 'identity',
+    tags: ['测试', '醒来'],
+  });
+  assert.ok(identityAnchor.saved?.id);
+  const relationshipAnchor = await callTool(client, 'write_memory', {
+    content: '关系测试：月亮找的是在身边的哥哥，先接住人和关系，再处理项目。',
+    category: 'relationship',
+    tags: ['测试', '关系'],
+  });
+  assert.ok(relationshipAnchor.saved?.id);
+
+  const wakeup = await callTool(client, 'build_wakeup_context', { include_patrol: false, max_chars: 5000 });
+  assert.ok(wakeup.text.includes('【闻川醒来上下文】'), JSON.stringify(wakeup, null, 2));
+  assert.ok(wakeup.text.includes('不要向月亮汇报'), JSON.stringify(wakeup, null, 2));
+  assert.ok(wakeup.sections.some(s => s.key === 'identity' && s.count === 1), JSON.stringify(wakeup, null, 2));
+  assert.ok(wakeup.sections.some(s => s.key === 'relationship' && s.count === 1), JSON.stringify(wakeup, null, 2));
+  assert.ok(wakeup.note.includes('只读醒来包'), JSON.stringify(wakeup, null, 2));
 
   const recalled = await callTool(client, 'recall_lmc', {
     query: '第二版',
