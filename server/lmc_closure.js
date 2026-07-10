@@ -368,10 +368,12 @@ export function createLmcClosureService({ db, dataDir, dbPath }) {
 
   function buildSafeRelations({ since_hours = 168, limit = 200, dry_run = true } = {}) {
     const since = new Date(Date.now() - clamp(since_hours, 1, 8760) * 3600000).toISOString();
+    const now = nowIso();
     const rows = db.prepare(`
       SELECT * FROM memories WHERE deleted_at IS NULL AND superseded_by IS NULL
-      AND COALESCE(status,'current')='current' AND created_at>=? ORDER BY created_at DESC LIMIT ?
-    `).all(since, clamp(limit, 1, 1000));
+      AND COALESCE(status,'current')='current' AND (expires_at IS NULL OR expires_at>?)
+      AND created_at>=? ORDER BY created_at DESC LIMIT ?
+    `).all(now, since, clamp(limit, 1, 1000));
     const plans = [];
     for (let i = 0; i < rows.length; i += 1) {
       const source = rows[i];
@@ -418,7 +420,9 @@ export function createLmcClosureService({ db, dataDir, dbPath }) {
 
   function addRelation({ source_id, target_id, relation = 'same_topic', weight = 0.5, reason = '', dry_run = true } = {}) {
     if (!source_id || !target_id || source_id === target_id) return { error: 'invalid_endpoints' };
-    const endpoints = db.prepare('SELECT id FROM memories WHERE id IN (?,?) AND deleted_at IS NULL').all(source_id, target_id);
+    const endpoints = db.prepare(`SELECT id FROM memories WHERE id IN (?,?) AND deleted_at IS NULL
+      AND superseded_by IS NULL AND COALESCE(status,'current')='current'
+      AND (expires_at IS NULL OR expires_at>?)`).all(source_id, target_id, nowIso());
     if (endpoints.length !== 2) return { error: 'missing_or_deleted_endpoint' };
     const safeTypes = new Set(['same_topic', 'same_event', 'temporal_sequence', 'derived_from', 'same_project', 'semantic']);
     const reviewTypes = new Set(['supports', 'contradicts', 'cause_effect', 'relationship_moment', 'emotional_link']);

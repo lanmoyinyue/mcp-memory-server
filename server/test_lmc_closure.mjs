@@ -86,8 +86,14 @@ try {
     .run('m3', '只有日期型标签的内容一', 'diary', '["第78天"]', ts, ts);
   db.prepare('INSERT INTO memories (id,content,category,tags,created_at,updated_at) VALUES (?,?,?,?,?,?)')
     .run('m4', '只有日期型标签的内容二', 'diary', '["第78天"]', ts, ts);
+  db.prepare('INSERT INTO memories (id,content,category,tags,created_at,updated_at,expires_at,protected) VALUES (?,?,?,?,?,?,?,?)')
+    .run('m5', '已经过期但受保护的短期锚点', 'anchor', '["共同主题"]', ts, ts, '2020-01-01T00:00:00.000Z', 1);
+  db.prepare('INSERT INTO memories (id,content,category,tags,created_at,updated_at) VALUES (?,?,?,?,?,?)')
+    .run('m6', '不能和过期锚点自动建边', 'deep', '["共同主题"]', ts, ts);
   const noBroadCategoryEdges = service.buildSafeRelations({ since_hours: 24, limit: 20, dry_run: true });
   assert.equal(noBroadCategoryEdges.planned_count, 0, JSON.stringify(noBroadCategoryEdges, null, 2));
+  const expiredEndpoint = service.addRelation({ source_id: 'm5', target_id: 'm6', relation: 'same_topic', dry_run: true });
+  assert.equal(expiredEndpoint.error, 'missing_or_deleted_endpoint');
 
   const snapshot = service.createSnapshot({ reason: 'restore test', dry_run: false });
   assert.ok(fs.existsSync(snapshot.snapshot_path));
