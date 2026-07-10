@@ -377,6 +377,8 @@ export function createLmcClosureService({ db, dataDir, dbPath }) {
       const source = rows[i];
       const sourceTags = new Set(safeJsonArray(source.tags).filter((tag) => String(tag).length >= 2 && !/^(测试|日常|记录|记忆)$/.test(String(tag))));
       const sourceEvidence = new Set([...safeJsonArray(source.evidence_raw_ids), ...safeJsonArray(source.evidence_chunk_ids)]);
+      let temporalAdded = false;
+      let sourcePlanCount = 0;
       for (let j = i + 1; j < Math.min(rows.length, i + 25); j += 1) {
         const target = rows[j];
         if (source.id === target.id) continue;
@@ -384,7 +386,7 @@ export function createLmcClosureService({ db, dataDir, dbPath }) {
         const sharedEvidence = [...safeJsonArray(target.evidence_raw_ids), ...safeJsonArray(target.evidence_chunk_ids)].filter((id) => sourceEvidence.has(id));
         const sameProject = source.source && target.source && source.source === target.source && categoryThread(source.category) === 'engineering';
         const timeGapHours = Math.abs(new Date(source.created_at) - new Date(target.created_at)) / 3600000;
-        const temporalSequence = source.source && source.source === target.source && categoryThread(source.category) === categoryThread(target.category) && timeGapHours <= 6;
+        const temporalSequence = !temporalAdded && source.source && source.source === target.source && categoryThread(source.category) === categoryThread(target.category) && timeGapHours <= 6;
         if (!sharedEvidence.length && !sharedTags.length && !sameProject && !temporalSequence) continue;
         const relation = sharedEvidence.length ? 'same_event' : sameProject ? 'same_project' : temporalSequence ? 'temporal_sequence' : 'same_topic';
         const weight = clamp(0.45 + sharedTags.length * 0.1 + sharedEvidence.length * 0.2 + (sameProject ? 0.15 : 0) + (temporalSequence ? 0.1 : 0), 0.45, 0.95);
@@ -394,6 +396,9 @@ export function createLmcClosureService({ db, dataDir, dbPath }) {
         const exists = db.prepare('SELECT 1 FROM memory_edges WHERE source_id=? AND target_id=?').get(sourceId, targetId);
         if (exists) continue;
         plans.push({ source_id: sourceId, target_id: targetId, relation_type: relation, strength: weight, status: 'safe', reason: sharedEvidence.length ? `shared evidence: ${sharedEvidence.length}` : sameProject ? 'same source project' : temporalSequence ? `same source within ${timeGapHours.toFixed(1)}h` : `shared tags: ${sharedTags.join(',')}` });
+        if (relation === 'temporal_sequence') temporalAdded = true;
+        sourcePlanCount += 1;
+        if (sourcePlanCount >= 4) break;
         if (plans.length >= clamp(limit, 1, 1000)) break;
       }
       if (plans.length >= clamp(limit, 1, 1000)) break;
@@ -573,7 +578,8 @@ export function createLmcClosureService({ db, dataDir, dbPath }) {
       chunks.push({
         id: crypto.randomUUID(), dedupe_key: hash(ids.sort().join('\0')), source: current[0].source || '', channel: current[0].channel || '', session_id: current[0].session_id || '',
         start_event_id: current[0].id, end_event_id: current.at(-1).id, start_time: current[0].timestamp, end_time: current.at(-1).timestamp,
-        event_count: current.length, summary: privateChunk ? `${current[0].speaker || '月亮'}在${current[0].source || '私密入口'}留下了${current.length}条私密消息（${current[0].timestamp}）` : current.map((row) => truncate(row.content, 80)).join(' / ').slice(0, 600),
+        event_count: current.length, raw_event_ids: ids,
+        summary: privateChunk ? `${current[0].speaker || '月亮'}在${current[0].source || '私密入口'}留下了${current.length}条私密消息（${current[0].timestamp}）` : current.map((row) => truncate(row.content, 80)).join(' / ').slice(0, 600),
       });
       current = [];
     };
@@ -600,21 +606,34 @@ export function createLmcClosureService({ db, dataDir, dbPath }) {
     return { dry_run, raw_count: rows.length, chunk_count: chunks.length, chunks };
   }
 
-  function proposeChunkCandidates({ limit = 50, dry_run = true } = {}) {
-    const rows = db.prepare("SELECT * FROM event_chunks WHERE status='open' ORDER BY created_at ASC LIMIT ?").all(clamp(limit, 1, 200));
+  function proposeChunkCandidates({ limit = 50, dry_run = true, extra_chunks = [] } = {}) {
+    const rows = [
+      ...db.prepare("SELECT * FROM event_chunks WHERE status='open' ORDER BY created_at ASC LIMIT ?").all(Math.max(500, clamp(limit, 1, 200) * 10)),
+      ...(Array.isArray(extra_chunks) ? extra_chunks : []),
+    ];
+    const existingCandidates = db.prepare('SELECT raw_event_ids,source_chunk_ids FROM memory_candidates').all();
+    const existingRawSignatures = new Set(existingCandidates.map((row) => safeJsonArray(row.raw_event_ids).sort().join('\0')).filter(Boolean));
+    const existingChunkIds = new Set(existingCandidates.flatMap((row) => safeJsonArray(row.source_chunk_ids)));
     const plans = [];
     for (const chunk of rows) {
-      const dedupeKey = hash(`chunk-candidate\0${chunk.id}`);
-      if (db.prepare('SELECT id FROM memory_candidates WHERE dedupe_key=?').get(dedupeKey)) continue;
+      if (existingChunkIds.has(chunk.id)) continue;
       const type = candidateCategory(chunk);
+      const rawIds = Array.isArray(chunk.raw_event_ids)
+        ? chunk.raw_event_ids
+        : db.prepare('SELECT raw_event_id FROM chunk_events WHERE chunk_id=? ORDER BY position').all(chunk.id).map((row) => row.raw_event_id);
+      const rawSignature = [...rawIds].sort().join('\0');
+      if (rawSignature && existingRawSignatures.has(rawSignature)) continue;
+      const dedupeKey = hash(`chunk:${chunk.id}:${type}`);
+      if (db.prepare('SELECT id FROM memory_candidates WHERE dedupe_key=?').get(dedupeKey)) continue;
       const privateCandidate = type === 'private_candidate';
       plans.push({
-        id: crypto.randomUUID(), raw_event_ids: db.prepare('SELECT raw_event_id FROM chunk_events WHERE chunk_id=? ORDER BY position').all(chunk.id).map((row) => row.raw_event_id),
+        id: crypto.randomUUID(), raw_event_ids: rawIds,
         source_chunk_ids: [chunk.id], dedupe_key: dedupeKey, source: chunk.source, channel: chunk.channel, speaker: '',
         summary: privateCandidate ? `一段私密对话（${chunk.start_time} 至 ${chunk.end_time}，${chunk.event_count}条）` : chunk.summary,
         suggested_category: type, candidate_type: type, reason: 'nightly chunk proposal', importance: privateCandidate ? 0.7 : 0.55,
         suggested_tags: ['chunk-candidate'], evidence_preview: privateCandidate ? '私密原文仅保留在 raw_events' : truncate(chunk.summary, 220),
       });
+      if (plans.length >= clamp(limit, 1, 200)) break;
     }
     if (!dry_run) {
       const insert = db.prepare(`INSERT OR IGNORE INTO memory_candidates
@@ -654,7 +673,7 @@ export function createLmcClosureService({ db, dataDir, dbPath }) {
       for (const row of expiredRows) softDelete.run(nowIso(), nowIso(), row.id);
     }
     const consolidation = consolidate({ since_hours, source, channel, dry_run });
-    const candidates = proposeChunkCandidates({ limit: 50, dry_run });
+    const candidates = proposeChunkCandidates({ limit: 50, dry_run, extra_chunks: dry_run ? consolidation.chunks : [] });
     if (!dry_run) db.prepare("UPDATE memory_candidates SET status='stale',updated_at=? WHERE status='pending' AND expires_at IS NOT NULL AND expires_at<?").run(nowIso(), nowIso());
     const relations = buildSafeRelations({ since_hours: Math.max(168, since_hours), limit: 200, dry_run });
     const zAxis = runZAxisAudit({ limit: 100, dry_run });
