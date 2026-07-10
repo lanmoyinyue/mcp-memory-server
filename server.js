@@ -9,17 +9,24 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import fs from 'fs';
 import crypto from 'crypto';
+import {
+  createLmcClosureService,
+  installLmcClosureSchema,
+  prepareMemoryStorage,
+  redactForRemote,
+  registerLmcClosureTools,
+} from './server/lmc_closure.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DEFAULT_E_AXIS_RULES = {
-  version: 'rules-v2',
+  version: 'rules-v4',
   negation_window_chars: 3,
   negators: ['假装', '不', '没', '没有', '别'],
   valence_positive: ['开心', '喜欢', '爱', '稳', '完成', '成功', '亲', '抱', '心动', '温柔'],
   valence_negative: ['生气', '难过', '失败', '掉线', '错误', 'bug', '冲突', '风险'],
   arousal_high: ['紧急', '立刻', '马上', '亲密', '欲望', '触觉', '心动', '生气', '崩', '炸'],
   tension_high: ['冲突', '错误', '失败', '掉线', '风险', '越权', '不许', '不能', '红线'],
-  risk_high: ['删除', '覆盖', '重置', '隐私', 'token', '鉴权', '越权', '红线'],
+  risk_high: ['越权', '红线', '伤害', '失联', '空心', '不理', '推开', '回避', '不能没有', '害怕失去'],
   urgency_high: ['现在', '立刻', '马上', '紧急', '挂了', '掉了', '炸了'],
 };
 
@@ -40,9 +47,11 @@ const E_AXIS_RULES = loadEAxisRules();
 // ── Database ──────────────────────────────────────────────────────────────────
 
 const dataDir = process.env.DATA_DIR || path.join(__dirname, 'data');
-if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir, { recursive: true });
+const dbPath = path.join(dataDir, 'memories.db');
+const memoryStorage = prepareMemoryStorage({ dataDir, dbPath });
+if (memoryStorage.restored) console.log('[snapshot] applied approved restore:', memoryStorage.restored.snapshot_path);
 
-const db = new Database(path.join(dataDir, 'memories.db'));
+const db = new Database(dbPath);
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS memories (
@@ -296,6 +305,10 @@ try { db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_candidate_dedupe ON memory_
 try { db.exec('CREATE INDEX IF NOT EXISTS idx_candidate_status ON memory_candidates(status, created_at)'); } catch {}
 try { db.exec('CREATE INDEX IF NOT EXISTS idx_candidate_expires ON memory_candidates(expires_at)'); } catch {}
 
+// Additive closure tables/columns only. This does not alter wakeup categories or prompt behavior.
+installLmcClosureSchema(db);
+const lmcClosure = createLmcClosureService({ db, dataDir, dbPath });
+
 const contentHash = (text, category) => crypto.createHash('sha256').update(`${category}:${text.trim()}`).digest('hex');
 
 // Categories that automation (supersede/decay/merge/heat) must never mutate.
@@ -309,7 +322,7 @@ const resolveProtectedFlag = (category, requested, existing = 0) => {
 const rowIsProtected = (row) => !!row?.protected || isProtectedCategory(row?.category);
 const currentMemorySql = (alias = '') => {
   const p = alias ? `${alias}.` : '';
-  return `COALESCE(${p}status, 'current') = 'current' AND ${p}superseded_by IS NULL`;
+  return `${p}deleted_at IS NULL AND COALESCE(${p}status, 'current') = 'current' AND ${p}superseded_by IS NULL`;
 };
 const factActiveValue = (factKey, status = 'current', supersededBy = null) =>
   factKey && status === 'current' && !supersededBy ? 1 : 0;
@@ -380,6 +393,12 @@ const fmt = (r) => ({
   fact_key: r.fact_key || null, superseded_by: r.superseded_by || null,
   reviewed_at: r.reviewed_at || null,
   review_note: r.review_note || '',
+  thread: r.thread || 'other',
+  importance: Number(r.importance ?? 0.5),
+  weight: Number(r.weight ?? 1),
+  lifecycle_bucket: r.lifecycle_bucket || 'retain',
+  resolved: !!r.resolved,
+  deleted_at: r.deleted_at || null,
   created_at: r.created_at, updated_at: r.updated_at, expires_at: r.expires_at || null,
 });
 
@@ -1070,7 +1089,7 @@ function selectReviewMemories({ ids = [], status = 'review', category = '', keyw
   const cleanIds = [...new Set((ids || []).map(id => String(id || '').trim()).filter(Boolean))];
   if (cleanIds.length) {
     const rows = [];
-    const stmt = db.prepare('SELECT * FROM memories WHERE id = ?');
+    const stmt = db.prepare('SELECT * FROM memories WHERE id = ? AND deleted_at IS NULL');
     for (const id of cleanIds.slice(0, 100)) {
       const row = stmt.get(id);
       if (row) rows.push(row);
@@ -1458,13 +1477,8 @@ function eAxisScoreForMemory(mem) {
   };
 }
 
-const cleanExpired = () => {
-  const r = db.prepare('DELETE FROM memories WHERE protected = 0 AND expires_at IS NOT NULL AND expires_at < ?')
-    .run(new Date().toISOString());
-  if (r.changes) {
-    db.prepare(`DELETE FROM memory_edges WHERE source_id NOT IN (SELECT id FROM memories) OR target_id NOT IN (SELECT id FROM memories)`).run();
-  }
-};
+// Read paths filter expiry in SQL. Lifecycle changes only happen in the approved night loop.
+const cleanExpired = () => 0;
 
 // Categories that auto-expire after 3 days. Everything else is permanent.
 const EXPIRING = new Set(['daily', 'anchor', 'cc-anchor', 'corridor']);
@@ -1549,7 +1563,7 @@ function planCandidateRelationHints(plan) {
       continue;
     }
 
-    const target = db.prepare('SELECT id, status, superseded_by, expires_at FROM memories WHERE id = ?').get(targetId);
+    const target = db.prepare('SELECT id, status, superseded_by, expires_at FROM memories WHERE id = ? AND deleted_at IS NULL').get(targetId);
     if (!target) {
       skipped.push({ candidate_id: candidateId, target_id: targetId, reason: 'target memory not found' });
       continue;
@@ -1742,19 +1756,36 @@ function classifyEmbeddingStatus(status) {
   return 'api_error';
 }
 
+const embeddingRuntime = {
+  attempts: 0,
+  successes: 0,
+  failures: 0,
+  redacted_inputs: 0,
+  last_status: process.env.VOYAGE_API_KEY ? 'not_checked' : 'missing_key',
+  last_error: '',
+  last_attempt_at: null,
+  last_success_at: null,
+  dimensions: null,
+};
+
 async function getEmbeddingDetailed(text, { maxAttempts = 2, retryDelayMs = 100, timeoutMs = 8000 } = {}) {
   const apiKey = process.env.VOYAGE_API_KEY;
   if (!apiKey) return { embedding: null, error: 'missing_key', attempts: 0 };
+  const remoteText = redactForRemote(text);
+  if (!remoteText) return { embedding: null, error: 'empty_after_redaction', attempts: 0 };
+  if (remoteText !== String(text || '')) embeddingRuntime.redacted_inputs += 1;
 
   let last = { embedding: null, error: 'unknown', attempts: 0 };
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    embeddingRuntime.attempts += 1;
+    embeddingRuntime.last_attempt_at = new Date().toISOString();
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
       const res = await fetch('https://api.voyageai.com/v1/embeddings', {
         method: 'POST',
         headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ input: [text], model: 'voyage-3-lite' }),
+        body: JSON.stringify({ input: [remoteText], model: 'voyage-3-lite' }),
         signal: controller.signal,
       });
       clearTimeout(timer);
@@ -1768,7 +1799,14 @@ async function getEmbeddingDetailed(text, { maxAttempts = 2, retryDelayMs = 100,
       } else {
         const data = await res.json();
         const embedding = data?.data?.[0]?.embedding;
-        if (Array.isArray(embedding)) return { embedding, error: null, attempts: attempt };
+        if (Array.isArray(embedding)) {
+          embeddingRuntime.successes += 1;
+          embeddingRuntime.last_status = 'ok';
+          embeddingRuntime.last_error = '';
+          embeddingRuntime.last_success_at = new Date().toISOString();
+          embeddingRuntime.dimensions = embedding.length;
+          return { embedding, error: null, attempts: attempt };
+        }
         last = { embedding: null, error: 'bad_response', attempts: attempt };
         console.error('[embed] bad response payload');
         if (attempt >= maxAttempts) return last;
@@ -1782,6 +1820,9 @@ async function getEmbeddingDetailed(text, { maxAttempts = 2, retryDelayMs = 100,
     }
     await sleep(retryDelayMs);
   }
+  embeddingRuntime.failures += 1;
+  embeddingRuntime.last_status = last.error || 'error';
+  embeddingRuntime.last_error = last.error || 'unknown';
   return last;
 }
 
@@ -1838,7 +1879,7 @@ function createMcpServer() {
     },
     async ({ content, category, tags, source, mood, pinned, fact_key, protected: protectedArg, evidence_raw_ids, evidence_chunk_ids }) => {
       const hash = contentHash(content, category);
-      const dupe = db.prepare('SELECT * FROM memories WHERE content_hash = ? AND (expires_at IS NULL OR expires_at > ?)').get(hash, new Date().toISOString());
+      const dupe = db.prepare('SELECT * FROM memories WHERE deleted_at IS NULL AND content_hash = ? AND (expires_at IS NULL OR expires_at > ?)').get(hash, new Date().toISOString());
       if (dupe) {
         return {
           content: [{
@@ -1949,7 +1990,7 @@ function createMcpServer() {
     },
     async ({ category, tags, keyword, limit = 20, include_expired = false, include_superseded = false }) => {
       if (!include_expired) cleanExpired();
-      let sql = 'SELECT * FROM memories WHERE 1=1';
+      let sql = 'SELECT * FROM memories WHERE deleted_at IS NULL';
       const p = [];
       if (!include_expired) { sql += ' AND (expires_at IS NULL OR expires_at > ?)'; p.push(new Date().toISOString()); }
       if (!include_superseded) { sql += ` AND ${currentMemorySql()}`; }
@@ -2008,14 +2049,27 @@ function createMcpServer() {
   // 4. delete_memory
   mcp.tool(
     'delete_memory',
-    'Delete a memory by ID',
+    'Soft-delete a memory by ID',
     { id: z.string().describe('Memory ID') },
     async ({ id }) => {
-      const r = db.prepare('DELETE FROM memories WHERE id = ?').run(id);
+      const now = new Date().toISOString();
+      const r = db.prepare('UPDATE memories SET deleted_at = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL').run(now, now, id);
       if (r.changes) {
         db.prepare('DELETE FROM memory_edges WHERE source_id = ? OR target_id = ?').run(id, id);
       }
       return { content: [{ type: 'text', text: r.changes ? `Deleted ${id}.` : `Not found: ${id}` }] };
+    }
+  );
+
+  mcp.tool(
+    'get_embedding_health',
+    'Read-only semantic recall health. Never returns credentials.',
+    { probe: z.boolean().default(false) },
+    async ({ probe = false }) => {
+      if (probe) await getEmbeddingDetailed('克的语义召回健康检查', { maxAttempts: 1 });
+      const total = db.prepare('SELECT COUNT(*) AS c FROM memories WHERE deleted_at IS NULL').get().c;
+      const withEmbeddings = db.prepare('SELECT COUNT(*) AS c FROM memories WHERE deleted_at IS NULL AND embedding IS NOT NULL').get().c;
+      return { content: [{ type: 'text', text: JSON.stringify({ ...embeddingRuntime, total_memories: total, with_embeddings: withEmbeddings, missing_embeddings: total - withEmbeddings }, null, 2) }] };
     }
   );
 
@@ -2037,7 +2091,7 @@ function createMcpServer() {
       evidence_chunk_ids: z.array(z.string()).optional().describe('Replace linked event_chunk evidence ids'),
     },
     async ({ id, content, category, tags, source, mood, pinned, fact_key, protected: protectedArg, evidence_raw_ids, evidence_chunk_ids }) => {
-      const row = db.prepare('SELECT * FROM memories WHERE id = ?').get(id);
+      const row = db.prepare('SELECT * FROM memories WHERE id = ? AND deleted_at IS NULL').get(id);
       if (!row) return { content: [{ type: 'text', text: `Not found: ${id}` }] };
       const newCategory = category ?? row.category;
       const newPinned = pinned !== undefined ? (pinned ? 1 : 0) : row.pinned;
@@ -2091,8 +2145,8 @@ function createMcpServer() {
     },
     async ({ include_edge_health = false, edge_issue_limit = 50 }) => {
       cleanExpired();
-      const total = db.prepare('SELECT COUNT(*) as c FROM memories').get().c;
-      const byCat = db.prepare('SELECT category, COUNT(*) as c FROM memories GROUP BY category').all();
+      const total = db.prepare('SELECT COUNT(*) as c FROM memories WHERE deleted_at IS NULL').get().c;
+      const byCat = db.prepare('SELECT category, COUNT(*) as c FROM memories WHERE deleted_at IS NULL GROUP BY category').all();
       const recent = db.prepare('SELECT * FROM memories ORDER BY created_at DESC LIMIT 5').all().map(fmt);
       const payload = {
         total_memories: total,
@@ -2321,7 +2375,7 @@ function createMcpServer() {
 
       if (fact_key) {
         const rows = db.prepare(
-          'SELECT * FROM memories WHERE fact_key = ? AND (expires_at IS NULL OR expires_at > ?) ORDER BY created_at DESC'
+          'SELECT * FROM memories WHERE deleted_at IS NULL AND fact_key = ? AND (expires_at IS NULL OR expires_at > ?) ORDER BY created_at DESC'
         ).all(fact_key, now).map(fmt);
         const current = rows.filter(r => r.status === 'current' && !r.superseded_by);
         return {
@@ -2341,7 +2395,7 @@ function createMcpServer() {
 
       // Scan all fact_keys
       const groups = db.prepare(
-        "SELECT fact_key, COUNT(*) as total, SUM(CASE WHEN COALESCE(status, 'current') = 'current' AND superseded_by IS NULL THEN 1 ELSE 0 END) as current_count FROM memories WHERE fact_key IS NOT NULL AND (expires_at IS NULL OR expires_at > ?) GROUP BY fact_key ORDER BY fact_key"
+        "SELECT fact_key, COUNT(*) as total, SUM(CASE WHEN COALESCE(status, 'current') = 'current' AND superseded_by IS NULL THEN 1 ELSE 0 END) as current_count FROM memories WHERE deleted_at IS NULL AND fact_key IS NOT NULL AND (expires_at IS NULL OR expires_at > ?) GROUP BY fact_key ORDER BY fact_key"
       ).all(now);
 
       const conflicts = groups.filter(g => g.current_count > 1);
@@ -2379,7 +2433,7 @@ function createMcpServer() {
       const now = new Date().toISOString();
       const sources = [];
       for (const id of ids) {
-        const row = db.prepare('SELECT * FROM memories WHERE id = ?').get(id);
+        const row = db.prepare('SELECT * FROM memories WHERE id = ? AND deleted_at IS NULL').get(id);
         if (!row) return { content: [{ type: 'text', text: `Source memory not found: ${id}` }] };
         sources.push(row);
       }
@@ -2399,7 +2453,7 @@ function createMcpServer() {
 
       const mergedCategory = category || sources[0].category;
       const hash = contentHash(content, mergedCategory);
-      const dupe = db.prepare('SELECT * FROM memories WHERE content_hash = ? AND (expires_at IS NULL OR expires_at > ?)').get(hash, now);
+      const dupe = db.prepare('SELECT * FROM memories WHERE deleted_at IS NULL AND content_hash = ? AND (expires_at IS NULL OR expires_at > ?)').get(hash, now);
       if (dupe) {
         return { content: [{ type: 'text', text: JSON.stringify({ duplicate: true, existing: fmt(dupe) }, null, 2) }] };
       }
@@ -2620,7 +2674,7 @@ function createMcpServer() {
     },
     async ({ status = 'open', limit = 20, dry_run = true }) => {
       const now = new Date().toISOString();
-      markStaleCandidates(now);
+      if (!dry_run) markStaleCandidates(now);
       const chunks = status === 'all'
         ? db.prepare('SELECT * FROM event_chunks ORDER BY created_at DESC LIMIT ?').all(limit)
         : db.prepare('SELECT * FROM event_chunks WHERE status = ? ORDER BY created_at DESC LIMIT ?').all(status, limit);
@@ -2723,8 +2777,8 @@ function createMcpServer() {
     },
     async ({ source_id, target_id, relation_type = 'same_topic', strength = 0.7, status = 'safe', reason = '' }) => {
       if (source_id === target_id) return { content: [{ type: 'text', text: JSON.stringify({ error: 'self_loop_refused' }, null, 2) }] };
-      const s = db.prepare('SELECT id FROM memories WHERE id = ?').get(source_id);
-      const t = db.prepare('SELECT id FROM memories WHERE id = ?').get(target_id);
+      const s = db.prepare('SELECT id FROM memories WHERE id = ? AND deleted_at IS NULL').get(source_id);
+      const t = db.prepare('SELECT id FROM memories WHERE id = ? AND deleted_at IS NULL').get(target_id);
       if (!s || !t) return { content: [{ type: 'text', text: JSON.stringify({ error: 'memory_not_found', source_exists: !!s, target_exists: !!t }, null, 2) }] };
       const type = normalizeRelationType(relation_type);
       const edgeStatus = REVIEW_RELATION_TYPES.has(type) && status === 'safe' ? 'review' : status;
@@ -2771,37 +2825,8 @@ function createMcpServer() {
       dry_run: z.boolean().default(true),
     },
     async ({ memory_id, limit = 20, dry_run = true }) => {
-      const now = new Date().toISOString();
-      const rows = memory_id
-        ? db.prepare('SELECT * FROM memories WHERE id = ?').all(memory_id)
-        : db.prepare(`SELECT * FROM memories WHERE (expires_at IS NULL OR expires_at > ?) AND ${currentMemorySql()} ORDER BY created_at DESC LIMIT ?`).all(now, limit);
-      const scorerVersion = E_AXIS_RULES.version || 'rules-v2';
-      const scores = rows.map(mem => ({ memory_id: mem.id, ...eAxisScoreForMemory(mem), scorer_version: scorerVersion, shadow: true, updated_at: now }));
-      if (!dry_run) {
-        const stmt = db.prepare(`
-          INSERT INTO e_axis_scores (memory_id,valence,arousal,tension,confidence,risk_level,urgency,scorer_version,shadow,updated_at)
-          VALUES (?,?,?,?,?,?,?,?,?,?)
-          ON CONFLICT(memory_id) DO UPDATE SET
-            valence=excluded.valence, arousal=excluded.arousal, tension=excluded.tension,
-            confidence=excluded.confidence, risk_level=excluded.risk_level, urgency=excluded.urgency,
-            scorer_version=excluded.scorer_version, shadow=excluded.shadow, updated_at=excluded.updated_at
-        `);
-        for (const s of scores) {
-          stmt.run(
-            s.memory_id,
-            validateEAxisNumber(s.valence, -1, 1, 'valence'),
-            validateEAxisNumber(s.arousal, 0, 1, 'arousal'),
-            validateEAxisNumber(s.tension, 0, 1, 'tension'),
-            validateEAxisNumber(s.confidence, 0, 1, 'confidence'),
-            validateEAxisNumber(s.risk_level, 0, 1, 'risk_level'),
-            validateEAxisNumber(s.urgency, 0, 1, 'urgency'),
-            s.scorer_version,
-            1,
-            s.updated_at
-          );
-        }
-      }
-      return { content: [{ type: 'text', text: JSON.stringify({ dry_run, count: scores.length, scores, note: 'E-axis is shadow-only; recall ranking is unchanged.' }, null, 2) }] };
+      const result = lmcClosure.scoreEAxis({ memory_id, limit, dry_run });
+      return { content: [{ type: 'text', text: JSON.stringify({ ...result, note: 'E-axis rules-v4 remains shadow-only and never controls Ke voice or behavior.' }, null, 2) }] };
     }
   );
 
@@ -2887,14 +2912,15 @@ function createMcpServer() {
     'Read-only LMC patrol: reports candidates, chunks, edge health, fact conflicts, and E-axis shadow coverage. Does not repair data.',
     {
       save_report: z.boolean().default(true),
+      dry_run: z.boolean().default(true).describe('true guarantees zero writes, including patrol reports.'),
       since_hours: z.number().min(1).max(720).default(24).describe('Daily summary window. Default is recent 24 hours.'),
       edge_issue_limit: z.number().int().min(1).max(200).default(50),
       e_axis_risk_threshold: z.number().min(0).max(1).default(0.6).describe('Report E-axis alerts above this risk level.'),
     },
-    async ({ save_report = true, since_hours = 24, edge_issue_limit = 50, e_axis_risk_threshold = 0.6 }) => {
+    async ({ save_report = true, dry_run = true, since_hours = 24, edge_issue_limit = 50, e_axis_risk_threshold = 0.6 }) => {
       const now = new Date().toISOString();
       const edge = inspectMemoryEdges(edge_issue_limit);
-      const factGroups = db.prepare("SELECT fact_key, SUM(CASE WHEN COALESCE(status, 'current') = 'current' AND superseded_by IS NULL THEN 1 ELSE 0 END) as current_count FROM memories WHERE fact_key IS NOT NULL GROUP BY fact_key").all();
+      const factGroups = db.prepare("SELECT fact_key, SUM(CASE WHEN COALESCE(status, 'current') = 'current' AND superseded_by IS NULL THEN 1 ELSE 0 END) as current_count FROM memories WHERE deleted_at IS NULL AND fact_key IS NOT NULL GROUP BY fact_key").all();
       const currentFactConflicts = factGroups.filter(g => g.current_count > 1);
       const conflicts = {
         pending_z_audits: db.prepare("SELECT COUNT(*) as c FROM z_conflict_audits WHERE status='pending'").get().c,
@@ -2909,7 +2935,7 @@ function createMcpServer() {
       });
       const payload = {
         checked_at: now,
-        memories: db.prepare('SELECT COUNT(*) as c FROM memories').get().c,
+        memories: db.prepare('SELECT COUNT(*) as c FROM memories WHERE deleted_at IS NULL').get().c,
         raw_events: db.prepare('SELECT COUNT(*) as c FROM raw_events').get().c,
         event_chunks: db.prepare('SELECT COUNT(*) as c FROM event_chunks').get().c,
         pending_candidates: db.prepare("SELECT COUNT(*) as c FROM memory_candidates WHERE status='pending'").get().c,
@@ -2922,12 +2948,12 @@ function createMcpServer() {
       const status = edge.issue_count || currentFactConflicts.length || dailySummary.e_axis_alerts.length || conflicts.pending_z_audits ? 'needs_review' : 'ok';
       const summary = dailySummary.text;
       let reportId = null;
-      if (save_report) {
+      if (save_report && !dry_run) {
         reportId = uuidv4();
         db.prepare('INSERT INTO memory_patrol_reports (id,status,summary,payload,created_at) VALUES (?,?,?,?,?)')
           .run(reportId, status, summary, JSON.stringify(payload), now);
       }
-      return { content: [{ type: 'text', text: JSON.stringify({ report_id: reportId, status, summary, daily_summary: dailySummary, payload, note: 'Patrol is read-only.' }, null, 2) }] };
+      return { content: [{ type: 'text', text: JSON.stringify({ report_id: reportId, dry_run, status, summary, daily_summary: dailySummary, payload, note: dry_run ? 'Zero-write patrol preview.' : 'Patrol report saved; no formal memory was changed.' }, null, 2) }] };
     }
   );
 
@@ -2959,7 +2985,7 @@ function createMcpServer() {
     },
     async ({ since_hours = 24, source = 'all', channel = 'all', limit = 20, include_private_raw = false, dry_run = true }) => {
       const now = new Date().toISOString();
-      markStaleCandidates(now);
+      if (!dry_run) markStaleCandidates(now);
       const since = new Date(Date.now() - Number(since_hours) * 60 * 60 * 1000).toISOString();
       let sql = "SELECT * FROM raw_events WHERE timestamp >= ? AND role = 'user'";
       const params = [since];
@@ -3070,8 +3096,6 @@ function createMcpServer() {
       limit: z.number().int().min(1).max(100).default(20),
     },
     async ({ status = 'pending', limit = 20 }) => {
-      const now = new Date().toISOString();
-      markStaleCandidates(now);
       const rows = status === 'all'
         ? db.prepare('SELECT * FROM memory_candidates ORDER BY created_at DESC LIMIT ?').all(limit)
         : db.prepare('SELECT * FROM memory_candidates WHERE status = ? ORDER BY created_at DESC LIMIT ?').all(status, limit);
@@ -3296,7 +3320,7 @@ function createMcpServer() {
           }
 
           const now = new Date().toISOString();
-          const existing = db.prepare('SELECT * FROM memories WHERE content_hash = ? AND (expires_at IS NULL OR expires_at > ?)').get(plan.memory.content_hash, now);
+          const existing = db.prepare('SELECT * FROM memories WHERE deleted_at IS NULL AND content_hash = ? AND (expires_at IS NULL OR expires_at > ?)').get(plan.memory.content_hash, now);
           if (existing) {
             const r = db.prepare(`
               UPDATE memory_candidates
@@ -3471,7 +3495,7 @@ function createMcpServer() {
       db.exec('BEGIN IMMEDIATE');
       try {
         for (const row of rows) {
-          const fresh = db.prepare('SELECT * FROM memories WHERE id = ?').get(row.id);
+          const fresh = db.prepare('SELECT * FROM memories WHERE id = ? AND deleted_at IS NULL').get(row.id);
           if (!fresh) {
             applySkips.push({ memory_id: row.id, reason: 'memory disappeared before apply' });
             continue;
@@ -3763,6 +3787,7 @@ function createMcpServer() {
     }
   );
 
+  registerLmcClosureTools(mcp, z, lmcClosure);
   return mcp;
 }
 
@@ -3859,7 +3884,7 @@ app.post('/api/memories', auth, async (req, res) => {
   const { content, category, tags = [], source = '', mood = null, pinned = false, fact_key = null, protected: protectedArg, evidence_raw_ids = [], evidence_chunk_ids = [] } = req.body;
   if (!content || !category) return res.status(400).json({ error: 'content and category required' });
   const hash = contentHash(content, category);
-  const dupe = db.prepare('SELECT * FROM memories WHERE content_hash = ? AND (expires_at IS NULL OR expires_at > ?)').get(hash, new Date().toISOString());
+  const dupe = db.prepare('SELECT * FROM memories WHERE deleted_at IS NULL AND content_hash = ? AND (expires_at IS NULL OR expires_at > ?)').get(hash, new Date().toISOString());
   if (dupe) return res.json({ id: dupe.id, duplicate: true, message: 'Duplicate content, skipped' });
   const id = uuidv4(), now = new Date().toISOString();
   const status = 'current';
@@ -3915,7 +3940,7 @@ app.post('/api/memories', auth, async (req, res) => {
 });
 
 app.put('/api/memories/:id', auth, (req, res) => {
-  const row = db.prepare('SELECT * FROM memories WHERE id = ?').get(req.params.id);
+  const row = db.prepare('SELECT * FROM memories WHERE id = ? AND deleted_at IS NULL').get(req.params.id);
   if (!row) return res.status(404).json({ error: 'Not found' });
   const { content, category, tags, source, mood, pinned, fact_key, protected: protectedArg, evidence_raw_ids, evidence_chunk_ids } = req.body;
   const newCategory = category ?? row.category;
@@ -3953,7 +3978,8 @@ app.put('/api/memories/:id', auth, (req, res) => {
 });
 
 app.delete('/api/memories/:id', auth, (req, res) => {
-  const r = db.prepare('DELETE FROM memories WHERE id = ?').run(req.params.id);
+  const now = new Date().toISOString();
+  const r = db.prepare('UPDATE memories SET deleted_at = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL').run(now, now, req.params.id);
   if (r.changes) {
     db.prepare('DELETE FROM memory_edges WHERE source_id = ? OR target_id = ?').run(req.params.id, req.params.id);
   }
@@ -3962,8 +3988,8 @@ app.delete('/api/memories/:id', auth, (req, res) => {
 
 app.get('/api/stats', auth, (_req, res) => {
   cleanExpired();
-  const total = db.prepare('SELECT COUNT(*) as c FROM memories').get().c;
-  const byCat = db.prepare('SELECT category, COUNT(*) as c FROM memories GROUP BY category').all();
+  const total = db.prepare('SELECT COUNT(*) as c FROM memories WHERE deleted_at IS NULL').get().c;
+  const byCat = db.prepare('SELECT category, COUNT(*) as c FROM memories WHERE deleted_at IS NULL GROUP BY category').all();
   res.json({ total, by_category: Object.fromEntries(byCat.map(r => [r.category, r.c])) });
 });
 
@@ -3974,13 +4000,13 @@ app.get('/api/facts', auth, (req, res) => {
   const { fact_key } = req.query;
   if (fact_key) {
     const rows = db.prepare(
-      'SELECT * FROM memories WHERE fact_key = ? AND (expires_at IS NULL OR expires_at > ?) ORDER BY created_at DESC'
+      'SELECT * FROM memories WHERE deleted_at IS NULL AND fact_key = ? AND (expires_at IS NULL OR expires_at > ?) ORDER BY created_at DESC'
     ).all(fact_key, now).map(fmt);
     const current = rows.filter(r => r.status === 'current' && !r.superseded_by);
     return res.json({ fact_key, total_versions: rows.length, current_count: current.length, conflict: current.length > 1, current, superseded: rows.filter(r => r.superseded_by) });
   }
   const groups = db.prepare(
-    "SELECT fact_key, COUNT(*) as total, SUM(CASE WHEN COALESCE(status, 'current') = 'current' AND superseded_by IS NULL THEN 1 ELSE 0 END) as current_count FROM memories WHERE fact_key IS NOT NULL AND (expires_at IS NULL OR expires_at > ?) GROUP BY fact_key ORDER BY fact_key"
+    "SELECT fact_key, COUNT(*) as total, SUM(CASE WHEN COALESCE(status, 'current') = 'current' AND superseded_by IS NULL THEN 1 ELSE 0 END) as current_count FROM memories WHERE deleted_at IS NULL AND fact_key IS NOT NULL AND (expires_at IS NULL OR expires_at > ?) GROUP BY fact_key ORDER BY fact_key"
   ).all(now);
   res.json({ total_fact_keys: groups.length, conflicts: groups.filter(g => g.current_count > 1).length, fact_keys: groups });
 });
@@ -3990,7 +4016,7 @@ app.get('/api/diary-calendar', auth, (req, res) => {
   const prefix = `${year}-${String(month).padStart(2, '0')}`;
   const rows = db.prepare(`
     SELECT id, mood, substr(content,1,120) as preview, substr(created_at,1,10) as date
-    FROM memories WHERE category='diary' AND created_at LIKE ?
+    FROM memories WHERE deleted_at IS NULL AND category='diary' AND created_at LIKE ?
     ORDER BY created_at DESC
   `).all(`${prefix}%`);
   res.json(rows);
@@ -4111,6 +4137,8 @@ const CONSOLIDATION_RUNS_BACKUP_PATH = 'backups/consolidation_runs.jsonl';
 const Z_AUDITS_BACKUP_PATH = 'backups/z_conflict_audits.jsonl';
 const E_AXIS_BACKUP_PATH = 'backups/e_axis_scores.jsonl';
 const PATROL_REPORTS_BACKUP_PATH = 'backups/memory_patrol_reports.jsonl';
+const NARRATIVE_BACKUP_PATH = 'backups/narrative_summaries.jsonl';
+const RELATION_REVIEWS_BACKUP_PATH = 'backups/relation_reviews.jsonl';
 const BACKUP_TOKEN = process.env.BACKUP_GITHUB_TOKEN;
 const BACKUP_INCLUDE_INTIMATE = ['1', 'true', 'yes', 'on'].includes(String(process.env.BACKUP_INCLUDE_INTIMATE || '').toLowerCase());
 
@@ -4215,6 +4243,8 @@ async function runBackup() {
     await backupJsonl(Z_AUDITS_BACKUP_PATH, db.prepare('SELECT * FROM z_conflict_audits ORDER BY created_at DESC').all().map(fmtZAudit), 'z audits');
     await backupJsonl(E_AXIS_BACKUP_PATH, db.prepare('SELECT * FROM e_axis_scores ORDER BY updated_at DESC').all().map(fmtEAxisScore), 'e-axis scores');
     await backupJsonl(PATROL_REPORTS_BACKUP_PATH, db.prepare('SELECT * FROM memory_patrol_reports ORDER BY created_at DESC').all(), 'patrol reports');
+    await backupJsonl(NARRATIVE_BACKUP_PATH, db.prepare('SELECT * FROM narrative_summaries ORDER BY end_time DESC').all(), 'narrative summaries');
+    await backupJsonl(RELATION_REVIEWS_BACKUP_PATH, db.prepare('SELECT * FROM relation_reviews ORDER BY created_at DESC').all(), 'relation reviews');
 
     console.log(`[backup] ${rows.length} memories, ${edgeRows.length} edges, ${rawRows.length} raw events (${BACKUP_INCLUDE_INTIMATE ? 'including' : 'excluding'} intimate), ${candidateRows.length} memory candidates, ${hookRows.length} somatic hooks, and ${chunkRows.length} event chunks backed up to GitHub`);
   } catch (e) {
@@ -4447,6 +4477,26 @@ async function restoreLmcTablesIfEmpty() {
       }
       if (restored) console.log(`[backup] auto-restored ${restored} patrol reports from GitHub`);
     }
+
+    const narrativeCount = db.prepare('SELECT COUNT(*) as c FROM narrative_summaries').get().c;
+    if (narrativeCount === 0) {
+      const stmt = db.prepare(`INSERT OR IGNORE INTO narrative_summaries
+        (id,period_type,period_key,thread,title,summary,memory_ids,start_time,end_time,created_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?)`);
+      for (const n of await readBackupJsonl(NARRATIVE_BACKUP_PATH)) {
+        stmt.run(n.id, n.period_type, n.period_key, n.thread || 'other', n.title || '', n.summary || '', typeof n.memory_ids === 'string' ? n.memory_ids : JSON.stringify(n.memory_ids || []), n.start_time, n.end_time, n.created_at || new Date().toISOString());
+      }
+    }
+
+    const relationReviewCount = db.prepare('SELECT COUNT(*) as c FROM relation_reviews').get().c;
+    if (relationReviewCount === 0) {
+      const stmt = db.prepare(`INSERT OR IGNORE INTO relation_reviews
+        (id,source_id,target_id,relation,weight,reason,status,created_at,reviewed_at,review_note)
+        VALUES (?,?,?,?,?,?,?,?,?,?)`);
+      for (const r of await readBackupJsonl(RELATION_REVIEWS_BACKUP_PATH)) {
+        stmt.run(r.id, r.source_id, r.target_id, r.relation, Number(r.weight || 0.5), r.reason || '', r.status || 'pending', r.created_at || new Date().toISOString(), r.reviewed_at || null, r.review_note || '');
+      }
+    }
   } catch (e) {
     console.error('[backup] LMC table restore failed:', e.message);
   }
@@ -4478,8 +4528,10 @@ async function autoRestore() {
       if (!exists) {
         const status = ['current', 'review', 'historical', 'archived', 'deleted'].includes(m.status) ? m.status : (m.superseded_by ? 'historical' : 'current');
         const activeFact = m.fact_key && status === 'current' && !m.superseded_by ? 1 : 0;
-        db.prepare('INSERT INTO memories (id,content,category,tags,source,mood,created_at,updated_at,expires_at,pinned,content_hash,activation_score,fact_key,superseded_by,protected,evidence_raw_ids,evidence_chunk_ids,status,active_fact,reviewed_at,review_note) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)')
-          .run(m.id, m.content, m.category, JSON.stringify(m.tags || []), m.source || '', m.mood, m.created_at, m.updated_at, m.expires_at || null, m.pinned ? 1 : 0, m.content_hash || contentHash(m.content, m.category), Number(m.activation_score || 0), m.fact_key || null, m.superseded_by || null, resolveProtectedFlag(m.category, m.protected, 0), JSON.stringify(m.evidence_raw_ids || []), JSON.stringify(m.evidence_chunk_ids || []), status, Number(m.active_fact ?? activeFact), m.reviewed_at || null, m.review_note || '');
+        db.prepare(`INSERT INTO memories
+          (id,content,category,tags,source,mood,created_at,updated_at,expires_at,pinned,content_hash,activation_score,fact_key,superseded_by,protected,evidence_raw_ids,evidence_chunk_ids,status,active_fact,reviewed_at,review_note,thread,importance,weight,lifecycle_bucket,resolved,deleted_at)
+          VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+          .run(m.id, m.content, m.category, JSON.stringify(m.tags || []), m.source || '', m.mood, m.created_at, m.updated_at, m.expires_at || null, m.pinned ? 1 : 0, m.content_hash || contentHash(m.content, m.category), Number(m.activation_score || 0), m.fact_key || null, m.superseded_by || null, resolveProtectedFlag(m.category, m.protected, 0), JSON.stringify(m.evidence_raw_ids || []), JSON.stringify(m.evidence_chunk_ids || []), status, Number(m.active_fact ?? activeFact), m.reviewed_at || null, m.review_note || '', m.thread || 'other', Number(m.importance ?? 0.5), Number(m.weight ?? 1), m.lifecycle_bucket || 'retain', m.resolved ? 1 : 0, m.deleted_at || null);
         restored++;
       }
     }

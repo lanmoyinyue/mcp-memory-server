@@ -75,6 +75,22 @@ try {
     'promote_memory_candidates',
     'list_review_memories',
     'publish_review_memories',
+    'create_memory_snapshot',
+    'list_memory_snapshots',
+    'restore_memory_snapshot',
+    'inspect_memory_metabolism',
+    'score_e_axis_v4',
+    'run_z_axis_audit',
+    'build_safe_typed_relations',
+    'add_memory_relation',
+    'list_relation_reviews',
+    'review_memory_relation',
+    'run_narrative_sweep',
+    'list_narrative_summaries',
+    'refresh_spontaneous_cache',
+    'surface_spontaneous_memory',
+    'build_refined_carryover',
+    'run_lmc_night_maintenance',
   ]) {
     assert.ok(toolNames.includes(name), `missing MCP tool: ${name}`);
   }
@@ -113,28 +129,36 @@ try {
 
   const fakeHeart = await callTool(client, 'write_memory', {
     content: '测试 E 轴：假装心动，没成功，也不紧急。',
-    category: 'work',
-    tags: ['测试'],
+    category: 'diary',
+    tags: ['情绪测试'],
   });
   const realHeart = await callTool(client, 'write_memory', {
     content: '测试 E 轴：真的心动，项目成功，现在很紧急。',
-    category: 'work',
-    tags: ['测试'],
+    category: 'diary',
+    tags: ['情绪测试'],
   });
   const riskMemory = await callTool(client, 'write_memory', {
-    content: '测试 E 轴：这里涉及 token、鉴权、越权和红线，必须谨慎。',
+    content: '测试 E 轴：这里涉及越权和红线，必须谨慎。',
+    category: 'diary',
+    tags: ['情绪测试'],
+  });
+  const technicalMemory = await callTool(client, 'write_memory', {
+    content: '测试 E 轴：修复 token 鉴权和数据库部署。',
     category: 'work',
     tags: ['测试'],
   });
   const fakeScore = await callTool(client, 'score_e_axis_shadow', { memory_id: fakeHeart.saved.id });
   const realScore = await callTool(client, 'score_e_axis_shadow', { memory_id: realHeart.saved.id });
   const riskScore = await callTool(client, 'score_e_axis_shadow', { memory_id: riskMemory.saved.id });
+  const technicalScore = await callTool(client, 'score_e_axis_shadow', { memory_id: technicalMemory.saved.id });
   assert.ok(fakeScore.scores[0].valence < 0, JSON.stringify(fakeScore, null, 2));
   assert.equal(fakeScore.scores[0].urgency, 0.2, JSON.stringify(fakeScore, null, 2));
   assert.ok(realScore.scores[0].valence > 0, JSON.stringify(realScore, null, 2));
   assert.equal(realScore.scores[0].urgency, 0.75, JSON.stringify(realScore, null, 2));
-  assert.equal(realScore.scores[0].scorer_version, 'rules-v2');
+  assert.equal(realScore.scores[0].scorer_version, 'rules-v4');
   assert.ok(riskScore.scores[0].risk_level > 0.6, JSON.stringify(riskScore, null, 2));
+  assert.equal(technicalScore.scores.length, 0, JSON.stringify(technicalScore, null, 2));
+  assert.equal(technicalScore.skipped[0].reason, 'technical_without_e_axis_tag');
 
   const currentRead = await callTool(client, 'read_memories', { keyword: '项目状态', limit: 10 });
   assert.equal(currentRead.length, 1);
@@ -706,13 +730,93 @@ try {
   assert.ok(eAxis.count >= 1);
   assert.ok(eAxis.scores.every(s => s.valence >= -1 && s.valence <= 1));
 
-  const patrol = await callTool(client, 'run_memory_patrol', { save_report: true });
+  const patrolPreview = await callTool(client, 'run_memory_patrol', { dry_run: true, save_report: true });
+  assert.equal(patrolPreview.report_id, null);
+  const patrol = await callTool(client, 'run_memory_patrol', { dry_run: false, save_report: true });
   assert.ok(patrol.summary.includes('近24小时新增'), JSON.stringify(patrol, null, 2));
   assert.equal(typeof patrol.daily_summary.text, 'string');
   assert.ok(patrol.daily_summary.e_axis_alerts.some(alert => alert.memory_id === riskMemory.saved.id), JSON.stringify(patrol, null, 2));
   assert.ok(Number.isInteger(patrol.daily_summary.edge_health.orphan_count), JSON.stringify(patrol, null, 2));
   const reports = await callTool(client, 'list_memory_patrol_reports', { limit: 5 });
   assert.ok(reports.count >= 1);
+
+  const snapshotsBefore = await callTool(client, 'list_memory_snapshots', { limit: 10 });
+  const snapshotDry = await callTool(client, 'create_memory_snapshot', { reason: 'closure dry-run', dry_run: true });
+  assert.equal(snapshotDry.dry_run, true);
+  const snapshotsAfterDry = await callTool(client, 'list_memory_snapshots', { limit: 10 });
+  assert.equal(snapshotsAfterDry.length, snapshotsBefore.length);
+  const snapshotLive = await callTool(client, 'create_memory_snapshot', { reason: 'closure test', dry_run: false });
+  assert.equal(snapshotLive.dry_run, false);
+  const restorePlan = await callTool(client, 'restore_memory_snapshot', { id: snapshotLive.id, dry_run: true });
+  assert.equal(restorePlan.would_schedule.id, snapshotLive.id);
+
+  const metabolism = await callTool(client, 'inspect_memory_metabolism', { limit: 20 });
+  assert.ok(metabolism.count >= 1);
+  assert.ok(metabolism.items.every(item => typeof item.score === 'number'));
+
+  const disposable = await callTool(client, 'write_memory', {
+    content: '仅用于验证软删除的临时记忆。',
+    category: 'work',
+    tags: ['测试'],
+  });
+  const deleteText = await callToolText(client, 'delete_memory', { id: disposable.saved.id });
+  assert.ok(deleteText.includes('Deleted'));
+  const deletedRead = await callToolText(client, 'read_memories', { keyword: '验证软删除', include_superseded: true, limit: 20 });
+  assert.equal(deletedRead, 'No memories found.');
+  const deletedDb = new Database(path.join(dataDir, 'memories.db'));
+  assert.ok(deletedDb.prepare('SELECT deleted_at FROM memories WHERE id=?').get(disposable.saved.id).deleted_at);
+  deletedDb.close();
+
+  const relationQueued = await callTool(client, 'add_memory_relation', {
+    source_id: factV2.saved.id,
+    target_id: protectedFact.saved.id,
+    relation: 'emotional_link',
+    reason: 'closure review test',
+    dry_run: false,
+  });
+  assert.ok(relationQueued.queued_review);
+  const relationReviews = await callTool(client, 'list_relation_reviews', { status: 'pending', limit: 20 });
+  assert.ok(relationReviews.some(row => row.id === relationQueued.queued_review));
+  const relationApproved = await callTool(client, 'review_memory_relation', { id: relationQueued.queued_review, action: 'approve' });
+  assert.equal(relationApproved.status, 'approved');
+
+  const narrative = await callTool(client, 'run_narrative_sweep', { period_type: 'week', force: true, dry_run: false });
+  assert.ok(narrative.written_count >= 1, JSON.stringify(narrative, null, 2));
+  const narratives = await callTool(client, 'list_narrative_summaries', { period_type: 'week', limit: 20 });
+  assert.ok(narratives.length >= 1);
+
+  const spontaneousCache = await callTool(client, 'refresh_spontaneous_cache', { limit: 6, dry_run: false });
+  assert.ok(spontaneousCache.written_count >= 1);
+  const spontaneous = await callTool(client, 'surface_spontaneous_memory', { limit: 1, consume: false });
+  assert.ok(spontaneous.memories.length >= 1);
+
+  const carryover = await callTool(client, 'build_refined_carryover', { since_hours: 24, include_private: false });
+  assert.ok(carryover.text.includes('[精炼交接]'));
+
+  const nightSnapshotsBefore = await callTool(client, 'list_memory_snapshots', { limit: 100 });
+  const dryRunDb = new Database(path.join(dataDir, 'memories.db'));
+  const dryRunCountsBefore = {
+    chunks: dryRunDb.prepare('SELECT COUNT(*) AS c FROM event_chunks').get().c,
+    candidates: dryRunDb.prepare('SELECT COUNT(*) AS c FROM memory_candidates').get().c,
+    reports: dryRunDb.prepare('SELECT COUNT(*) AS c FROM memory_patrol_reports').get().c,
+  };
+  dryRunDb.close();
+  const nightDry = await callTool(client, 'run_lmc_night_maintenance', { since_hours: 24, dry_run: true, save_report: true });
+  assert.equal(nightDry.dry_run, true);
+  assert.equal(nightDry.report_id, null);
+  const nightSnapshotsAfter = await callTool(client, 'list_memory_snapshots', { limit: 100 });
+  assert.equal(nightSnapshotsAfter.length, nightSnapshotsBefore.length);
+  const dryRunDbAfter = new Database(path.join(dataDir, 'memories.db'));
+  assert.deepEqual({
+    chunks: dryRunDbAfter.prepare('SELECT COUNT(*) AS c FROM event_chunks').get().c,
+    candidates: dryRunDbAfter.prepare('SELECT COUNT(*) AS c FROM memory_candidates').get().c,
+    reports: dryRunDbAfter.prepare('SELECT COUNT(*) AS c FROM memory_patrol_reports').get().c,
+  }, dryRunCountsBefore);
+  dryRunDbAfter.close();
+  const nightLive = await callTool(client, 'run_lmc_night_maintenance', { since_hours: 24, dry_run: false, save_report: true });
+  assert.equal(nightLive.dry_run, false);
+  assert.ok(nightLive.snapshot.id);
+  assert.ok(nightLive.report_id);
 
   await client.close();
   console.log('LMC-5 local MCP test passed');
