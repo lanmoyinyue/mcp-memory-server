@@ -375,7 +375,10 @@ export function createLmcClosureService({ db, dataDir, dbPath }) {
     const plans = [];
     for (let i = 0; i < rows.length; i += 1) {
       const source = rows[i];
-      const sourceTags = new Set(safeJsonArray(source.tags).filter((tag) => String(tag).length >= 2 && !/^(测试|日常|记录|记忆)$/.test(String(tag))));
+      const sourceTags = new Set(safeJsonArray(source.tags).filter((tag) => {
+        const value = String(tag).trim();
+        return value.length >= 3 && !/^(测试|日常|日记|记录|记忆|私藏|心动|关系|工作|坐标|月亮|克|闻川|第\d+天)$/i.test(value);
+      }));
       const sourceEvidence = new Set([...safeJsonArray(source.evidence_raw_ids), ...safeJsonArray(source.evidence_chunk_ids)]);
       let temporalAdded = false;
       let sourcePlanCount = 0;
@@ -613,6 +616,7 @@ export function createLmcClosureService({ db, dataDir, dbPath }) {
     ];
     const existingCandidates = db.prepare('SELECT raw_event_ids,source_chunk_ids FROM memory_candidates').all();
     const existingRawSignatures = new Set(existingCandidates.map((row) => safeJsonArray(row.raw_event_ids).sort().join('\0')).filter(Boolean));
+    const usedRawIds = new Set(existingCandidates.flatMap((row) => safeJsonArray(row.raw_event_ids)));
     const existingChunkIds = new Set(existingCandidates.flatMap((row) => safeJsonArray(row.source_chunk_ids)));
     const plans = [];
     for (const chunk of rows) {
@@ -623,6 +627,7 @@ export function createLmcClosureService({ db, dataDir, dbPath }) {
         : db.prepare('SELECT raw_event_id FROM chunk_events WHERE chunk_id=? ORDER BY position').all(chunk.id).map((row) => row.raw_event_id);
       const rawSignature = [...rawIds].sort().join('\0');
       if (rawSignature && existingRawSignatures.has(rawSignature)) continue;
+      if (rawIds.some((id) => usedRawIds.has(id))) continue;
       const dedupeKey = hash(`chunk:${chunk.id}:${type}`);
       if (db.prepare('SELECT id FROM memory_candidates WHERE dedupe_key=?').get(dedupeKey)) continue;
       const privateCandidate = type === 'private_candidate';

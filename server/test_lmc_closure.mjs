@@ -82,6 +82,10 @@ try {
     .run('m1', '快照前的真实内容', 'deep', '[]', ts, ts);
   db.prepare('INSERT INTO memories (id,content,category,tags,created_at,updated_at) VALUES (?,?,?,?,?,?)')
     .run('m2', '同分类但没有共同证据的另一条内容', 'deep', '[]', ts, ts);
+  db.prepare('INSERT INTO memories (id,content,category,tags,created_at,updated_at) VALUES (?,?,?,?,?,?)')
+    .run('m3', '只有日期型标签的内容一', 'diary', '["第78天"]', ts, ts);
+  db.prepare('INSERT INTO memories (id,content,category,tags,created_at,updated_at) VALUES (?,?,?,?,?,?)')
+    .run('m4', '只有日期型标签的内容二', 'diary', '["第78天"]', ts, ts);
   const noBroadCategoryEdges = service.buildSafeRelations({ since_hours: 24, limit: 20, dry_run: true });
   assert.equal(noBroadCategoryEdges.planned_count, 0, JSON.stringify(noBroadCategoryEdges, null, 2));
 
