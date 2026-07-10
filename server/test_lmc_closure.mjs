@@ -95,6 +95,20 @@ try {
   const expiredEndpoint = service.addRelation({ source_id: 'm5', target_id: 'm6', relation: 'same_topic', dry_run: true });
   assert.equal(expiredEndpoint.error, 'missing_or_deleted_endpoint');
 
+  const t0 = new Date();
+  const t1 = new Date(t0.getTime() - 3600000).toISOString();
+  const t2 = new Date(t0.getTime() - 7200000).toISOString();
+  db.prepare('INSERT INTO memories (id,content,category,tags,source,created_at,updated_at) VALUES (?,?,?,?,?,?,?)')
+    .run('m7', '时间链最新', 'work', '[]', 'same-session', t0.toISOString(), t0.toISOString());
+  db.prepare('INSERT INTO memories (id,content,category,tags,source,created_at,updated_at) VALUES (?,?,?,?,?,?,?)')
+    .run('m8', '时间链中间', 'work', '[]', 'same-session', t1, t1);
+  db.prepare('INSERT INTO memories (id,content,category,tags,source,created_at,updated_at) VALUES (?,?,?,?,?,?,?)')
+    .run('m9', '时间链最早', 'work', '[]', 'same-session', t2, t2);
+  db.prepare(`INSERT INTO memory_edges (source_id,target_id,weight,created_at,relation_type,strength,status,reason,updated_at)
+    VALUES (?,?,?,?,?,?,?,?,?)`).run('m8', 'm7', 0.55, ts, 'temporal_sequence', 0.55, 'safe', 'existing nearest edge', ts);
+  const idempotentTemporal = service.buildSafeRelations({ since_hours: 24, limit: 20, dry_run: true });
+  assert.ok(!idempotentTemporal.relations.some((edge) => edge.source_id === 'm9' && edge.target_id === 'm7'), JSON.stringify(idempotentTemporal, null, 2));
+
   const snapshot = service.createSnapshot({ reason: 'restore test', dry_run: false });
   assert.ok(fs.existsSync(snapshot.snapshot_path));
   db.prepare('UPDATE memories SET content=? WHERE id=?').run('被改坏的内容', 'm1');

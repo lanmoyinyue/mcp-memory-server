@@ -398,10 +398,10 @@ export function createLmcClosureService({ db, dataDir, dbPath }) {
         const [sourceId, targetId] = relation === 'temporal_sequence'
           ? (new Date(source.created_at) <= new Date(target.created_at) ? [source.id, target.id] : [target.id, source.id])
           : (source.id < target.id ? [source.id, target.id] : [target.id, source.id]);
+        if (relation === 'temporal_sequence') temporalAdded = true;
         const exists = db.prepare('SELECT 1 FROM memory_edges WHERE source_id=? AND target_id=?').get(sourceId, targetId);
         if (exists) continue;
         plans.push({ source_id: sourceId, target_id: targetId, relation_type: relation, strength: weight, status: 'safe', reason: sharedEvidence.length ? `shared evidence: ${sharedEvidence.length}` : sameProject ? 'same source project' : temporalSequence ? `same source within ${timeGapHours.toFixed(1)}h` : `shared tags: ${sharedTags.join(',')}` });
-        if (relation === 'temporal_sequence') temporalAdded = true;
         sourcePlanCount += 1;
         if (sourcePlanCount >= 4) break;
         if (plans.length >= clamp(limit, 1, 1000)) break;
