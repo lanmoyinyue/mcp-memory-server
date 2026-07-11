@@ -93,6 +93,7 @@ try {
     'list_recall_traces',
     'record_recall_feedback',
     'inspect_other_incubation',
+    'backfill_memory_threads',
     'detect_heartbeat_candidates',
     'quarantine_heartbeat_pollution',
     'run_lmc_nap',
@@ -811,6 +812,8 @@ try {
   assert.ok(carryover.text.includes('[精炼交接]'));
   const otherIncubation = await callTool(client, 'inspect_other_incubation', {});
   assert.equal(typeof otherIncubation.suggestion_count, 'number');
+  const threadBackfill = await callTool(client, 'backfill_memory_threads', { dry_run: true });
+  assert.equal(threadBackfill.changed_count, 0);
   const heartbeatPreview = await callTool(client, 'detect_heartbeat_candidates', { since_hours: 24, dry_run: true });
   assert.ok(heartbeatPreview.note.toLowerCase().includes('no formal memory'));
   const pollutionPreview = await callTool(client, 'quarantine_heartbeat_pollution', { dry_run: true });

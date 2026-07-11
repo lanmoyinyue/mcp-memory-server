@@ -139,8 +139,8 @@ export function installLmcClosureSchema(db) {
 function categoryThread(category) {
   const c = String(category || '').trim();
   if (['identity', 'anchor', 'corridor', 'deep'].includes(c)) return 'identity';
-  if (['relationship', '日常', '日记', 'diary', 'cc-diary', '私藏', '心动', 'dream'].includes(c)) return 'relationship';
-  if (['工作', 'work', 'project', '工具'].includes(c)) return 'engineering';
+  if (['relationship', '日常', '日记', 'daily', 'diary', 'cc-daily', 'cc-diary', '私藏', '心动', 'dream', 'conversation_episode'].includes(c)) return 'relationship';
+  if (['工作', 'work', 'project', '工具', 'swap-meta'].includes(c)) return 'engineering';
   if (c === 'writing') return 'writing';
   return 'other';
 }
@@ -580,6 +580,29 @@ export function createLmcClosureService({ db, dataDir, dbPath, embedText = null 
     return { scanned_count: rows.length, suggestion_count: suggestions.length, suggestions };
   }
 
+  function backfillMemoryThreads({ dry_run = true, limit = 2000 } = {}) {
+    const rows = db.prepare("SELECT id,category,thread FROM memories WHERE thread='other' AND deleted_at IS NULL ORDER BY created_at ASC LIMIT ?").all(clamp(limit, 1, 10000));
+    const plans = rows.map((row) => ({ ...row, target_thread: categoryThread(row.category) })).filter((row) => row.target_thread !== 'other');
+    if (!dry_run) {
+      const update = db.prepare("UPDATE memories SET thread=?,updated_at=? WHERE id=? AND thread='other'");
+      let changed = 0;
+      db.exec('BEGIN IMMEDIATE');
+      try {
+        for (const item of plans) changed += update.run(item.target_thread, nowIso(), item.id).changes;
+        db.exec('COMMIT');
+      } catch (error) {
+        try { db.exec('ROLLBACK'); } catch {}
+        throw error;
+      }
+      const counts = {};
+      for (const item of plans) counts[item.target_thread] = (counts[item.target_thread] || 0) + 1;
+      return { dry_run: false, planned_count: plans.length, changed_count: changed, counts, note: 'Only thread metadata changed; content, category, status and protection were untouched.' };
+    }
+    const counts = {};
+    for (const item of plans) counts[item.target_thread] = (counts[item.target_thread] || 0) + 1;
+    return { dry_run: true, planned_count: plans.length, changed_count: 0, counts, preview: plans.slice(0, 100), note: 'Preview only; take a snapshot before apply.' };
+  }
+
   function metabolicGateForRecall(row, { mode = 'recall' } = {}) {
     return metabolicGate(row, mode);
   }
@@ -931,7 +954,7 @@ export function createLmcClosureService({ db, dataDir, dbPath, embedText = null 
     buildSafeRelations, addRelation, listRelationReviews, reviewRelation, runNarrative, listNarratives,
     refreshSpontaneous, surfaceSpontaneous, buildCarryover, consolidate, proposeChunkCandidates,
     metabolicGateForRecall, recordRecallTrace, listRecallTraces, addRecallFeedback,
-    inspectOtherIncubation, detectHeartbeatCandidates, quarantineHeartbeatPollution, runNap, inspectDreamReadiness, listDreamRuns,
+    inspectOtherIncubation, backfillMemoryThreads, detectHeartbeatCandidates, quarantineHeartbeatPollution, runNap, inspectDreamReadiness, listDreamRuns,
     edgeHealth, cleanupEdges, runNight,
   };
 }
@@ -991,6 +1014,9 @@ export function registerLmcClosureTools(mcp, z, service) {
   tool('inspect_other_incubation', 'Read-only X-axis three-stage incubation report for the other thread.', {
     observe_threshold: z.number().int().min(2).max(20).optional(), candidate_threshold: z.number().int().min(3).max(30).optional(), formal_threshold: z.number().int().min(5).max(50).optional(), formal_min_span_days: z.number().int().min(1).max(365).optional(), formal_min_hits: z.number().int().min(0).max(100).optional(),
   }, service.inspectOtherIncubation);
+  tool('backfill_memory_threads', 'Deterministically move legacy thread=other rows into known X lines. Changes thread only; dry-run by default.', {
+    limit: z.number().int().min(1).max(10000).optional(), dry_run: z.boolean().default(true),
+  }, service.backfillMemoryThreads);
   tool('detect_heartbeat_candidates', 'Batch-detect relationship moments into review-gated candidates only.', {
     since_hours: z.number().min(1).max(720).optional(), limit: z.number().int().min(1).max(200).optional(), dry_run: z.boolean().default(true),
   }, service.detectHeartbeatCandidates);

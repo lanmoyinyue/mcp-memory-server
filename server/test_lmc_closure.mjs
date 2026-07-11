@@ -116,6 +116,12 @@ try {
 
   const incubation = service.inspectOtherIncubation();
   assert.ok(incubation.suggestions.some((item) => item.group_kind === 'category' && item.group_key === 'work' && item.stage === 'observe_cluster'));
+  const threadPreview = service.backfillMemoryThreads({ dry_run: true });
+  assert.ok(threadPreview.planned_count >= 3);
+  const threadApply = service.backfillMemoryThreads({ dry_run: false });
+  assert.equal(threadApply.changed_count, threadApply.planned_count);
+  assert.equal(db.prepare("SELECT thread FROM memories WHERE id='m1'").get().thread, 'identity');
+  assert.equal(db.prepare("SELECT thread FROM memories WHERE id='m7'").get().thread, 'engineering');
 
   const trace = service.recordRecallTrace({
     query: '快照内容', channels: ['keyword'], requested_count: 3,
