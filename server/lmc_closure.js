@@ -112,6 +112,27 @@ export function installLmcClosureSchema(db) {
       channels TEXT NOT NULL DEFAULT '[]', result_ids TEXT NOT NULL DEFAULT '[]', created_at TEXT NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_recall_traces_created ON recall_traces(created_at);
+
+    CREATE TABLE IF NOT EXISTS recall_trace_items (
+      id TEXT PRIMARY KEY, trace_id TEXT NOT NULL, memory_id TEXT, rank INTEGER NOT NULL,
+      recall_layer TEXT NOT NULL, evidence_role TEXT NOT NULL, injected INTEGER NOT NULL DEFAULT 0,
+      score REAL NOT NULL DEFAULT 0, score_breakdown TEXT NOT NULL DEFAULT '{}',
+      reasons TEXT NOT NULL DEFAULT '[]', related_from TEXT NOT NULL DEFAULT '[]', created_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_recall_trace_items_trace ON recall_trace_items(trace_id, rank);
+
+    CREATE TABLE IF NOT EXISTS recall_feedback (
+      id TEXT PRIMARY KEY, trace_id TEXT NOT NULL, memory_id TEXT,
+      outcome TEXT NOT NULL, note TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_recall_feedback_trace ON recall_feedback(trace_id, created_at);
+
+    CREATE TABLE IF NOT EXISTS dream_runs (
+      id TEXT PRIMARY KEY, mode TEXT NOT NULL DEFAULT 'night_dream', status TEXT NOT NULL,
+      dry_run INTEGER NOT NULL DEFAULT 1, started_at TEXT NOT NULL, finished_at TEXT,
+      step_results TEXT NOT NULL DEFAULT '[]', error TEXT NOT NULL DEFAULT ''
+    );
+    CREATE INDEX IF NOT EXISTS idx_dream_runs_started ON dream_runs(started_at);
   `);
 }
 
@@ -221,6 +242,29 @@ function metabolicState(row, eScore, at = new Date()) {
   };
 }
 
+function metabolicGate(row, mode = 'recall', at = new Date()) {
+  const status = String(row.status || 'current').toLowerCase();
+  const source = String(row.source || '').toLowerCase();
+  const category = String(row.category || '').toLowerCase();
+  const protectedRow = !!row.protected || PROTECTED_CATEGORIES.has(row.category)
+    || ['identity', 'relationship', 'corridor'].includes(category);
+  if (status !== 'current' || row.deleted_at || row.superseded_by) {
+    return { bucket: 'quarantine', allowed: false, factor: 0, reason: `status:${status}` };
+  }
+  if (protectedRow) return { bucket: 'retain', allowed: true, factor: 1, reason: 'protected' };
+  const noise = new Set(['debug', 'log', 'logs', 'scratch', 'temp', 'transient', 'working', 'worklog']);
+  if (noise.has(source)) return { bucket: 'quarantine', allowed: false, factor: 0, reason: `noise_source:${source}` };
+  if (noise.has(category)) return { bucket: 'quarantine', allowed: false, factor: 0, reason: `noise_category:${category}` };
+  const state = metabolicState(row, row, at);
+  const bucket = state.suggested_bucket || state.bucket || 'retain';
+  const factor = bucket === 'cold' ? 0.45 : bucket === 'quarantine' ? 0 : 1;
+  if (mode === 'surface' && bucket !== 'retain') return { bucket, allowed: false, factor: 0, reason: `surface_blocks_${bucket}` };
+  if (mode === 'surface' && ['conversation', 'raw', 'raw_event'].includes(source)) {
+    return { bucket: 'quarantine', allowed: false, factor: 0, reason: `surface_block_source:${source}` };
+  }
+  return { bucket, allowed: factor > 0, factor, reason: bucket };
+}
+
 function isoWeekKey(date) {
   const d = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()));
   d.setUTCDate(d.getUTCDate() + 4 - (d.getUTCDay() || 7));
@@ -248,7 +292,7 @@ function candidateCategory(chunk) {
   return 'daily';
 }
 
-export function createLmcClosureService({ db, dataDir, dbPath }) {
+export function createLmcClosureService({ db, dataDir, dbPath, embedText = null }) {
   const snapshotDir = process.env.MEMORY_SNAPSHOT_DIR || path.join(dataDir, 'snapshots');
   const pendingRestorePath = path.join(dataDir, 'pending-restore.json');
   const retention = clamp(process.env.MEMORY_SNAPSHOT_RETENTION || 14, 3, 90);
@@ -507,6 +551,157 @@ export function createLmcClosureService({ db, dataDir, dbPath }) {
     return db.prepare(sql).all(...params).map((row) => ({ ...row, memory_ids: safeJsonArray(row.memory_ids) }));
   }
 
+  function inspectOtherIncubation({ observe_threshold = 3, candidate_threshold = 5, formal_threshold = 8, formal_min_span_days = 14, formal_min_hits = 2 } = {}) {
+    const rows = db.prepare(`SELECT id,category,tags,created_at,activation_score FROM memories
+      WHERE thread='other' AND deleted_at IS NULL AND superseded_by IS NULL AND COALESCE(status,'current')='current'`).all();
+    const groups = new Map();
+    const add = (kind, key, row) => {
+      if (!key) return;
+      const id = `${kind}:${key}`;
+      if (!groups.has(id)) groups.set(id, { kind, key, rows: [] });
+      groups.get(id).rows.push(row);
+    };
+    for (const row of rows) {
+      add('category', row.category, row);
+      for (const tag of safeJsonArray(row.tags)) add('tag', String(tag), row);
+    }
+    const suggestions = [];
+    for (const group of groups.values()) {
+      const ordered = group.rows.slice().sort((a, b) => String(a.created_at).localeCompare(String(b.created_at)));
+      const count = ordered.length;
+      const spanDays = count > 1 ? Math.max(0, (new Date(ordered.at(-1).created_at) - new Date(ordered[0].created_at)) / 86400000) : 0;
+      const hitTotal = ordered.reduce((sum, row) => sum + Number(row.activation_score || 0), 0);
+      let stage = null;
+      if (count >= formal_threshold && spanDays >= formal_min_span_days && hitTotal >= formal_min_hits) stage = 'formal_line_candidate';
+      else if (count >= candidate_threshold || (count >= observe_threshold && hitTotal >= 3)) stage = 'candidate_line';
+      else if (count >= observe_threshold) stage = 'observe_cluster';
+      if (stage) suggestions.push({ action: 'split_thread', stage, thread: 'other', group_kind: group.kind, group_key: group.key, count, span_days: +spanDays.toFixed(2), hit_total: +hitTotal.toFixed(2), memory_ids: ordered.slice(0, 20).map((row) => row.id), note: 'Review-only incubation; no thread is changed automatically.' });
+    }
+    return { scanned_count: rows.length, suggestion_count: suggestions.length, suggestions };
+  }
+
+  function metabolicGateForRecall(row, { mode = 'recall' } = {}) {
+    return metabolicGate(row, mode);
+  }
+
+  function recordRecallTrace({ query, channels = [], layers, requested_count = 0 }) {
+    const id = crypto.randomUUID();
+    const ordered = [
+      ...(layers.main_recall || []).map((item) => ({ ...item, recall_layer: 'main_recall', evidence_role: 'authority' })),
+      ...(layers.source_neighborhood || []).map((item) => ({ ...item, recall_layer: 'source_neighborhood', evidence_role: 'navigation' })),
+      ...(layers.graph_expansion || []).map((item) => ({ ...item, recall_layer: 'graph_expansion', evidence_role: 'association' })),
+      ...(layers.fallback_archive || []).map((item) => ({ ...item, recall_layer: 'fallback_archive', evidence_role: 'last_resort' })),
+    ];
+    db.prepare('INSERT INTO recall_traces (id,query_hash,query_preview,channels,result_ids,created_at) VALUES (?,?,?,?,?,?)')
+      .run(id, hash(query), truncate(query, 160), JSON.stringify(channels), JSON.stringify(ordered.map((item) => item.id).filter(Boolean)), nowIso());
+    const insert = db.prepare(`INSERT INTO recall_trace_items
+      (id,trace_id,memory_id,rank,recall_layer,evidence_role,injected,score,score_breakdown,reasons,related_from,created_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`);
+    ordered.forEach((item, index) => insert.run(crypto.randomUUID(), id, item.id || null, index + 1, item.recall_layer, item.evidence_role,
+      item.recall_layer === 'main_recall' || item.recall_layer === 'graph_expansion' ? 1 : 0,
+      Number(item.recall_score || item.graph_score || 0), JSON.stringify(item.score_breakdown || {}),
+      JSON.stringify(item.recall_channels || [item.recall_layer]), JSON.stringify(item.bridge_from ? [item.bridge_from] : []), nowIso()));
+    return { recall_run_id: id, requested_count, selected_count: ordered.length };
+  }
+
+  function listRecallTraces({ limit = 20, trace_id } = {}) {
+    const traces = trace_id
+      ? db.prepare('SELECT * FROM recall_traces WHERE id=?').all(trace_id)
+      : db.prepare('SELECT * FROM recall_traces ORDER BY created_at DESC LIMIT ?').all(clamp(limit, 1, 100));
+    return traces.map((trace) => ({ ...trace, channels: safeJsonArray(trace.channels), result_ids: safeJsonArray(trace.result_ids), items: db.prepare('SELECT * FROM recall_trace_items WHERE trace_id=? ORDER BY rank').all(trace.id).map((item) => ({ ...item, score_breakdown: JSON.parse(item.score_breakdown || '{}'), reasons: safeJsonArray(item.reasons), related_from: safeJsonArray(item.related_from) })) }));
+  }
+
+  function addRecallFeedback({ trace_id, memory_id, outcome, note = '' } = {}) {
+    if (!db.prepare('SELECT id FROM recall_traces WHERE id=?').get(trace_id)) return { error: 'recall_trace_not_found', trace_id };
+    const id = crypto.randomUUID();
+    db.prepare('INSERT INTO recall_feedback (id,trace_id,memory_id,outcome,note,created_at) VALUES (?,?,?,?,?,?)')
+      .run(id, trace_id, memory_id || null, outcome, String(note || ''), nowIso());
+    return { id, trace_id, memory_id: memory_id || null, outcome, note: 'Feedback is telemetry only; it does not rewrite memories or personality.' };
+  }
+
+  function detectHeartbeatCandidates({ since_hours = 72, limit = 50, dry_run = true, extra_chunks = [] } = {}) {
+    const since = new Date(Date.now() - clamp(since_hours, 1, 720) * 3600000).toISOString();
+    const chunks = [...db.prepare(`SELECT * FROM event_chunks WHERE created_at>=? ORDER BY created_at DESC LIMIT ?`).all(since, clamp(limit, 1, 200) * 4), ...(Array.isArray(extra_chunks) ? extra_chunks : [])];
+    const patterns = ['亲亲', '亲了', '亲你', '抱住', '抱抱', '摸摸', '摸你', '捏你', '蹭蹭', '想你', '爱你', '心跳', '脸红', '耳朵热'];
+    const plans = [];
+    for (const chunk of chunks) {
+      const rawIds = Array.isArray(chunk.raw_event_ids)
+        ? chunk.raw_event_ids
+        : db.prepare('SELECT raw_event_id FROM chunk_events WHERE chunk_id=? ORDER BY position').all(chunk.id).map((row) => row.raw_event_id);
+      const rawRows = rawIds.length ? db.prepare(`SELECT content FROM raw_events WHERE id IN (${rawIds.map(() => '?').join(',')})`).all(...rawIds) : [];
+      const text = rawRows.map((row) => row.content || '').join('\n');
+      const matched = patterns.filter((term) => text.includes(term));
+      if (!matched.length) continue;
+      const dedupeKey = hash(`heartbeat:${chunk.id}`);
+      if (db.prepare('SELECT id FROM memory_candidates WHERE dedupe_key=?').get(dedupeKey)) continue;
+      const isPrivate = ['private', 'intimate'].includes(chunk.channel);
+      plans.push({
+        id: crypto.randomUUID(), raw_event_ids: rawIds,
+        source_chunk_ids: [chunk.id], dedupe_key: dedupeKey, source: chunk.source, channel: chunk.channel, speaker: '',
+        summary: isPrivate ? `一段可能值得记住的亲密时刻（${chunk.start_time} 至 ${chunk.end_time}）` : `可能值得记住的关系时刻：${truncate(chunk.summary, 140)}`,
+        suggested_category: isPrivate ? 'private_candidate' : 'relationship', candidate_type: 'relationship_moment',
+        reason: `batch heartbeat detector: ${matched.slice(0, 6).join('/')}`, importance: Math.min(1, 0.65 + matched.length * 0.05),
+        suggested_tags: ['heartbeat-candidate', 'review-required'], evidence_preview: isPrivate ? '私密原文仅保留在 raw_events' : truncate(chunk.summary, 180),
+        relation_hints: ['emotional_link', 'same_event'],
+      });
+      if (plans.length >= clamp(limit, 1, 200)) break;
+    }
+    if (!dry_run) {
+      const insert = db.prepare(`INSERT OR IGNORE INTO memory_candidates
+        (id,raw_event_ids,dedupe_key,source,channel,speaker,summary,suggested_category,reason,confidence,status,created_at,updated_at,expires_at,source_chunk_ids,candidate_type,importance,suggested_tags,evidence_preview,relation_hints)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
+      const expires = new Date(Date.now() + 7 * 86400000).toISOString();
+      for (const item of plans) insert.run(item.id, JSON.stringify(item.raw_event_ids), item.dedupe_key, item.source, item.channel, item.speaker, item.summary, item.suggested_category, item.reason, 0.62, 'pending', nowIso(), nowIso(), expires, JSON.stringify(item.source_chunk_ids), item.candidate_type, item.importance, JSON.stringify(item.suggested_tags), item.evidence_preview, JSON.stringify(item.relation_hints));
+    }
+    return { dry_run, scanned_chunks: chunks.length, planned_count: plans.length, written_count: dry_run ? 0 : plans.length, candidates: plans, note: 'Review-gated only; no formal memory is written and no BPM is fabricated.' };
+  }
+
+  function quarantineHeartbeatPollution({ dry_run = true, limit = 200 } = {}) {
+    const rows = db.prepare(`SELECT id,category,source,status,protected FROM memories
+      WHERE source='heartbeat_detector' AND deleted_at IS NULL AND COALESCE(status,'current')='current'
+      ORDER BY created_at DESC LIMIT ?`).all(clamp(limit, 1, 1000));
+    if (!dry_run) {
+      const update = db.prepare("UPDATE memories SET status='review',lifecycle_bucket='quarantine',updated_at=? WHERE id=? AND source='heartbeat_detector' AND COALESCE(status,'current')='current'");
+      for (const row of rows) update.run(nowIso(), row.id);
+    }
+    return { dry_run, planned_count: rows.length, quarantined_count: dry_run ? 0 : rows.length, memories: rows, note: 'Quarantine only: rows are never deleted and require human review.' };
+  }
+
+  async function runNap({ dry_run = true, limit = 25 } = {}) {
+    const missingVectors = db.prepare(`SELECT id,category FROM memories WHERE deleted_at IS NULL AND superseded_by IS NULL AND COALESCE(status,'current')='current' AND embedding IS NULL ORDER BY created_at DESC LIMIT ?`).all(clamp(limit, 1, 100));
+    const orphanRows = db.prepare(`SELECT m.id,m.category FROM memories m WHERE m.deleted_at IS NULL AND m.superseded_by IS NULL AND COALESCE(m.status,'current')='current' AND NOT EXISTS (SELECT 1 FROM memory_edges e WHERE e.source_id=m.id OR e.target_id=m.id) ORDER BY m.created_at DESC LIMIT ?`).all(clamp(limit, 1, 100));
+    const relations = buildSafeRelations({ since_hours: 168, limit: clamp(limit, 1, 100), dry_run });
+    let vectorsWritten = 0;
+    const errors = [];
+    const skipped = [];
+    if (!embedText) skipped.push('vectors: embedding writer not configured');
+    else if (!dry_run) {
+      const update = db.prepare('UPDATE memories SET embedding=?,updated_at=? WHERE id=? AND embedding IS NULL');
+      for (const row of missingVectors) {
+        try {
+          const memory = db.prepare('SELECT content FROM memories WHERE id=?').get(row.id);
+          const embedding = await embedText(memory?.content || '');
+          if (Array.isArray(embedding) && embedding.length) {
+            vectorsWritten += update.run(JSON.stringify(embedding), nowIso(), row.id).changes;
+          } else skipped.push(`vector:${row.id}: provider unavailable`);
+        } catch (error) {
+          errors.push(`vector:${row.id}:${error.message}`);
+        }
+      }
+    }
+    return { dry_run, ok: errors.length === 0, scanned_memories: missingVectors.length, vectors_written: vectorsWritten, missing_vectors: missingVectors, orphan_memories_scanned: orphanRows.length, orphan_memories: orphanRows, relations, skipped, errors, note: 'Nap never promotes durable memories.' };
+  }
+
+  function inspectDreamReadiness() {
+    const last = db.prepare('SELECT * FROM dream_runs ORDER BY started_at DESC LIMIT 1').get() || null;
+    const active = last?.status === 'running' && Date.now() - new Date(last.started_at).getTime() < 2 * 3600000;
+    return { ready: !active, busy: !!active, schedule: 'existing patrol cron', last_run: last ? { ...last, step_results: safeJsonArray(last.step_results) } : null, pending_candidates: db.prepare("SELECT COUNT(*) AS c FROM memory_candidates WHERE status='pending'").get().c, open_chunks: db.prepare("SELECT COUNT(*) AS c FROM event_chunks WHERE status='open'").get().c };
+  }
+
+  function listDreamRuns({ limit = 20 } = {}) {
+    return db.prepare('SELECT * FROM dream_runs ORDER BY started_at DESC LIMIT ?').all(clamp(limit, 1, 100)).map((row) => ({ ...row, step_results: safeJsonArray(row.step_results) }));
+  }
+
   function refreshSpontaneous({ limit = 6, dry_run = true } = {}) {
     const rows = db.prepare(`
       SELECT m.*,e.arousal,e.valence FROM memories m LEFT JOIN e_axis_scores e ON e.memory_id=m.id
@@ -537,7 +732,7 @@ export function createLmcClosureService({ db, dataDir, dbPath }) {
       FROM spontaneous_cache c JOIN memories m ON m.id=c.memory_id
       WHERE c.expires_at>? AND m.deleted_at IS NULL AND m.superseded_by IS NULL AND COALESCE(m.status,'current')='current'
       ORDER BY c.score DESC,c.surfaced_count ASC LIMIT 100
-    `).all(nowIso()).filter((row) => !excluded.has(row.id)).slice(0, clamp(limit, 1, 3));
+    `).all(nowIso()).filter((row) => !excluded.has(row.id) && metabolicGate(row, 'surface').allowed).slice(0, clamp(limit, 1, 3));
     if (consume) {
       const ts = nowIso();
       for (const row of rows) {
@@ -613,7 +808,7 @@ export function createLmcClosureService({ db, dataDir, dbPath }) {
     return { dry_run, raw_count: rows.length, chunk_count: chunks.length, chunks };
   }
 
-  function proposeChunkCandidates({ limit = 50, dry_run = true, extra_chunks = [] } = {}) {
+  function proposeChunkCandidates({ limit = 50, dry_run = true, extra_chunks = [], exclude_chunk_ids = [] } = {}) {
     const rows = [
       ...db.prepare("SELECT * FROM event_chunks WHERE status='open' ORDER BY created_at ASC LIMIT ?").all(Math.max(500, clamp(limit, 1, 200) * 10)),
       ...(Array.isArray(extra_chunks) ? extra_chunks : []),
@@ -623,7 +818,9 @@ export function createLmcClosureService({ db, dataDir, dbPath }) {
     const usedRawIds = new Set(existingCandidates.flatMap((row) => safeJsonArray(row.raw_event_ids)));
     const existingChunkIds = new Set(existingCandidates.flatMap((row) => safeJsonArray(row.source_chunk_ids)));
     const plans = [];
+    const excludedChunkIds = new Set(exclude_chunk_ids || []);
     for (const chunk of rows) {
+      if (excludedChunkIds.has(chunk.id)) continue;
       if (existingChunkIds.has(chunk.id)) continue;
       const type = candidateCategory(chunk);
       const rawIds = Array.isArray(chunk.raw_event_ids)
@@ -675,6 +872,15 @@ export function createLmcClosureService({ db, dataDir, dbPath }) {
   }
 
   async function runNight({ since_hours = 24, source = 'all', channel = 'all', dry_run = true, save_report = true } = {}) {
+    const dreamRunId = crypto.randomUUID();
+    const startedAt = nowIso();
+    if (!dry_run) {
+      const active = db.prepare("SELECT id,started_at FROM dream_runs WHERE status='running' AND started_at>? ORDER BY started_at DESC LIMIT 1")
+        .get(new Date(Date.now() - 2 * 3600000).toISOString());
+      if (active) return { dry_run: false, status: 'busy', active_run: active, note: 'A recent night-dream run is still active; no second run was started.' };
+    }
+    if (!dry_run) db.prepare("INSERT INTO dream_runs (id,mode,status,dry_run,started_at,step_results,error) VALUES (?,'night_dream','running',0,?,'[]','')").run(dreamRunId, startedAt);
+    try {
     const snapshot = createSnapshot({ reason: 'nightly LMC maintenance', dry_run });
     const expiredRows = db.prepare("SELECT id FROM memories WHERE deleted_at IS NULL AND protected=0 AND expires_at IS NOT NULL AND expires_at<?").all(nowIso());
     if (!dry_run) {
@@ -682,7 +888,9 @@ export function createLmcClosureService({ db, dataDir, dbPath }) {
       for (const row of expiredRows) softDelete.run(nowIso(), nowIso(), row.id);
     }
     const consolidation = consolidate({ since_hours, source, channel, dry_run });
-    const candidates = proposeChunkCandidates({ limit: 50, dry_run, extra_chunks: dry_run ? consolidation.chunks : [] });
+    const nap = await runNap({ dry_run, limit: 25 });
+    const heartbeat = detectHeartbeatCandidates({ since_hours, limit: 50, dry_run, extra_chunks: dry_run ? consolidation.chunks : [] });
+    const candidates = proposeChunkCandidates({ limit: 50, dry_run, extra_chunks: dry_run ? consolidation.chunks : [], exclude_chunk_ids: heartbeat.candidates.flatMap((item) => item.source_chunk_ids) });
     if (!dry_run) db.prepare("UPDATE memory_candidates SET status='stale',updated_at=? WHERE status='pending' AND expires_at IS NOT NULL AND expires_at<?").run(nowIso(), nowIso());
     const relations = buildSafeRelations({ since_hours: Math.max(168, since_hours), limit: 200, dry_run });
     const zAxis = runZAxisAudit({ limit: 100, dry_run });
@@ -690,26 +898,40 @@ export function createLmcClosureService({ db, dataDir, dbPath }) {
     const narrative = runNarrative({ period_type: 'both', dry_run });
     const spontaneous = refreshSpontaneous({ limit: 6, dry_run });
     const metabolism = inspectMetabolism({ limit: 50 });
+    const otherIncubation = inspectOtherIncubation();
     const edges = edgeHealth();
     const status = edges.issue_count || zAxis.conflict_count ? 'needs_review' : 'ok';
     const summary = [
       `夜间闭环：raw ${consolidation.raw_count} 条，chunk ${consolidation.chunk_count} 段，候选 ${candidates.planned_count} 条，短期过期 ${expiredRows.length} 条。`,
+      `小睡检查：缺向量 ${nap.scanned_memories} 条，孤立记忆 ${nap.orphan_memories_scanned} 条；心跳待审 ${heartbeat.planned_count} 条。`,
       `Y轴计划 ${relations.planned_count} 条；Z轴冲突 ${zAxis.conflict_count} 组；E轴评分 ${eAxis.count} 条。`,
-      `叙事 ${narrative.planned_count} 条；自发缓存 ${spontaneous.planned_count} 条；坏边 ${edges.issue_count} 条。`,
+      `叙事 ${narrative.planned_count} 条；other孵化建议 ${otherIncubation.suggestion_count} 条；自发缓存 ${spontaneous.planned_count} 条；坏边 ${edges.issue_count} 条。`,
     ].join('\n');
     let reportId = null;
     if (!dry_run && save_report) {
       reportId = crypto.randomUUID();
       db.prepare('INSERT INTO memory_patrol_reports (id,status,summary,payload,created_at) VALUES (?,?,?,?,?)')
-        .run(reportId, status, summary, JSON.stringify({ snapshot, consolidation, candidates, relations, z_axis: zAxis, e_axis: eAxis, narrative, spontaneous, metabolism, edge_health: edges }), nowIso());
+        .run(reportId, status, summary, JSON.stringify({ snapshot, consolidation, nap, heartbeat, candidates, relations, z_axis: zAxis, e_axis: eAxis, narrative, other_incubation: otherIncubation, spontaneous, metabolism, edge_health: edges }), nowIso());
     }
-    return { dry_run, report_id: reportId, status, summary, snapshot, expired: { planned_count: expiredRows.length, soft_deleted_count: dry_run ? 0 : expiredRows.length }, consolidation, candidates, relations, z_axis: zAxis, e_axis: eAxis, narrative, spontaneous, metabolism, edge_health: edges, note: 'No candidate was published as a formal memory.' };
+    const stepResults = [
+      ['snapshot', snapshot], ['consolidate', consolidation], ['nap', nap], ['heartbeat_detect', heartbeat],
+      ['hippocampus', candidates], ['y_axis', relations], ['z_audit', zAxis], ['e_axis', eAxis],
+      ['narrative', narrative], ['other_incubation', otherIncubation], ['spontaneous', spontaneous], ['patrol', edges],
+    ].map(([name, output]) => ({ name, status: 'ok', output }));
+    if (!dry_run) db.prepare('UPDATE dream_runs SET status=?,finished_at=?,step_results=? WHERE id=?').run(status, nowIso(), JSON.stringify(stepResults), dreamRunId);
+    return { dry_run, dream_run_id: dry_run ? null : dreamRunId, report_id: reportId, status, summary, snapshot, expired: { planned_count: expiredRows.length, soft_deleted_count: dry_run ? 0 : expiredRows.length }, consolidation, nap, heartbeat, candidates, relations, z_axis: zAxis, e_axis: eAxis, narrative, other_incubation: otherIncubation, spontaneous, metabolism, edge_health: edges, note: 'No candidate was published as a formal memory.' };
+    } catch (error) {
+      if (!dry_run) db.prepare("UPDATE dream_runs SET status='error',finished_at=?,error=? WHERE id=?").run(nowIso(), String(error?.message || error), dreamRunId);
+      throw error;
+    }
   }
 
   return {
     createSnapshot, listSnapshots, restoreSnapshot, inspectMetabolism, scoreEAxis, runZAxisAudit,
     buildSafeRelations, addRelation, listRelationReviews, reviewRelation, runNarrative, listNarratives,
     refreshSpontaneous, surfaceSpontaneous, buildCarryover, consolidate, proposeChunkCandidates,
+    metabolicGateForRecall, recordRecallTrace, listRecallTraces, addRecallFeedback,
+    inspectOtherIncubation, detectHeartbeatCandidates, quarantineHeartbeatPollution, runNap, inspectDreamReadiness, listDreamRuns,
     edgeHealth, cleanupEdges, runNight,
   };
 }
@@ -760,6 +982,28 @@ export function registerLmcClosureTools(mcp, z, service) {
   tool('build_refined_carryover', 'Read-only refined carryover. Does not change wakeup category rules.', {
     since_hours: z.number().min(1).max(720).optional(), tail_limit: z.number().int().min(1).max(30).optional(), memory_limit: z.number().int().min(1).max(30).optional(), include_private: z.boolean().optional(), max_chars: z.number().int().min(1000).max(20000).optional(),
   }, service.buildCarryover);
+  tool('list_recall_traces', 'List explainable recall runs and per-hit layer/score evidence.', {
+    trace_id: z.string().optional(), limit: z.number().int().min(1).max(100).optional(),
+  }, service.listRecallTraces);
+  tool('record_recall_feedback', 'Attach review feedback to a recall trace. Telemetry only; never rewrites memory or personality.', {
+    trace_id: z.string().min(1), memory_id: z.string().optional(), outcome: z.enum(['useful', 'irrelevant', 'misleading']), note: z.string().max(500).optional(),
+  }, service.addRecallFeedback);
+  tool('inspect_other_incubation', 'Read-only X-axis three-stage incubation report for the other thread.', {
+    observe_threshold: z.number().int().min(2).max(20).optional(), candidate_threshold: z.number().int().min(3).max(30).optional(), formal_threshold: z.number().int().min(5).max(50).optional(), formal_min_span_days: z.number().int().min(1).max(365).optional(), formal_min_hits: z.number().int().min(0).max(100).optional(),
+  }, service.inspectOtherIncubation);
+  tool('detect_heartbeat_candidates', 'Batch-detect relationship moments into review-gated candidates only.', {
+    since_hours: z.number().min(1).max(720).optional(), limit: z.number().int().min(1).max(200).optional(), dry_run: z.boolean().default(true),
+  }, service.detectHeartbeatCandidates);
+  tool('quarantine_heartbeat_pollution', 'Find or quarantine legacy heartbeat_detector rows that bypassed candidate review. Never deletes.', {
+    limit: z.number().int().min(1).max(1000).optional(), dry_run: z.boolean().default(true),
+  }, service.quarantineHeartbeatPollution);
+  tool('run_lmc_nap', 'Run lightweight vector/relation readiness checks without promoting memories.', {
+    limit: z.number().int().min(1).max(100).optional(), dry_run: z.boolean().default(true),
+  }, service.runNap);
+  tool('inspect_dream_readiness', 'Inspect night-dream readiness and the most recent run.', {}, service.inspectDreamReadiness);
+  tool('list_dream_runs', 'List observable night-dream runs and step results.', {
+    limit: z.number().int().min(1).max(100).optional(),
+  }, service.listDreamRuns);
   tool('run_lmc_night_maintenance', 'Run the complete LMC night loop without publishing formal memories.', {
     since_hours: z.number().min(1).max(720).optional(), source: z.string().optional(), channel: z.enum(['cc', 'daily', 'intimate', 'private', 'group', 'normal', 'all']).optional(), dry_run: z.boolean().default(true), save_report: z.boolean().optional(),
   }, service.runNight);

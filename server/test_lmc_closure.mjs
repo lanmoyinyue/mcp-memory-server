@@ -13,17 +13,18 @@ import {
 
 const dataDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'ke-lmc-closure-'));
 const dbPath = path.join(dataDir, 'memories.db');
+let db = null;
 
 try {
   prepareMemoryStorage({ dataDir, dbPath });
-  let db = new Database(dbPath);
+  db = new Database(dbPath);
   db.exec(`
     CREATE TABLE memories (
       id TEXT PRIMARY KEY, content TEXT NOT NULL, category TEXT NOT NULL,
       tags TEXT NOT NULL DEFAULT '[]', source TEXT NOT NULL DEFAULT '', mood TEXT,
       created_at TEXT NOT NULL, updated_at TEXT NOT NULL, expires_at TEXT,
       protected INTEGER NOT NULL DEFAULT 0, activation_score REAL NOT NULL DEFAULT 0,
-      superseded_by TEXT, status TEXT NOT NULL DEFAULT 'current'
+      superseded_by TEXT, status TEXT NOT NULL DEFAULT 'current', embedding TEXT
     );
     CREATE TABLE e_axis_scores (
       memory_id TEXT PRIMARY KEY, valence REAL, arousal REAL, tension REAL,
@@ -63,7 +64,8 @@ try {
       confidence REAL NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'pending', created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL, expires_at TEXT, source_chunk_ids TEXT NOT NULL DEFAULT '[]',
       candidate_type TEXT NOT NULL DEFAULT '', importance REAL NOT NULL DEFAULT 0,
-      suggested_tags TEXT NOT NULL DEFAULT '[]', evidence_preview TEXT NOT NULL DEFAULT ''
+      suggested_tags TEXT NOT NULL DEFAULT '[]', evidence_preview TEXT NOT NULL DEFAULT '',
+      relation_hints TEXT NOT NULL DEFAULT '[]'
     );
     CREATE TABLE z_conflict_audits (
       id TEXT PRIMARY KEY, fact_key TEXT NOT NULL, stale_id TEXT, current_id TEXT,
@@ -109,6 +111,54 @@ try {
   const idempotentTemporal = service.buildSafeRelations({ since_hours: 24, limit: 20, dry_run: true });
   assert.ok(!idempotentTemporal.relations.some((edge) => edge.source_id === 'm9' && edge.target_id === 'm7'), JSON.stringify(idempotentTemporal, null, 2));
 
+  assert.equal(service.metabolicGateForRecall({ status: 'current', source: 'debug', category: 'log' }).allowed, false);
+  assert.equal(service.metabolicGateForRecall({ status: 'current', protected: 1, source: 'debug', category: 'deep' }).allowed, true);
+
+  const incubation = service.inspectOtherIncubation();
+  assert.ok(incubation.suggestions.some((item) => item.group_kind === 'category' && item.group_key === 'work' && item.stage === 'observe_cluster'));
+
+  const trace = service.recordRecallTrace({
+    query: '快照内容', channels: ['keyword'], requested_count: 3,
+    layers: {
+      main_recall: [{ id: 'm1', recall_score: 0.02, score_breakdown: { final: 0.02 }, recall_channels: ['keyword'] }],
+      source_neighborhood: [{ id: 'chunk-nav' }], graph_expansion: [], fallback_archive: [],
+    },
+  });
+  const traced = service.listRecallTraces({ trace_id: trace.recall_run_id });
+  assert.equal(traced.length, 1);
+  assert.equal(traced[0].items[0].evidence_role, 'authority');
+  assert.equal(traced[0].items[1].evidence_role, 'navigation');
+  assert.equal(service.addRecallFeedback({ trace_id: trace.recall_run_id, memory_id: 'm1', outcome: 'useful' }).outcome, 'useful');
+
+  db.prepare('INSERT INTO raw_events (id,session_id,source,channel,role,speaker,content,timestamp) VALUES (?,?,?,?,?,?,?,?)')
+    .run('r-heart', 's-heart', 'telegram', 'private', 'user', '月亮', '亲亲，抱住你，我很爱你', ts);
+  db.prepare(`INSERT INTO event_chunks (id,dedupe_key,source,channel,session_id,start_event_id,end_event_id,start_time,end_time,event_count,summary,status,created_at,updated_at)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run('c-heart', 'd-heart', 'telegram', 'private', 's-heart', 'r-heart', 'r-heart', ts, ts, 1, '私密元数据', 'open', ts, ts);
+  db.prepare('INSERT INTO chunk_events (chunk_id,raw_event_id,position) VALUES (?,?,?)').run('c-heart', 'r-heart', 0);
+  const heartbeat = service.detectHeartbeatCandidates({ since_hours: 24, dry_run: false });
+  assert.equal(heartbeat.written_count, 1);
+  const heartbeatRow = db.prepare("SELECT * FROM memory_candidates WHERE candidate_type='relationship_moment'").get();
+  assert.equal(heartbeatRow.status, 'pending');
+  assert.equal(heartbeatRow.suggested_category, 'private_candidate');
+  assert.ok(!heartbeatRow.summary.includes('亲亲'));
+  assert.deepEqual(JSON.parse(heartbeatRow.relation_hints), ['emotional_link', 'same_event']);
+  db.prepare('INSERT INTO memories (id,content,category,tags,source,created_at,updated_at) VALUES (?,?,?,?,?,?,?)')
+    .run('m-pollution', 'detector raw output', 'heartbeat', '[]', 'heartbeat_detector', ts, ts);
+  const pollution = service.quarantineHeartbeatPollution({ dry_run: false });
+  assert.equal(pollution.quarantined_count, 1);
+  const quarantined = db.prepare('SELECT status,lifecycle_bucket,deleted_at FROM memories WHERE id=?').get('m-pollution');
+  assert.equal(quarantined.status, 'review');
+  assert.equal(quarantined.lifecycle_bucket, 'quarantine');
+  assert.equal(quarantined.deleted_at, null);
+
+  const nap = await service.runNap({ dry_run: true, limit: 10 });
+  assert.equal(nap.vectors_written, 0);
+  assert.ok(nap.scanned_memories > 0);
+  assert.equal(service.inspectDreamReadiness().ready, true);
+  db.prepare("INSERT INTO dream_runs (id,mode,status,dry_run,started_at,step_results,error) VALUES (?,'night_dream','running',0,?,'[]','')").run('dream-active', ts);
+  assert.equal(service.inspectDreamReadiness().busy, true);
+  db.prepare("UPDATE dream_runs SET status='ok',finished_at=? WHERE id='dream-active'").run(ts);
+
   const snapshot = service.createSnapshot({ reason: 'restore test', dry_run: false });
   assert.ok(fs.existsSync(snapshot.snapshot_path));
   db.prepare('UPDATE memories SET content=? WHERE id=?').run('被改坏的内容', 'm1');
@@ -132,5 +182,6 @@ try {
   console.log('LMC closure snapshot/restore test passed');
 } finally {
   delete process.env.MEMORY_ALLOW_SNAPSHOT_RESTORE;
+  try { db?.close(); } catch {}
   await fsp.rm(dataDir, { recursive: true, force: true });
 }

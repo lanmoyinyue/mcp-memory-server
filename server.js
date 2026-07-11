@@ -307,7 +307,12 @@ try { db.exec('CREATE INDEX IF NOT EXISTS idx_candidate_expires ON memory_candid
 
 // Additive closure tables/columns only. This does not alter wakeup categories or prompt behavior.
 installLmcClosureSchema(db);
-const lmcClosure = createLmcClosureService({ db, dataDir, dbPath });
+const lmcClosure = createLmcClosureService({
+  db,
+  dataDir,
+  dbPath,
+  embedText: async (text) => (await getEmbeddingDetailed(text)).embedding,
+});
 
 const contentHash = (text, category) => crypto.createHash('sha256').update(`${category}:${text.trim()}`).digest('hex');
 
@@ -2859,25 +2864,39 @@ function createMcpServer() {
       const K = 60;
       const fuse = new Map();
       keywordRows.forEach((r, i) => {
-        const e = fuse.get(r.id) || { row: r, score: 0, channels: [] };
+        const e = fuse.get(r.id) || { row: r, score: 0, channels: [], ranks: {} };
         e.score += 1 / (K + i + 1);
         e.channels.push('keyword');
+        e.ranks.keyword = i + 1;
         fuse.set(r.id, e);
       });
       semanticRows.forEach((r, i) => {
-        const e = fuse.get(r.id) || { row: r, score: 0, channels: [] };
+        const e = fuse.get(r.id) || { row: r, score: 0, channels: [], ranks: {} };
         e.score += 1 / (K + i + 1);
         e.channels.push('semantic');
+        e.ranks.semantic = i + 1;
         fuse.set(r.id, e);
       });
       const primary = [...fuse.values()]
         .sort((a, b) => b.score - a.score)
+        .map(e => ({ ...e, gate: lmcClosure.metabolicGateForRecall(e.row, { mode: 'recall' }) }))
+        .filter(e => e.gate.allowed)
         .slice(0, limit)
-        .map(e => ({ ...fmt(e.row), recall_score: +e.score.toFixed(4), recall_channels: [...new Set(e.channels)] }));
-      const graph = graph_hops > 0 ? graphExpand(primary.map(r => r.id), { hops: graph_hops, limit }) : [];
+        .map(e => ({
+          ...fmt(e.row), recall_score: +(e.score * e.gate.factor).toFixed(4), recall_channels: [...new Set(e.channels)],
+          recall_layer: 'main_recall', recall_tier: 'authority', evidence_role: 'authority', metabolic_gate: e.gate,
+          score_breakdown: { final: +(e.score * e.gate.factor).toFixed(4), rrf_k: K, keyword_rank: e.ranks.keyword || null, semantic_rank: e.ranks.semantic || null, metabolic_factor: e.gate.factor },
+        }));
+      const graph = (graph_hops > 0 ? graphExpand(primary.map(r => r.id), { hops: graph_hops, limit }) : [])
+        .map((row) => ({ ...row, gate: lmcClosure.metabolicGateForRecall(row, { mode: 'recall' }) }))
+        .filter((row) => row.gate.allowed)
+        .map((row) => {
+          const finalScore = +(row.graph_score * row.gate.factor).toFixed(4);
+          return { ...row, graph_score: finalScore, recall_layer: 'graph_expansion', recall_tier: 'association', evidence_role: 'association', metabolic_gate: row.gate, score_breakdown: { final: finalScore, graph_score: row.graph_score, depth: row.graph_depth, metabolic_factor: row.gate.factor } };
+        });
       const raw = fallback_to_raw ? rawEventSearch({ query, mode: 'exact', channel: 'all', limit: 5 }).rows.map(fmtRawEvent) : [];
       const chunks = include_chunks
-        ? db.prepare('SELECT * FROM event_chunks WHERE summary LIKE ? ORDER BY created_at DESC LIMIT ?').all(`%${query}%`, Math.min(5, limit)).map(fmtEventChunk)
+        ? db.prepare('SELECT * FROM event_chunks WHERE summary LIKE ? ORDER BY created_at DESC LIMIT ?').all(`%${query}%`, Math.min(5, limit, primary.length)).map(fmtEventChunk)
         : [];
       const lines = [];
       for (const mem of primary.slice(0, 5)) lines.push(`- ${mem.category} ${mem.id.slice(0, 8)}：${truncateText(mem.content, 220)}`);
@@ -2885,6 +2904,13 @@ function createMcpServer() {
       if (raw.length) lines.push(`- 原始证据命中 ${raw.length} 条，可按需查看 raw_fallback。`);
       if (chunks.length) lines.push(`- 片段命中 ${chunks.length} 条，可按需查看 chunks。`);
       const injection_text = lines.join('\n').slice(0, 5000);
+      const layers = {
+        main_recall: primary,
+        source_neighborhood: chunks.map((row) => ({ ...row, recall_layer: 'source_neighborhood', recall_tier: 'navigation', evidence_role: 'navigation', source_label: 'event_chunk' })),
+        graph_expansion: graph,
+        fallback_archive: raw.map((row) => ({ ...row, recall_layer: 'fallback_archive', recall_tier: 'last_resort', evidence_role: 'last_resort', source_label: 'raw_event' })),
+      };
+      const trace = lmcClosure.recordRecallTrace({ query, channels: [...new Set([...primary.flatMap((row) => row.recall_channels), ...(graph.length ? ['graph'] : []), ...(chunks.length ? ['chunk'] : []), ...(raw.length ? ['raw_exact'] : [])])], layers, requested_count: limit });
       return {
         content: [{
           type: 'text',
@@ -2894,12 +2920,14 @@ function createMcpServer() {
             graph,
             raw_fallback: raw,
             chunks,
+            layers,
+            recall_trace: trace,
             injection_text,
             semantic_enabled: !!embedding,
             semantic_error: embedding ? null : embeddingResult.error,
             semantic_attempts: embeddingResult.attempts,
             keyword_terms: keywordSearch.terms,
-            note: 'Z-axis filters current memories by default; E-axis is still shadow-only.',
+            note: 'Layer roles are strict: main=authority, chunks=navigation, graph=association, raw=last resort. M-axis gates output; E-axis remains shadow-only.',
           }, null, 2),
         }],
       };

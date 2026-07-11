@@ -90,6 +90,14 @@ try {
     'refresh_spontaneous_cache',
     'surface_spontaneous_memory',
     'build_refined_carryover',
+    'list_recall_traces',
+    'record_recall_feedback',
+    'inspect_other_incubation',
+    'detect_heartbeat_candidates',
+    'quarantine_heartbeat_pollution',
+    'run_lmc_nap',
+    'inspect_dream_readiness',
+    'list_dream_runs',
     'run_lmc_night_maintenance',
   ]) {
     assert.ok(toolNames.includes(name), `missing MCP tool: ${name}`);
@@ -715,6 +723,15 @@ try {
   assert.ok(recalled.graph.some(m => m.id === protectedFact.saved.id), JSON.stringify(recalled, null, 2));
   assert.equal(recalled.semantic_enabled, false, JSON.stringify(recalled, null, 2));
   assert.equal(recalled.semantic_error, 'missing_key', JSON.stringify(recalled, null, 2));
+  assert.equal(recalled.layers.main_recall[0].evidence_role, 'authority');
+  assert.ok(recalled.recall_trace.recall_run_id);
+  assert.ok(recalled.primary.every(m => m.score_breakdown.final === m.recall_score));
+  assert.ok(recalled.layers.source_neighborhood.length <= recalled.layers.main_recall.length);
+  const recallTraces = await callTool(client, 'list_recall_traces', { trace_id: recalled.recall_trace.recall_run_id });
+  assert.equal(recallTraces.length, 1);
+  assert.ok(recallTraces[0].items.some(item => item.evidence_role === 'authority'));
+  const recallFeedback = await callTool(client, 'record_recall_feedback', { trace_id: recalled.recall_trace.recall_run_id, memory_id: factV2.saved.id, outcome: 'useful' });
+  assert.equal(recallFeedback.outcome, 'useful');
 
   const identityRecall = await callTool(client, 'recall_lmc', {
     query: '克 窗口 身份',
@@ -792,6 +809,16 @@ try {
 
   const carryover = await callTool(client, 'build_refined_carryover', { since_hours: 24, include_private: false });
   assert.ok(carryover.text.includes('[精炼交接]'));
+  const otherIncubation = await callTool(client, 'inspect_other_incubation', {});
+  assert.equal(typeof otherIncubation.suggestion_count, 'number');
+  const heartbeatPreview = await callTool(client, 'detect_heartbeat_candidates', { since_hours: 24, dry_run: true });
+  assert.ok(heartbeatPreview.note.toLowerCase().includes('no formal memory'));
+  const pollutionPreview = await callTool(client, 'quarantine_heartbeat_pollution', { dry_run: true });
+  assert.equal(pollutionPreview.quarantined_count, 0);
+  const napPreview = await callTool(client, 'run_lmc_nap', { dry_run: true, limit: 10 });
+  assert.equal(napPreview.vectors_written, 0);
+  const dreamReady = await callTool(client, 'inspect_dream_readiness', {});
+  assert.equal(dreamReady.ready, true);
 
   const nightSnapshotsBefore = await callTool(client, 'list_memory_snapshots', { limit: 100 });
   const dryRunDb = new Database(path.join(dataDir, 'memories.db'));
@@ -817,6 +844,12 @@ try {
   assert.equal(nightLive.dry_run, false);
   assert.ok(nightLive.snapshot.id);
   assert.ok(nightLive.report_id);
+  assert.ok(nightLive.dream_run_id);
+  assert.ok(nightLive.nap);
+  assert.ok(nightLive.heartbeat);
+  assert.ok(nightLive.other_incubation);
+  const dreamRuns = await callTool(client, 'list_dream_runs', { limit: 5 });
+  assert.ok(dreamRuns.some(run => run.id === nightLive.dream_run_id));
 
   await client.close();
   console.log('LMC-5 local MCP test passed');
