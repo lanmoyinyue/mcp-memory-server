@@ -449,6 +449,82 @@ const fmtMemoryEdge = (r) => ({
   updated_at: r.updated_at || null,
 });
 
+function exportMemoryGraph({ limit = 1000, edge_limit = 5000, content_chars = 360 } = {}) {
+  const now = new Date().toISOString();
+  const nodeLimit = Math.max(1, Math.min(2000, Number(limit) || 1000));
+  const edgeLimit = Math.max(0, Math.min(10000, Number(edge_limit) || 5000));
+  const contentLimit = Math.max(80, Math.min(800, Number(content_chars) || 360));
+  const rows = db.prepare(`
+    SELECT m.*, e.valence, e.arousal, e.tension, e.confidence, e.risk_level
+    FROM memories m
+    LEFT JOIN e_axis_scores e ON e.memory_id = m.id
+    WHERE (m.expires_at IS NULL OR m.expires_at > ?)
+      AND ${currentMemorySql('m')}
+    ORDER BY m.protected DESC,
+             COALESCE(m.weight, 1) DESC,
+             COALESCE(m.importance, 0.5) DESC,
+             m.created_at DESC
+    LIMIT ?
+  `).all(now, nodeLimit);
+
+  const nodes = rows.map(row => {
+    const memory = fmt(row);
+    const content = truncateText(memory.content, contentLimit);
+    const firstLine = String(memory.content || '').split(/\r?\n/).find(Boolean) || memory.category || '记忆';
+    return {
+      id: memory.id,
+      label: truncateText(firstLine.replace(/^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}\s+\[[^\]]+\]\s*/, ''), 34),
+      content,
+      category: memory.category,
+      thread: memory.thread,
+      mood: memory.mood,
+      protected: memory.protected,
+      weight: memory.weight,
+      importance: memory.importance,
+      activation_score: memory.activation_score,
+      created_at: memory.created_at,
+      valence: row.valence === null || row.valence === undefined ? null : Number(row.valence),
+      arousal: row.arousal === null || row.arousal === undefined ? null : Number(row.arousal),
+      tension: row.tension === null || row.tension === undefined ? null : Number(row.tension),
+      confidence: row.confidence === null || row.confidence === undefined ? null : Number(row.confidence),
+      risk_level: row.risk_level === null || row.risk_level === undefined ? null : Number(row.risk_level),
+    };
+  });
+
+  const nodeIds = new Set(nodes.map(node => node.id));
+  const edges = edgeLimit
+    ? db.prepare(`
+        SELECT * FROM memory_edges
+        WHERE COALESCE(status, 'safe') = 'safe'
+        ORDER BY COALESCE(strength, weight, 0) DESC, created_at DESC
+        LIMIT ?
+      `).all(edgeLimit)
+      .filter(row => nodeIds.has(row.source_id)
+        && nodeIds.has(row.target_id)
+        && relationIsSafe(row.relation_type, row.status || 'safe'))
+      .map(row => ({
+        id: `${row.source_id}:${row.target_id}`,
+        source: row.source_id,
+        target: row.target_id,
+        relation_type: row.relation_type || 'semantic',
+        strength: Number(row.strength || row.weight || 0),
+      }))
+    : [];
+
+  return {
+    generated_at: now,
+    nodes,
+    edges,
+    stats: {
+      node_count: nodes.length,
+      edge_count: edges.length,
+      protected_count: nodes.filter(node => node.protected).length,
+      current_only: true,
+      safe_edges_only: true,
+    },
+  };
+}
+
 const fmtZAudit = (r) => ({
   id: r.id,
   fact_key: r.fact_key,
@@ -2208,6 +2284,24 @@ function createMcpServer() {
         }],
       };
     }
+  );
+
+  // Read-only graph export for the memory starmap. It never includes raw_events,
+  // non-current memories, or relation edges outside the safe graph.
+  mcp.tool(
+    'export_memory_graph',
+    'Export current curated memories and safe relation edges for a read-only visualization. Never writes memory data.',
+    {
+      limit: z.number().int().min(1).max(2000).default(1000),
+      edge_limit: z.number().int().min(0).max(10000).default(5000),
+      content_chars: z.number().int().min(80).max(800).default(360),
+    },
+    async ({ limit = 1000, edge_limit = 5000, content_chars = 360 }) => ({
+      content: [{
+        type: 'text',
+        text: JSON.stringify(exportMemoryGraph({ limit, edge_limit, content_chars }), null, 2),
+      }],
+    })
   );
 
   // 8. get_neighbors — find connected memories via edges (for association slot)

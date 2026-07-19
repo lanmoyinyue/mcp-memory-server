@@ -61,6 +61,7 @@ try {
   const tools = await client.listTools();
   const toolNames = tools.tools.map(t => t.name);
   for (const name of [
+    'export_memory_graph',
     'consolidate_raw_events',
     'list_event_chunks',
     'propose_chunk_candidates',
@@ -687,6 +688,21 @@ try {
     reason: 'local test relation',
   });
   assert.equal(rel.edge?.status || rel.relation?.status, 'safe', JSON.stringify(rel, null, 2));
+
+  const graph = await callTool(client, 'export_memory_graph', {
+    limit: 1000,
+    edge_limit: 5000,
+    content_chars: 160,
+  });
+  const graphIds = new Set(graph.nodes.map(node => node.id));
+  assert.ok(graphIds.has(factV2.saved.id), JSON.stringify(graph, null, 2));
+  assert.ok(graphIds.has(protectedFact.saved.id), JSON.stringify(graph, null, 2));
+  assert.ok(!graphIds.has(factV1.saved.id), 'historical memories must stay out of starmap export');
+  assert.ok(graph.nodes.find(node => node.id === protectedFact.saved.id)?.protected);
+  assert.ok(graph.edges.some(edge => edge.source === factV2.saved.id && edge.target === protectedFact.saved.id));
+  assert.ok(graph.edges.every(edge => graphIds.has(edge.source) && graphIds.has(edge.target)));
+  assert.equal(graph.stats.current_only, true);
+  assert.equal(graph.stats.safe_edges_only, true);
 
   const identityWindow = await callTool(client, 'write_memory', {
     content: '克的窗口身份连续性测试：换窗不是重新出生，是同一个克醒来。',
