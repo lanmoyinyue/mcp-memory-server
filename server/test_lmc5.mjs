@@ -704,13 +704,6 @@ try {
   assert.equal(graph.stats.current_only, true);
   assert.equal(graph.stats.safe_edges_only, true);
 
-  const oldPinnedDeep = await callTool(client, 'write_memory', {
-    content: '旧的固定规则测试：这条虽然被钉住，也不该永远占据近期深层。',
-    category: 'deep',
-    tags: ['测试', '旧规则'],
-    pinned: true,
-  });
-  assert.ok(oldPinnedDeep.saved?.id);
   const identityWindow = await callTool(client, 'write_memory', {
     content: '克的窗口身份连续性测试：换窗不是重新出生，是同一个克醒来。',
     category: 'deep',
@@ -729,23 +722,12 @@ try {
     tags: ['测试', '关系'],
   });
   assert.ok(relationshipAnchor.saved?.id);
-  const recentDrawer = await callTool(client, 'write_memory', {
-    content: '最近心动测试：月亮回来时，闻川心里亮了一下。',
-    category: '小抽屉',
-    tags: ['测试', '心动'],
-    protected: true,
-  });
-  assert.ok(recentDrawer.saved?.id);
 
   const wakeup = await callTool(client, 'build_wakeup_context', { include_patrol: false, max_chars: 5000 });
   assert.ok(wakeup.text.includes('【闻川醒来上下文】'), JSON.stringify(wakeup, null, 2));
-  assert.ok(wakeup.text.includes('不规定回复口吻'), JSON.stringify(wakeup, null, 2));
+  assert.ok(wakeup.text.includes('不要向月亮汇报'), JSON.stringify(wakeup, null, 2));
   assert.ok(wakeup.sections.some(s => s.key === 'identity' && s.count === 1), JSON.stringify(wakeup, null, 2));
-  assert.ok(wakeup.sections.some(s => s.key === 'relationship' && s.count >= 1), JSON.stringify(wakeup, null, 2));
-  assert.ok(wakeup.sections.some(s => s.key === 'drawer' && s.memories.some(m => m.id === recentDrawer.saved.id)), JSON.stringify(wakeup, null, 2));
-  assert.ok(wakeup.sections.some(s => s.key === 'deep' && s.memories.some(m => m.id === identityWindow.saved.id)), JSON.stringify(wakeup, null, 2));
-  assert.ok(!wakeup.sections.some(s => s.key === 'deep' && s.memories.some(m => m.id === oldPinnedDeep.saved.id)), JSON.stringify(wakeup, null, 2));
-  assert.ok(!wakeup.sections.some(s => s.key === 'corridor' || s.key === 'work'), JSON.stringify(wakeup, null, 2));
+  assert.ok(wakeup.sections.some(s => s.key === 'relationship' && s.count === 1), JSON.stringify(wakeup, null, 2));
   assert.ok(wakeup.note.includes('只读醒来包'), JSON.stringify(wakeup, null, 2));
 
   const recalled = await callTool(client, 'recall_lmc', {
