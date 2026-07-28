@@ -1066,6 +1066,9 @@ const CANDIDATE_PROMOTION_CATEGORY_MAP = {
   preference_candidate: 'preference',
   boundary_candidate: 'boundary',
   todo_candidate: 'todo',
+  private_candidate: 'diary',
+  private_index: 'diary',
+  intimate: 'diary',
 };
 const PRIVATE_CANDIDATE_CATEGORIES = new Set(['private_candidate', 'private_index', 'intimate']);
 const PROMOTION_MIN_CONFIDENCE = 0.55;
@@ -1089,22 +1092,63 @@ function missingIds(table, ids) {
   return unique.filter(id => !stmt.get(id));
 }
 
-function planCandidatePromotion(candidate) {
+function candidateEvidenceRows(candidate) {
+  const formatted = fmtMemoryCandidate(candidate);
+  const rawById = new Map();
+  const chunks = formatted.source_chunk_ids.length
+    ? db.prepare(`
+      SELECT * FROM event_chunks
+      WHERE id IN (${formatted.source_chunk_ids.map(() => '?').join(',')})
+      ORDER BY start_time ASC
+    `).all(...formatted.source_chunk_ids)
+    : [];
+  if (formatted.raw_event_ids.length) {
+    const rows = db.prepare(`
+      SELECT * FROM raw_events
+      WHERE id IN (${formatted.raw_event_ids.map(() => '?').join(',')})
+      ORDER BY timestamp ASC
+    `).all(...formatted.raw_event_ids);
+    for (const row of rows) rawById.set(row.id, row);
+  }
+  for (const chunk of chunks) {
+    const rows = db.prepare(`
+      SELECT * FROM raw_events
+      WHERE session_id=? AND timestamp>=? AND timestamp<=?
+      ORDER BY timestamp ASC
+    `).all(chunk.session_id || '', chunk.start_time, chunk.end_time);
+    for (const row of rows) rawById.set(row.id, row);
+  }
+  return {
+    rawRows: [...rawById.values()].sort((a, b) => String(a.timestamp).localeCompare(String(b.timestamp))),
+    chunkRows: chunks,
+  };
+}
+
+function candidateEvidenceTranscript(candidate) {
+  const { rawRows } = candidateEvidenceRows(candidate);
+  return rawRows.map((row) => {
+    const speaker = row.speaker || row.role || 'unknown';
+    const timestamp = row.timestamp ? `【${row.timestamp}】` : '';
+    return `${timestamp}${speaker}：${String(row.content || '').trim()}`;
+  }).filter(Boolean).join('\n\n');
+}
+
+function planCandidatePromotion(candidate, { allowPrivate = false } = {}) {
   const formatted = fmtMemoryCandidate(candidate);
   const suggested = formatted.suggested_category;
+  const privateLike = PRIVATE_CANDIDATE_CATEGORIES.has(suggested)
+    || PRIVATE_CANDIDATE_CATEGORIES.has(formatted.candidate_type);
   const targetCategory = promotedCategoryForCandidate(candidate);
   const { rawIds, chunkIds } = candidatePromotionEvidence(candidate);
   const skip = (reason) => ({ action: 'skip', reason, candidate: formatted });
 
   if (formatted.status !== 'accepted') return skip('candidate status is not accepted');
   if (formatted.promoted_memory_id) return skip('candidate already has promoted_memory_id');
-  if (PRIVATE_CANDIDATE_CATEGORIES.has(suggested) || PRIVATE_CANDIDATE_CATEGORIES.has(formatted.candidate_type)) {
-    return skip('private_candidate promotion is disabled in v1');
-  }
-  if (!PROMOTABLE_CANDIDATE_CATEGORIES.has(suggested) && !PROMOTABLE_CANDIDATE_CATEGORIES.has(formatted.candidate_type)) {
+  if (privateLike && !allowPrivate) return skip('private_candidate requires explicit allow_private=true and exact ids');
+  if (!privateLike && !PROMOTABLE_CANDIDATE_CATEGORIES.has(suggested) && !PROMOTABLE_CANDIDATE_CATEGORIES.has(formatted.candidate_type)) {
     return skip(`unsupported candidate category: ${suggested || formatted.candidate_type || '(empty)'}`);
   }
-  if (!String(candidate.summary || '').trim()) return skip('summary is empty');
+  if (!privateLike && !String(candidate.summary || '').trim()) return skip('summary is empty');
   if (formatted.confidence < PROMOTION_MIN_CONFIDENCE) return skip(`confidence below ${PROMOTION_MIN_CONFIDENCE}`);
   if (!rawIds.length && !chunkIds.length) return skip('missing evidence ids');
 
@@ -1113,7 +1157,10 @@ function planCandidatePromotion(candidate) {
   const missingChunkIds = missingIds('event_chunks', chunkIds);
   if (missingChunkIds.length) return skip(`missing event_chunks: ${missingChunkIds.join(',')}`);
 
-  const content = String(candidate.summary || '').trim();
+  const content = privateLike
+    ? candidateEvidenceTranscript(candidate)
+    : String(candidate.summary || '').trim();
+  if (!content) return skip('evidence has no readable content');
   const tags = [...new Set([...formatted.suggested_tags, 'candidate-promoted'])];
   const now = new Date().toISOString();
   const protectedFlag = resolveProtectedFlag(targetCategory, undefined, 0);
@@ -2695,6 +2742,31 @@ function createMcpServer() {
     }
   );
 
+  mcp.tool(
+    'get_candidate_evidence',
+    'Return the authenticated owner-visible original raw events linked to one memory candidate.',
+    {
+      candidate_id: z.string().describe('Memory candidate id'),
+    },
+    async ({ candidate_id }) => {
+      const candidate = db.prepare('SELECT * FROM memory_candidates WHERE id = ?').get(candidate_id);
+      if (!candidate) return { content: [{ type: 'text', text: JSON.stringify({ error: 'candidate not found' }, null, 2) }] };
+      const { rawRows, chunkRows } = candidateEvidenceRows(candidate);
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            candidate: fmtMemoryCandidate(candidate),
+            raw_events: rawRows.map(fmtRawEvent),
+            event_chunks: chunkRows.map(fmtEventChunk),
+            raw_count: rawRows.length,
+            chunk_count: chunkRows.length,
+          }, null, 2),
+        }],
+      };
+    }
+  );
+
   // 16. consolidate_raw_events — X-axis raw events -> event chunks
   mcp.tool(
     'consolidate_raw_events',
@@ -3365,7 +3437,7 @@ function createMcpServer() {
   // 21. promote_memory_candidates — accepted candidates -> review memories
   mcp.tool(
     'promote_memory_candidates',
-    'Promote accepted non-private memory_candidates into formal memories with status=review. dry_run=true by default. Safe relation_hints are written; risky relation_hints are queued as review edges.',
+    'Promote accepted memory_candidates into formal memories with status=review. Private candidates require exact ids plus allow_private=true.',
     {
       ids: z.array(z.string()).optional().describe('Optional exact candidate ids. If present, filters are ignored.'),
       match_status: z.enum(['accepted']).default('accepted').describe('Only accepted candidates can be promoted in v1.'),
@@ -3373,12 +3445,14 @@ function createMcpServer() {
       source: z.string().optional().describe('Optional exact source filter'),
       channel: z.enum(['cc', 'daily', 'intimate', 'private', 'group', 'normal', 'all']).default('all').describe('Optional channel filter'),
       candidate_type: z.string().optional().describe('Optional exact candidate_type filter'),
+      allow_private: z.boolean().default(false).describe('Allow explicitly selected private candidates to use their original evidence as memory content'),
       limit: z.number().int().min(1).max(100).default(50),
       dry_run: z.boolean().default(true),
     },
-    async ({ ids = [], match_status = 'accepted', suggested_category = '', source = '', channel = 'all', candidate_type = '', limit = 50, dry_run = true }) => {
+    async ({ ids = [], match_status = 'accepted', suggested_category = '', source = '', channel = 'all', candidate_type = '', allow_private = false, limit = 50, dry_run = true }) => {
       const rows = selectPromotionCandidates({ ids, match_status, suggested_category, source, channel, candidate_type, limit });
-      const plans = rows.map(planCandidatePromotion);
+      const privateAllowed = allow_private && ids.length > 0;
+      const plans = rows.map((row) => planCandidatePromotion(row, { allowPrivate: privateAllowed }));
       const promotePlans = plans.filter(p => p.action === 'promote');
       const skipPlans = plans.filter(p => p.action !== 'promote');
 
@@ -3410,7 +3484,9 @@ function createMcpServer() {
               would_queue_review_relations: relationPlans.reduce((n, p) => n + p.review.length, 0),
               relation_skips: relationPlans.flatMap(p => p.skipped),
               skips: skipPlans.map(p => ({ candidate_id: p.candidate.id, action: 'skip', reason: p.reason })),
-              note: 'dry_run=true: no memories, relation edges, or candidate statuses were changed. private_candidate is still skipped.',
+              note: privateAllowed
+                ? 'dry_run=true: no memories, relation edges, or candidate statuses were changed. Explicit private candidates use original evidence.'
+                : 'dry_run=true: no memories, relation edges, or candidate statuses were changed. Private candidates require exact ids plus allow_private=true.',
             }, null, 2),
           }],
         };
@@ -3435,7 +3511,7 @@ function createMcpServer() {
             skipped.push({ candidate_id: original.id, reason: 'candidate disappeared before apply' });
             continue;
           }
-          const plan = planCandidatePromotion(current);
+          const plan = planCandidatePromotion(current, { allowPrivate: privateAllowed });
           if (plan.action !== 'promote') {
             skipped.push({ candidate_id: current.id, reason: plan.reason });
             continue;
@@ -4262,7 +4338,9 @@ const PATROL_REPORTS_BACKUP_PATH = 'backups/memory_patrol_reports.jsonl';
 const NARRATIVE_BACKUP_PATH = 'backups/narrative_summaries.jsonl';
 const RELATION_REVIEWS_BACKUP_PATH = 'backups/relation_reviews.jsonl';
 const BACKUP_TOKEN = process.env.BACKUP_GITHUB_TOKEN;
-const BACKUP_INCLUDE_INTIMATE = ['1', 'true', 'yes', 'on'].includes(String(process.env.BACKUP_INCLUDE_INTIMATE || '').toLowerCase());
+const BACKUP_INCLUDE_INTIMATE = !['0', 'false', 'no', 'off'].includes(
+  String(process.env.BACKUP_INCLUDE_INTIMATE || '').toLowerCase()
+);
 
 async function ghRequest(method, path, body) {
   const res = await fetch(`https://api.github.com/repos/${BACKUP_REPO}/contents/${path}`, {

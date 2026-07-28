@@ -599,6 +599,22 @@ try {
   const privateSkip = await callTool(client, 'promote_memory_candidates', { ids: ['promo-private-1'], dry_run: true });
   assert.equal(privateSkip.would_promote_count, 0, JSON.stringify(privateSkip, null, 2));
   assert.ok(privateSkip.skips[0].reason.includes('private_candidate'), JSON.stringify(privateSkip, null, 2));
+  const privateEvidence = await callTool(client, 'get_candidate_evidence', { candidate_id: 'promo-private-1' });
+  assert.ok(privateEvidence.raw_events.some((event) => event.id === rawCandidateEvent.id), JSON.stringify(privateEvidence, null, 2));
+  const privatePreview = await callTool(client, 'promote_memory_candidates', {
+    ids: ['promo-private-1'],
+    allow_private: true,
+    dry_run: true,
+  });
+  assert.equal(privatePreview.would_promote_count, 1, JSON.stringify(privatePreview, null, 2));
+  assert.equal(privatePreview.plans[0].memory_preview.category, 'diary', JSON.stringify(privatePreview, null, 2));
+  assert.equal(privatePreview.plans[0].memory_preview.protected, true, JSON.stringify(privatePreview, null, 2));
+  const privatePromoted = await callTool(client, 'promote_memory_candidates', {
+    ids: ['promo-private-1'],
+    allow_private: true,
+    dry_run: false,
+  });
+  assert.equal(privatePromoted.promoted_count, 1, JSON.stringify(privatePromoted, null, 2));
   const missingRawSkip = await callTool(client, 'promote_memory_candidates', { ids: ['promo-missing-raw-1'], dry_run: true });
   assert.ok(missingRawSkip.skips[0].reason.includes('missing raw_events'), JSON.stringify(missingRawSkip, null, 2));
   const unknownSkip = await callTool(client, 'promote_memory_candidates', { ids: ['promo-unknown-1'], dry_run: true });
