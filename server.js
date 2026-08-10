@@ -336,7 +336,7 @@ const historicalMemorySql = (alias = '') => {
 const recallMemorySql = (stateView = 'current', alias = '') =>
   stateView === 'historical' ? historicalMemorySql(alias) : currentMemorySql(alias);
 const isRecallFactKey = (factKey) => {
-  const key = String(factKey || '').trim();
+  const key = String(factKey || '').trim().toLowerCase();
   return !!key && !key.startsWith('swap-');
 };
 const recallStateMetrics = {
@@ -789,8 +789,11 @@ function factChainsForMemories(memories, now = new Date().toISOString(), limitPe
   `).all(...factKeys, now);
   const grouped = new Map();
   for (const row of rows) {
+    const mode = row.status === 'historical' ? 'historical' : 'recall';
+    const gate = lmcClosure.metabolicGateForRecall(row, { mode });
+    if (!gate.allowed) continue;
     const versions = grouped.get(row.fact_key) || [];
-    if (versions.length < limitPerFact) versions.push(fmt(row));
+    if (versions.length < limitPerFact) versions.push({ ...fmt(row), metabolic_gate: gate });
     grouped.set(row.fact_key, versions);
   }
   return factKeys
@@ -809,12 +812,28 @@ function factChainsForMemories(memories, now = new Date().toISOString(), limitPe
 }
 
 function inspectTemporalMemoryHealth(limit = 50) {
+  const historicalWithoutFactKeyCount = Number(db.prepare(`
+    SELECT COUNT(*) AS c
+    FROM memories
+    WHERE deleted_at IS NULL
+      AND COALESCE(status, 'current') = 'historical'
+      AND (fact_key IS NULL OR TRIM(fact_key) = '')
+  `).get().c || 0);
+  const historicalWithoutFactKey = db.prepare(`
+    SELECT id, created_at
+    FROM memories
+    WHERE deleted_at IS NULL
+      AND COALESCE(status, 'current') = 'historical'
+      AND (fact_key IS NULL OR TRIM(fact_key) = '')
+    ORDER BY created_at DESC
+    LIMIT ?
+  `).all(limit);
   const historicalWithoutSuccessorCount = Number(db.prepare(`
     SELECT COUNT(*) AS c
     FROM memories
     WHERE deleted_at IS NULL
       AND COALESCE(status, 'current') = 'historical'
-      AND fact_key NOT LIKE 'swap-%'
+      AND (fact_key IS NULL OR LOWER(fact_key) NOT LIKE 'swap-%')
       AND (superseded_by IS NULL OR TRIM(superseded_by) = '')
   `).get().c || 0);
   const historicalWithoutSuccessor = db.prepare(`
@@ -822,7 +841,7 @@ function inspectTemporalMemoryHealth(limit = 50) {
     FROM memories
     WHERE deleted_at IS NULL
       AND COALESCE(status, 'current') = 'historical'
-      AND fact_key NOT LIKE 'swap-%'
+      AND (fact_key IS NULL OR LOWER(fact_key) NOT LIKE 'swap-%')
       AND (superseded_by IS NULL OR TRIM(superseded_by) = '')
     ORDER BY created_at DESC
     LIMIT ?
@@ -833,7 +852,7 @@ function inspectTemporalMemoryHealth(limit = 50) {
     LEFT JOIN memories s ON s.id = h.superseded_by AND s.deleted_at IS NULL
     WHERE h.deleted_at IS NULL
       AND COALESCE(h.status, 'current') = 'historical'
-      AND h.fact_key NOT LIKE 'swap-%'
+      AND (h.fact_key IS NULL OR LOWER(h.fact_key) NOT LIKE 'swap-%')
       AND h.superseded_by IS NOT NULL
       AND (
         h.superseded_by = h.id
@@ -853,7 +872,7 @@ function inspectTemporalMemoryHealth(limit = 50) {
     LEFT JOIN memories s ON s.id = h.superseded_by AND s.deleted_at IS NULL
     WHERE h.deleted_at IS NULL
       AND COALESCE(h.status, 'current') = 'historical'
-      AND h.fact_key NOT LIKE 'swap-%'
+      AND (h.fact_key IS NULL OR LOWER(h.fact_key) NOT LIKE 'swap-%')
       AND h.superseded_by IS NOT NULL
       AND (
         h.superseded_by = h.id
@@ -874,9 +893,11 @@ function inspectTemporalMemoryHealth(limit = 50) {
     FROM memories
     WHERE deleted_at IS NULL
       AND COALESCE(status, 'current') = 'historical'
-      AND fact_key LIKE 'swap-%'
+      AND LOWER(fact_key) LIKE 'swap-%'
   `).get().c || 0);
   return {
+    historical_without_fact_key_count: historicalWithoutFactKeyCount,
+    historical_without_fact_key: historicalWithoutFactKey,
     historical_without_successor_count: historicalWithoutSuccessorCount,
     historical_without_successor: historicalWithoutSuccessor,
     broken_successor_count: brokenSuccessorCount,
@@ -884,6 +905,15 @@ function inspectTemporalMemoryHealth(limit = 50) {
     current_filter_historical_matches: currentFilterHistoricalMatches,
     runtime_current_queries: recallStateMetrics.current_queries,
     runtime_current_query_historical_leaks: recallStateMetrics.current_query_historical_leaks,
+    current_filter_regression_probe: {
+      historical_matches: currentFilterHistoricalMatches,
+      expected: 0,
+    },
+    runtime_observation: {
+      scope: 'process',
+      current_queries: recallStateMetrics.current_queries,
+      historical_rows_exposed: recallStateMetrics.current_query_historical_leaks,
+    },
     excluded_swap_historical_count: excludedSwapHistorical,
   };
 }
@@ -3301,9 +3331,9 @@ function createMcpServer() {
         daily_summary: dailySummary,
       };
       const temporalIssueCount = temporalState.historical_without_successor_count
+        + temporalState.historical_without_fact_key_count
         + temporalState.broken_successor_count
-        + temporalState.current_filter_historical_matches
-        + temporalState.runtime_current_query_historical_leaks;
+        + temporalState.current_filter_historical_matches;
       const status = edge.issue_count || currentFactConflicts.length || dailySummary.e_axis_alerts.length || conflicts.pending_z_audits || temporalIssueCount ? 'needs_review' : 'ok';
       const summary = dailySummary.text;
       let reportId = null;

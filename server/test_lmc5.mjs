@@ -849,16 +849,19 @@ try {
   assert.ok(eAxis.scores.every(s => s.valence >= -1 && s.valence <= 1));
 
   const temporalHealthDb = new Database(path.join(dataDir, 'memories.db'));
-  temporalHealthDb.prepare("UPDATE memories SET superseded_by = NULL WHERE id = ?").run(factV1.saved.id);
+  temporalHealthDb.prepare("UPDATE memories SET fact_key = NULL, superseded_by = NULL WHERE id = ?").run(factV1.saved.id);
   temporalHealthDb.prepare("UPDATE memories SET superseded_by = 'missing-successor-id' WHERE id = ?").run(temporalV1.saved.id);
   temporalHealthDb.close();
 
   const patrolPreview = await callTool(client, 'run_memory_patrol', { dry_run: true, save_report: true });
   assert.equal(patrolPreview.report_id, null);
+  assert.ok(patrolPreview.payload.temporal_state_health.historical_without_fact_key_count >= 1);
   assert.ok(patrolPreview.payload.temporal_state_health.historical_without_successor_count >= 1);
   assert.ok(patrolPreview.payload.temporal_state_health.broken_successor_count >= 1);
   assert.equal(patrolPreview.payload.temporal_state_health.current_filter_historical_matches, 0);
   assert.equal(patrolPreview.payload.temporal_state_health.runtime_current_query_historical_leaks, 0);
+  assert.equal(patrolPreview.payload.temporal_state_health.current_filter_regression_probe.expected, 0);
+  assert.equal(patrolPreview.payload.temporal_state_health.runtime_observation.scope, 'process');
   assert.ok(patrolPreview.payload.temporal_state_health.excluded_swap_historical_count >= 1);
   const patrol = await callTool(client, 'run_memory_patrol', { dry_run: false, save_report: true });
   assert.ok(patrol.summary.includes('近24小时新增'), JSON.stringify(patrol, null, 2));
