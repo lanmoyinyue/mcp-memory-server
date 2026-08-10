@@ -16,6 +16,7 @@ import {
   redactForRemote,
   registerLmcClosureTools,
 } from './server/lmc_closure.js';
+import { createEdgeMigrationService, excludeSupersededRelated } from './server/edge_migration.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DEFAULT_E_AXIS_RULES = {
@@ -313,6 +314,10 @@ const lmcClosure = createLmcClosureService({
   dbPath,
   embedText: async (text) => (await getEmbeddingDetailed(text)).embedding,
 });
+const edgeMigration = createEdgeMigrationService({ db });
+const edgeMigrationRuntime = {
+  supersede_not_applied_count: 0,
+};
 
 const contentHash = (text, category) => crypto.createHash('sha256').update(`${category}:${text.trim()}`).digest('hex');
 
@@ -345,6 +350,87 @@ const recallStateMetrics = {
 };
 const factActiveValue = (factKey, status = 'current', supersededBy = null) =>
   factKey && status === 'current' && !supersededBy ? 1 : 0;
+
+function commitMemoryWrite({
+  id,
+  content,
+  category,
+  tags,
+  source,
+  mood,
+  now,
+  expiresAt,
+  embedding,
+  pinned,
+  hash,
+  factKey,
+  protectedFlag,
+  evidenceIds,
+  evidenceChunkIds,
+  status,
+  activeFact,
+  oldFactRows,
+  related,
+}) {
+  const superseded = [];
+  const supersedeSkipped = [];
+  const edgeMigrations = [];
+  let supersedeNotAppliedCount = 0;
+  let edgesCreated = 0;
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    db.prepare(
+      'INSERT INTO memories (id,content,category,tags,source,mood,created_at,updated_at,expires_at,embedding,pinned,content_hash,fact_key,protected,evidence_raw_ids,evidence_chunk_ids,status,active_fact) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)'
+    ).run(
+      id, content, category, JSON.stringify(tags ?? []), source ?? '', mood ?? null,
+      now, now, expiresAt, embedding ? JSON.stringify(embedding) : null, pinned ? 1 : 0,
+      hash, factKey ?? null, protectedFlag, evidenceIds, evidenceChunkIds, status, activeFact,
+    );
+
+    if (factKey) {
+      const superStmt = db.prepare("UPDATE memories SET superseded_by = ?, status = 'historical', active_fact = 0, updated_at = ? WHERE id = ? AND protected = 0");
+      for (const oldFact of oldFactRows) {
+        const result = superStmt.run(id, now, oldFact.id);
+        if (result.changes !== 1) {
+          supersedeNotAppliedCount += 1;
+          supersedeSkipped.push({ id: oldFact.id, reason: 'supersede_not_applied' });
+          continue;
+        }
+        superseded.push(oldFact.id);
+      }
+      // Mark the complete fact set historical before inspecting any edge. This
+      // prevents one co-superseded version from looking live during migration.
+      for (const oldId of superseded) {
+        edgeMigrations.push(edgeMigration.migrateOne({ old_id: oldId, successor_id: id, checked_at: now }));
+      }
+    }
+
+    const liveRelated = excludeSupersededRelated(related, superseded);
+    if (liveRelated.length) {
+      const edgeStmt = db.prepare(
+        'INSERT OR IGNORE INTO memory_edges (source_id,target_id,weight,created_at,relation_type,strength,status,reason,updated_at) VALUES (?,?,?,?,?,?,?,?,?)'
+      );
+      for (const relatedMemory of liveRelated) {
+        const weight = relatedMemory.similarity ?? 0.5;
+        edgesCreated += edgeStmt.run(id, relatedMemory.id, weight, now, 'semantic', weight, 'safe', 'auto semantic association', now).changes || 0;
+        edgesCreated += edgeStmt.run(relatedMemory.id, id, weight, now, 'semantic', weight, 'safe', 'auto semantic association', now).changes || 0;
+      }
+    }
+    db.exec('COMMIT');
+    edgeMigrationRuntime.supersede_not_applied_count += supersedeNotAppliedCount;
+  } catch (error) {
+    try { db.exec('ROLLBACK'); } catch {}
+    throw error;
+  }
+
+  return {
+    superseded,
+    supersede_skipped: supersedeSkipped,
+    edge_migrations: edgeMigrations,
+    related_memories: excludeSupersededRelated(related, superseded),
+    edges_created: edgesCreated,
+  };
+}
 
 // One-time backfill: content_hash for existing memories
 {
@@ -2234,42 +2320,39 @@ function createMcpServer() {
         }
       }
 
-      db.prepare(
-        'INSERT INTO memories (id,content,category,tags,source,mood,created_at,updated_at,expires_at,embedding,pinned,content_hash,fact_key,protected,evidence_raw_ids,evidence_chunk_ids,status,active_fact) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)'
-      ).run(id, content, category, JSON.stringify(tags ?? []), source ?? '', mood ?? null, now, now, expires_at,
-        embedding ? JSON.stringify(embedding) : null, pinned ? 1 : 0, hash, fact_key ?? null, protectedFlag, evidenceIds, evidenceChunkIds, status, activeFact);
-
-      // Z-axis: auto-supersede old versions of the same fact
-      let superseded = [];
-      if (fact_key) {
-        const superStmt = db.prepare("UPDATE memories SET superseded_by = ?, status = 'historical', active_fact = 0, updated_at = ? WHERE id = ? AND protected = 0");
-        for (const o of oldFactRows) {
-          superStmt.run(id, now, o.id);
-          superseded.push(o.id);
-        }
-      }
-
-      // "写就是读"：把相关记忆存为边
-      if (related.length) {
-        const edgeStmt = db.prepare(
-          'INSERT OR IGNORE INTO memory_edges (source_id,target_id,weight,created_at,relation_type,strength,status,reason,updated_at) VALUES (?,?,?,?,?,?,?,?,?)'
-        );
-        for (const r of related) {
-          const weight = r.similarity ?? 0.5;
-          edgeStmt.run(id, r.id, weight, now, 'semantic', weight, 'safe', 'auto semantic association', now);
-          edgeStmt.run(r.id, id, weight, now, 'semantic', weight, 'safe', 'auto semantic association', now);
-        }
-      }
+      const committed = commitMemoryWrite({
+        id,
+        content,
+        category,
+        tags,
+        source,
+        mood,
+        now,
+        expiresAt: expires_at,
+        embedding,
+        pinned,
+        hash,
+        factKey: fact_key,
+        protectedFlag,
+        evidenceIds,
+        evidenceChunkIds,
+        status,
+        activeFact,
+        oldFactRows,
+        related,
+      });
 
       return {
         content: [{
           type: 'text',
           text: JSON.stringify({
             saved: { id, category, fact_key: fact_key || null },
-            superseded_ids: superseded,
-            related_memories: related,
-            edges_created: related.length * 2,
-            note: embedding ? `Found ${related.length} related memories, created ${related.length * 2} edges.` : 'Set VOYAGE_API_KEY to enable semantic associations.',
+            superseded_ids: committed.superseded,
+            supersede_skipped: committed.supersede_skipped,
+            edge_migrations: committed.edge_migrations,
+            related_memories: committed.related_memories,
+            edges_created: committed.edges_created,
+            note: embedding ? `Found ${committed.related_memories.length} live related memories, created ${committed.edges_created} edges.` : 'Set VOYAGE_API_KEY to enable semantic associations.',
           }, null, 2),
         }],
       };
@@ -2468,6 +2551,20 @@ function createMcpServer() {
     },
     async ({ dry_run = true, limit = 50 }) => {
       const payload = cleanupMemoryEdges({ dryRun: dry_run, limit });
+      return { content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }] };
+    }
+  );
+
+  mcp.tool(
+    'migrate_superseded_edges',
+    'Preview or apply safe relation-edge migration from superseded facts to their current successors. Defaults to zero-write dry run; apply requires the exact preview fingerprint.',
+    {
+      dry_run: z.boolean().default(true),
+      plan_fingerprint: z.string().optional().describe('Required for dry_run=false; copy exactly from the reviewed dry-run result.'),
+      limit: z.number().int().min(1).max(5000).default(5000).describe('Maximum superseded memories to inspect.'),
+    },
+    async ({ dry_run = true, plan_fingerprint = '', limit = 5000 }) => {
+      const payload = edgeMigration.runStoredMigration({ dry_run, plan_fingerprint, limit });
       return { content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }] };
     }
   );
@@ -3303,6 +3400,11 @@ function createMcpServer() {
     async ({ save_report = true, dry_run = true, since_hours = 24, edge_issue_limit = 50, e_axis_risk_threshold = 0.6 }) => {
       const now = new Date().toISOString();
       const edge = inspectMemoryEdges(edge_issue_limit);
+      const supersededEdgeMigration = {
+        ...edgeMigration.inspectHealth({ sample_limit: edge_issue_limit }),
+        supersede_not_applied_count: edgeMigrationRuntime.supersede_not_applied_count,
+        runtime_scope: 'process',
+      };
       const temporalState = inspectTemporalMemoryHealth(edge_issue_limit);
       const factGroups = db.prepare("SELECT fact_key, SUM(CASE WHEN COALESCE(status, 'current') = 'current' AND superseded_by IS NULL THEN 1 ELSE 0 END) as current_count FROM memories WHERE deleted_at IS NULL AND fact_key IS NOT NULL GROUP BY fact_key").all();
       const currentFactConflicts = factGroups.filter(g => g.current_count > 1);
@@ -3326,6 +3428,7 @@ function createMcpServer() {
         pending_z_audits: conflicts.pending_z_audits,
         e_axis_scored: db.prepare('SELECT COUNT(*) as c FROM e_axis_scores').get().c,
         edge_health: edge,
+        superseded_edge_migration: supersededEdgeMigration,
         fact_conflicts: currentFactConflicts,
         temporal_state_health: temporalState,
         daily_summary: dailySummary,
@@ -4310,26 +4413,37 @@ app.post('/api/memories', auth, async (req, res) => {
     }
   }
 
-  db.prepare('INSERT INTO memories (id,content,category,tags,source,mood,created_at,updated_at,expires_at,embedding,pinned,content_hash,fact_key,protected,evidence_raw_ids,evidence_chunk_ids,status,active_fact) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)')
-    .run(id, content, category, JSON.stringify(tags), source, mood, now, now, expires_at,
-      embedding ? JSON.stringify(embedding) : null, pinned ? 1 : 0, hash, fact_key, protectedFlag, evidenceIds, evidenceChunkIds, status, activeFact);
-  // Z-axis: auto-supersede old versions
-  let superseded = [];
-  if (fact_key) {
-    const superStmt = db.prepare("UPDATE memories SET superseded_by = ?, status = 'historical', active_fact = 0, updated_at = ? WHERE id = ? AND protected = 0");
-    for (const o of oldFactRows) { superStmt.run(id, now, o.id); superseded.push(o.id); }
-  }
-  if (related.length) {
-    const edgeStmt = db.prepare(
-      'INSERT OR IGNORE INTO memory_edges (source_id,target_id,weight,created_at,relation_type,strength,status,reason,updated_at) VALUES (?,?,?,?,?,?,?,?,?)'
-    );
-    for (const r of related) {
-      const weight = r.similarity ?? 0.5;
-      edgeStmt.run(id, r.id, weight, now, 'semantic', weight, 'safe', 'auto semantic association', now);
-      edgeStmt.run(r.id, id, weight, now, 'semantic', weight, 'safe', 'auto semantic association', now);
-    }
-  }
-  res.json({ id, message: 'Memory saved', fact_key, superseded_ids: superseded, related_memories: related, edges_created: related.length * 2 });
+  const committed = commitMemoryWrite({
+    id,
+    content,
+    category,
+    tags,
+    source,
+    mood,
+    now,
+    expiresAt: expires_at,
+    embedding,
+    pinned,
+    hash,
+    factKey: fact_key,
+    protectedFlag,
+    evidenceIds,
+    evidenceChunkIds,
+    status,
+    activeFact,
+    oldFactRows,
+    related,
+  });
+  res.json({
+    id,
+    message: 'Memory saved',
+    fact_key,
+    superseded_ids: committed.superseded,
+    supersede_skipped: committed.supersede_skipped,
+    edge_migrations: committed.edge_migrations,
+    related_memories: committed.related_memories,
+    edges_created: committed.edges_created,
+  });
 });
 
 app.put('/api/memories/:id', auth, (req, res) => {
@@ -4377,6 +4491,26 @@ app.delete('/api/memories/:id', auth, (req, res) => {
     db.prepare('DELETE FROM memory_edges WHERE source_id = ? OR target_id = ?').run(req.params.id, req.params.id);
   }
   res.json({ deleted: r.changes > 0 });
+});
+
+app.post('/api/memory-edges/migrate-superseded', auth, (req, res) => {
+  const dryRun = req.body?.dry_run !== false;
+  const requestedLimit = Number(req.body?.limit ?? 5000);
+  const limit = Number.isFinite(requestedLimit)
+    ? Math.max(1, Math.min(5000, Math.trunc(requestedLimit)))
+    : 5000;
+  try {
+    const payload = edgeMigration.runStoredMigration({
+      dry_run: dryRun,
+      plan_fingerprint: String(req.body?.plan_fingerprint || ''),
+      limit,
+    });
+    const status = payload.error === 'plan_fingerprint_mismatch' ? 409
+      : (payload.error ? 400 : 200);
+    res.status(status).json(payload);
+  } catch (error) {
+    res.status(500).json({ error: 'edge_migration_failed', detail: error.message });
+  }
 });
 
 app.get('/api/stats', auth, (_req, res) => {

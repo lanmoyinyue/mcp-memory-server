@@ -52,6 +52,17 @@ async function callToolText(client, name, args = {}) {
   return result.content?.[0]?.text || '';
 }
 
+async function postJson(route, body) {
+  const response = await fetch(`http://127.0.0.1:${port}${route}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  const payload = await response.json();
+  if (!response.ok) throw new Error(`${route} failed (${response.status}): ${JSON.stringify(payload)}`);
+  return payload;
+}
+
 try {
   await waitForServer();
   const transport = new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${port}/mcp`));
@@ -101,6 +112,7 @@ try {
     'inspect_dream_readiness',
     'list_dream_runs',
     'run_lmc_night_maintenance',
+    'migrate_superseded_edges',
   ]) {
     assert.ok(toolNames.includes(name), `missing MCP tool: ${name}`);
   }
@@ -136,6 +148,139 @@ try {
     fact_key: 'project:lmc-status',
   });
   assert.deepEqual(factV2.superseded_ids, [factV1.saved.id]);
+
+  const edgePeer = await callTool(client, 'write_memory', {
+    content: '关联迁移测试的稳定同伴节点。',
+    category: 'work',
+  });
+  const edgeOldMcp = await callTool(client, 'write_memory', {
+    content: 'MCP 关联迁移事实旧版。',
+    category: 'work',
+    fact_key: 'project:edge-migration-mcp',
+  });
+  await callTool(client, 'upsert_memory_relation', {
+    source_id: edgePeer.saved.id,
+    target_id: edgeOldMcp.saved.id,
+    relation_type: 'same_topic',
+    strength: 0.61,
+  });
+  await callTool(client, 'upsert_memory_relation', {
+    source_id: edgeOldMcp.saved.id,
+    target_id: edgePeer.saved.id,
+    relation_type: 'same_project',
+    strength: 0.72,
+  });
+  const edgeNewMcp = await callTool(client, 'write_memory', {
+    content: 'MCP 关联迁移事实新版。',
+    category: 'work',
+    fact_key: 'project:edge-migration-mcp',
+  });
+  assert.equal(edgeNewMcp.edge_migrations[0].migrated.length, 2, JSON.stringify(edgeNewMcp, null, 2));
+
+  const restPeer = await postJson('/api/memories', {
+    content: 'REST 关联迁移测试的稳定同伴节点。',
+    category: 'work',
+  });
+  const edgeOldRest = await postJson('/api/memories', {
+    content: 'REST 关联迁移事实旧版。',
+    category: 'work',
+    fact_key: 'project:edge-migration-rest',
+  });
+  await callTool(client, 'upsert_memory_relation', {
+    source_id: edgeOldRest.id,
+    target_id: restPeer.id,
+    relation_type: 'same_event',
+    strength: 0.66,
+  });
+  const edgeNewRest = await postJson('/api/memories', {
+    content: 'REST 关联迁移事实新版。',
+    category: 'work',
+    fact_key: 'project:edge-migration-rest',
+  });
+  assert.equal(edgeNewRest.edge_migrations[0].migrated.length, 1, JSON.stringify(edgeNewRest, null, 2));
+
+  const coOldA = await callTool(client, 'write_memory', {
+    content: '同批替换顺序测试旧事实甲。',
+    category: 'work',
+    fact_key: 'project:co-superseded-order',
+  });
+  const coOldB = await callTool(client, 'write_memory', {
+    content: '同批替换顺序测试旧事实乙。',
+    category: 'work',
+  });
+  const coSetupDb = new Database(path.join(dataDir, 'memories.db'));
+  coSetupDb.prepare('UPDATE memories SET fact_key=?,active_fact=1 WHERE id=?')
+    .run('project:co-superseded-order', coOldB.saved.id);
+  coSetupDb.close();
+  await callTool(client, 'upsert_memory_relation', {
+    source_id: coOldA.saved.id,
+    target_id: coOldB.saved.id,
+    relation_type: 'same_topic',
+    strength: 0.64,
+  });
+  const coNew = await callTool(client, 'write_memory', {
+    content: '同批替换顺序测试新事实。',
+    category: 'work',
+    fact_key: 'project:co-superseded-order',
+  });
+  assert.deepEqual(new Set(coNew.superseded_ids), new Set([coOldA.saved.id, coOldB.saved.id]));
+  const coCheckDb = new Database(path.join(dataDir, 'memories.db'));
+  assert.equal(coCheckDb.prepare(`
+    SELECT COUNT(*) AS c FROM memory_edges
+    WHERE (source_id=? AND target_id IN (?,?))
+       OR (target_id=? AND source_id IN (?,?))
+  `).get(coNew.saved.id, coOldA.saved.id, coOldB.saved.id, coNew.saved.id, coOldA.saved.id, coOldB.saved.id).c, 0);
+  assert.ok(coCheckDb.prepare('SELECT 1 FROM memory_edges WHERE source_id=? AND target_id=?')
+    .get(coOldA.saved.id, coOldB.saved.id));
+  coCheckDb.close();
+
+  const edgeDb = new Database(path.join(dataDir, 'memories.db'));
+  assert.ok(edgeDb.prepare('SELECT 1 FROM memory_edges WHERE source_id=? AND target_id=?').get(edgePeer.saved.id, edgeNewMcp.saved.id));
+  assert.ok(edgeDb.prepare('SELECT 1 FROM memory_edges WHERE source_id=? AND target_id=?').get(edgeNewMcp.saved.id, edgePeer.saved.id));
+  assert.equal(edgeDb.prepare('SELECT COUNT(*) AS c FROM memory_edges WHERE source_id=? OR target_id=?').get(edgeOldMcp.saved.id, edgeOldMcp.saved.id).c, 0);
+  assert.ok(edgeDb.prepare('SELECT 1 FROM memory_edges WHERE source_id=? AND target_id=?').get(edgeNewRest.id, restPeer.id));
+  edgeDb.close();
+
+  const rollbackPeer = await callTool(client, 'write_memory', {
+    content: '事务回滚测试同伴节点。',
+    category: 'work',
+  });
+  const rollbackOld = await callTool(client, 'write_memory', {
+    content: '事务回滚事实旧版。',
+    category: 'work',
+    fact_key: 'project:edge-migration-rollback',
+  });
+  await callTool(client, 'upsert_memory_relation', {
+    source_id: rollbackOld.saved.id,
+    target_id: rollbackPeer.saved.id,
+    relation_type: 'same_topic',
+    strength: 0.58,
+  });
+  const rollbackDb = new Database(path.join(dataDir, 'memories.db'));
+  rollbackDb.exec(`
+    CREATE TRIGGER force_automatic_edge_migration_failure
+    BEFORE INSERT ON memory_edges
+    WHEN NEW.reason LIKE 'migrated from superseded memory%'
+    BEGIN
+      SELECT RAISE(ABORT, 'forced automatic migration failure');
+    END;
+  `);
+  rollbackDb.close();
+  await assert.rejects(
+    () => callTool(client, 'write_memory', {
+      content: '事务回滚事实新版。',
+      category: 'work',
+      fact_key: 'project:edge-migration-rollback',
+    }),
+  );
+  const rollbackCheck = new Database(path.join(dataDir, 'memories.db'));
+  const rollbackOldRow = rollbackCheck.prepare('SELECT status,superseded_by FROM memories WHERE id=?').get(rollbackOld.saved.id);
+  assert.equal(rollbackOldRow.status, 'current');
+  assert.equal(rollbackOldRow.superseded_by, null);
+  assert.equal(rollbackCheck.prepare("SELECT COUNT(*) AS c FROM memories WHERE content='事务回滚事实新版。'").get().c, 0);
+  assert.ok(rollbackCheck.prepare('SELECT 1 FROM memory_edges WHERE source_id=? AND target_id=?').get(rollbackOld.saved.id, rollbackPeer.saved.id));
+  rollbackCheck.exec('DROP TRIGGER force_automatic_edge_migration_failure');
+  rollbackCheck.close();
 
   const temporalV1 = await callTool(client, 'write_memory', {
     content: 'A-TMA temporal history marker oldstate',
@@ -193,6 +338,51 @@ try {
   assert.ok(riskScore.scores[0].risk_level > 0.6, JSON.stringify(riskScore, null, 2));
   assert.equal(technicalScore.scores.length, 0, JSON.stringify(technicalScore, null, 2));
   assert.equal(technicalScore.skipped[0].reason, 'technical_without_e_axis_tag');
+
+  const storedPeer = await callTool(client, 'write_memory', {
+    content: '存量迁边预演的同伴节点。',
+    category: 'work',
+  });
+  const storedOld = await callTool(client, 'write_memory', {
+    content: '存量迁边预演旧事实。',
+    category: 'work',
+    fact_key: 'project:stored-edge-migration',
+  });
+  const storedNew = await callTool(client, 'write_memory', {
+    content: '存量迁边预演新事实。',
+    category: 'work',
+  });
+  const storedDb = new Database(path.join(dataDir, 'memories.db'));
+  storedDb.prepare("UPDATE memories SET status='historical',active_fact=0,superseded_by=? WHERE id=?")
+    .run(storedNew.saved.id, storedOld.saved.id);
+  storedDb.prepare(`
+    INSERT INTO memory_edges
+      (source_id,target_id,weight,created_at,relation_type,strength,status,reason,updated_at)
+    VALUES (?,?,?,?,?,?,?,?,?)
+  `).run(storedOld.saved.id, storedPeer.saved.id, 0.63, new Date().toISOString(), 'same_topic', 0.63, 'safe', 'stored migration test', new Date().toISOString());
+  storedDb.close();
+
+  const storedPreview = await callTool(client, 'migrate_superseded_edges', { dry_run: true });
+  assert.ok(storedPreview.planned.some(row => row.old_id === storedOld.saved.id), JSON.stringify(storedPreview, null, 2));
+  const storedDryCheck = new Database(path.join(dataDir, 'memories.db'));
+  assert.ok(storedDryCheck.prepare('SELECT 1 FROM memory_edges WHERE source_id=? AND target_id=?').get(storedOld.saved.id, storedPeer.saved.id));
+  storedDryCheck.close();
+
+  const wrongFingerprintResponse = await fetch(`http://127.0.0.1:${port}/api/memory-edges/migrate-superseded`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ dry_run: false, plan_fingerprint: 'wrong' }),
+  });
+  assert.equal(wrongFingerprintResponse.status, 409);
+  const storedApply = await postJson('/api/memory-edges/migrate-superseded', {
+    dry_run: false,
+    plan_fingerprint: storedPreview.plan_fingerprint,
+  });
+  assert.ok(storedApply.migrated_count >= 1, JSON.stringify(storedApply, null, 2));
+  const storedApplyCheck = new Database(path.join(dataDir, 'memories.db'));
+  assert.ok(storedApplyCheck.prepare('SELECT 1 FROM memory_edges WHERE source_id=? AND target_id=?').get(storedNew.saved.id, storedPeer.saved.id));
+  assert.equal(storedApplyCheck.prepare('SELECT COUNT(*) AS c FROM memory_edges WHERE source_id=? AND target_id=?').get(storedOld.saved.id, storedPeer.saved.id).c, 0);
+  storedApplyCheck.close();
 
   const currentRead = await callTool(client, 'read_memories', { keyword: '项目状态', limit: 10 });
   assert.equal(currentRead.length, 1);
@@ -863,6 +1053,9 @@ try {
   assert.equal(patrolPreview.payload.temporal_state_health.current_filter_regression_probe.expected, 0);
   assert.equal(patrolPreview.payload.temporal_state_health.runtime_observation.scope, 'process');
   assert.ok(patrolPreview.payload.temporal_state_health.excluded_swap_historical_count >= 1);
+  assert.equal(typeof patrolPreview.payload.superseded_edge_migration.superseded_edge_migration_candidate_count, 'number');
+  assert.equal(typeof patrolPreview.payload.superseded_edge_migration.superseded_edge_unmigratable_count, 'number');
+  assert.equal(patrolPreview.payload.superseded_edge_migration.runtime_scope, 'process');
   const patrol = await callTool(client, 'run_memory_patrol', { dry_run: false, save_report: true });
   assert.ok(patrol.summary.includes('近24小时新增'), JSON.stringify(patrol, null, 2));
   assert.equal(typeof patrol.daily_summary.text, 'string');
