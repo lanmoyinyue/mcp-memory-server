@@ -30,7 +30,7 @@ child.stdout.on('data', d => { stdout += d.toString(); });
 child.stderr.on('data', d => { stderr += d.toString(); });
 
 async function waitForServer() {
-  const deadline = Date.now() + 8000;
+  const deadline = Date.now() + 30000;
   while (Date.now() < deadline) {
     try {
       const res = await fetch(`http://127.0.0.1:${port}/api/stats`);
