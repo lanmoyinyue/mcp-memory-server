@@ -137,6 +137,30 @@ try {
   });
   assert.deepEqual(factV2.superseded_ids, [factV1.saved.id]);
 
+  const temporalV1 = await callTool(client, 'write_memory', {
+    content: 'A-TMA temporal history marker oldstate',
+    category: 'work',
+    fact_key: 'project:temporal-state-test',
+  });
+  const temporalV2 = await callTool(client, 'write_memory', {
+    content: 'A-TMA temporal current marker newstate',
+    category: 'work',
+    fact_key: 'project:temporal-state-test',
+  });
+  assert.deepEqual(temporalV2.superseded_ids, [temporalV1.saved.id]);
+
+  const swapV1 = await callTool(client, 'write_memory', {
+    content: 'swap pulse historical marker',
+    category: 'work',
+    fact_key: 'swap-heartbeat-test',
+  });
+  const swapV2 = await callTool(client, 'write_memory', {
+    content: 'swap pulse current marker',
+    category: 'work',
+    fact_key: 'swap-heartbeat-test',
+  });
+  assert.deepEqual(swapV2.superseded_ids, [swapV1.saved.id]);
+
   const fakeHeart = await callTool(client, 'write_memory', {
     content: '测试 E 轴：假装心动，没成功，也不紧急。',
     category: 'diary',
@@ -766,6 +790,50 @@ try {
   const recallFeedback = await callTool(client, 'record_recall_feedback', { trace_id: recalled.recall_trace.recall_run_id, memory_id: factV2.saved.id, outcome: 'useful' });
   assert.equal(recallFeedback.outcome, 'useful');
 
+  const currentStateRecall = await callTool(client, 'recall_lmc', {
+    query: 'A-TMA temporal marker',
+    state_view: 'current',
+    graph_hops: 0,
+    include_chunks: false,
+  });
+  assert.equal(currentStateRecall.state_view_effective, 'current');
+  assert.ok(currentStateRecall.primary.some(m => m.id === temporalV2.saved.id), JSON.stringify(currentStateRecall, null, 2));
+  assert.ok(!currentStateRecall.primary.some(m => m.id === temporalV1.saved.id), JSON.stringify(currentStateRecall, null, 2));
+
+  const historicalStateRecall = await callTool(client, 'recall_lmc', {
+    query: 'A-TMA temporal history oldstate',
+    state_view: 'historical',
+    graph_hops: 0,
+    include_chunks: false,
+  });
+  assert.equal(historicalStateRecall.state_view_effective, 'historical');
+  assert.ok(historicalStateRecall.primary.some(m => m.id === temporalV1.saved.id), JSON.stringify(historicalStateRecall, null, 2));
+  assert.ok(!historicalStateRecall.primary.some(m => m.id === temporalV2.saved.id), JSON.stringify(historicalStateRecall, null, 2));
+  const temporalChain = historicalStateRecall.fact_chains.find(chain => chain.fact_key === 'project:temporal-state-test');
+  assert.ok(temporalChain, JSON.stringify(historicalStateRecall, null, 2));
+  assert.deepEqual(temporalChain.versions.map(version => version.id), [temporalV1.saved.id, temporalV2.saved.id]);
+
+  const excludedSwapRecall = await callTool(client, 'recall_lmc', {
+    query: 'swap pulse historical marker',
+    state_view: 'historical',
+    graph_hops: 0,
+    include_chunks: false,
+  });
+  assert.ok(!excludedSwapRecall.primary.some(m => m.id === swapV1.saved.id), JSON.stringify(excludedSwapRecall, null, 2));
+  assert.ok(!excludedSwapRecall.fact_chains.some(chain => chain.fact_key === 'swap-heartbeat-test'), JSON.stringify(excludedSwapRecall, null, 2));
+
+  const autoStateRecall = await callTool(client, 'recall_lmc', {
+    query: '以前 A-TMA temporal marker',
+    state_view: 'auto',
+    graph_hops: 0,
+    include_chunks: false,
+  });
+  assert.equal(autoStateRecall.state_view_effective, 'current');
+  assert.equal(autoStateRecall.state_view_shadow.active, false);
+  assert.equal(autoStateRecall.state_view_shadow.suggested_state_view, 'historical');
+  assert.ok(autoStateRecall.primary.some(m => m.id === temporalV2.saved.id), JSON.stringify(autoStateRecall, null, 2));
+  assert.ok(!autoStateRecall.primary.some(m => m.id === temporalV1.saved.id), JSON.stringify(autoStateRecall, null, 2));
+
   const identityRecall = await callTool(client, 'recall_lmc', {
     query: '克 窗口 身份',
     graph_hops: 0,
@@ -780,8 +848,18 @@ try {
   assert.ok(eAxis.count >= 1);
   assert.ok(eAxis.scores.every(s => s.valence >= -1 && s.valence <= 1));
 
+  const temporalHealthDb = new Database(path.join(dataDir, 'memories.db'));
+  temporalHealthDb.prepare("UPDATE memories SET superseded_by = NULL WHERE id = ?").run(factV1.saved.id);
+  temporalHealthDb.prepare("UPDATE memories SET superseded_by = 'missing-successor-id' WHERE id = ?").run(temporalV1.saved.id);
+  temporalHealthDb.close();
+
   const patrolPreview = await callTool(client, 'run_memory_patrol', { dry_run: true, save_report: true });
   assert.equal(patrolPreview.report_id, null);
+  assert.ok(patrolPreview.payload.temporal_state_health.historical_without_successor_count >= 1);
+  assert.ok(patrolPreview.payload.temporal_state_health.broken_successor_count >= 1);
+  assert.equal(patrolPreview.payload.temporal_state_health.current_filter_historical_matches, 0);
+  assert.equal(patrolPreview.payload.temporal_state_health.runtime_current_query_historical_leaks, 0);
+  assert.ok(patrolPreview.payload.temporal_state_health.excluded_swap_historical_count >= 1);
   const patrol = await callTool(client, 'run_memory_patrol', { dry_run: false, save_report: true });
   assert.ok(patrol.summary.includes('近24小时新增'), JSON.stringify(patrol, null, 2));
   assert.equal(typeof patrol.daily_summary.text, 'string');

@@ -329,6 +329,20 @@ const currentMemorySql = (alias = '') => {
   const p = alias ? `${alias}.` : '';
   return `${p}deleted_at IS NULL AND COALESCE(${p}status, 'current') = 'current' AND ${p}superseded_by IS NULL`;
 };
+const historicalMemorySql = (alias = '') => {
+  const p = alias ? `${alias}.` : '';
+  return `${p}deleted_at IS NULL AND COALESCE(${p}status, 'current') = 'historical' AND ${p}superseded_by IS NOT NULL AND ${p}fact_key IS NOT NULL AND ${p}fact_key NOT LIKE 'swap-%'`;
+};
+const recallMemorySql = (stateView = 'current', alias = '') =>
+  stateView === 'historical' ? historicalMemorySql(alias) : currentMemorySql(alias);
+const isRecallFactKey = (factKey) => {
+  const key = String(factKey || '').trim();
+  return !!key && !key.startsWith('swap-');
+};
+const recallStateMetrics = {
+  current_queries: 0,
+  current_query_historical_leaks: 0,
+};
 const factActiveValue = (factKey, status = 'current', supersededBy = null) =>
   factKey && status === 'current' && !supersededBy ? 1 : 0;
 
@@ -718,7 +732,7 @@ function charLength(text) {
   return Array.from(String(text || '')).length;
 }
 
-function memoryKeywordSearch({ query, now = new Date().toISOString(), limit = 20, category = '' }) {
+function memoryKeywordSearch({ query, now = new Date().toISOString(), limit = 20, category = '', stateView = 'current' }) {
   let terms = queryTerms(query);
   if (terms.length > 1) {
     terms = terms.filter(term => charLength(term) > 1 || /^[A-Za-z0-9_-]{2,}$/.test(term));
@@ -735,7 +749,7 @@ function memoryKeywordSearch({ query, now = new Date().toISOString(), limit = 20
     params.push(`%${term}%`);
     return 'content LIKE ?';
   });
-  let sql = `SELECT * FROM memories WHERE (${clauses.join(' OR ')}) AND (expires_at IS NULL OR expires_at > ?) AND ${currentMemorySql()}`;
+  let sql = `SELECT * FROM memories WHERE (${clauses.join(' OR ')}) AND (expires_at IS NULL OR expires_at > ?) AND ${recallMemorySql(stateView)}`;
   params.push(now);
   if (category) { sql += ' AND category = ?'; params.push(category); }
   sql += ' ORDER BY pinned DESC, created_at DESC LIMIT ?';
@@ -744,6 +758,134 @@ function memoryKeywordSearch({ query, now = new Date().toISOString(), limit = 20
   let rows = db.prepare(sql).all(...params);
   rows = rows.filter(row => terms.some(term => charLength(term) <= 2 ? exactTermMatches(row.content, term) : String(row.content || '').includes(term)));
   return { rows: rows.slice(0, limit), terms };
+}
+
+const HISTORICAL_QUERY_TERMS = [
+  '以前', '当时', '曾经', '从前', '那时', '那时候', '原来', '旧版', '历史',
+  '后来', '变化', '演变', '替代', '改成', '之前是', '最初', '起初',
+];
+
+function shadowStateViewForQuery(query) {
+  const text = String(query || '').trim();
+  const matched_terms = HISTORICAL_QUERY_TERMS.filter(term => text.includes(term));
+  return {
+    suggested_state_view: matched_terms.length ? 'historical' : 'current',
+    matched_terms,
+  };
+}
+
+function factChainsForMemories(memories, now = new Date().toISOString(), limitPerFact = 20) {
+  const factKeys = [...new Set(memories.map(row => row.fact_key).filter(isRecallFactKey))];
+  if (!factKeys.length) return [];
+  const placeholders = factKeys.map(() => '?').join(',');
+  const rows = db.prepare(`
+    SELECT * FROM memories
+    WHERE deleted_at IS NULL
+      AND fact_key IN (${placeholders})
+      AND fact_key NOT LIKE 'swap-%'
+      AND COALESCE(status, 'current') IN ('current', 'historical')
+      AND (expires_at IS NULL OR expires_at > ?)
+    ORDER BY fact_key ASC, created_at ASC
+  `).all(...factKeys, now);
+  const grouped = new Map();
+  for (const row of rows) {
+    const versions = grouped.get(row.fact_key) || [];
+    if (versions.length < limitPerFact) versions.push(fmt(row));
+    grouped.set(row.fact_key, versions);
+  }
+  return factKeys
+    .map(fact_key => {
+      const versions = grouped.get(fact_key) || [];
+      return {
+        fact_key,
+        current_memory_id: versions.find(version => version.status === 'current' && !version.superseded_by)?.id || null,
+        links: versions
+          .filter(version => version.superseded_by)
+          .map(version => ({ predecessor_id: version.id, successor_id: version.superseded_by })),
+        versions,
+      };
+    })
+    .filter(chain => chain.versions.length > 0);
+}
+
+function inspectTemporalMemoryHealth(limit = 50) {
+  const historicalWithoutSuccessorCount = Number(db.prepare(`
+    SELECT COUNT(*) AS c
+    FROM memories
+    WHERE deleted_at IS NULL
+      AND COALESCE(status, 'current') = 'historical'
+      AND fact_key NOT LIKE 'swap-%'
+      AND (superseded_by IS NULL OR TRIM(superseded_by) = '')
+  `).get().c || 0);
+  const historicalWithoutSuccessor = db.prepare(`
+    SELECT id, fact_key, created_at
+    FROM memories
+    WHERE deleted_at IS NULL
+      AND COALESCE(status, 'current') = 'historical'
+      AND fact_key NOT LIKE 'swap-%'
+      AND (superseded_by IS NULL OR TRIM(superseded_by) = '')
+    ORDER BY created_at DESC
+    LIMIT ?
+  `).all(limit);
+  const brokenSuccessorCount = Number(db.prepare(`
+    SELECT COUNT(*) AS c
+    FROM memories h
+    LEFT JOIN memories s ON s.id = h.superseded_by AND s.deleted_at IS NULL
+    WHERE h.deleted_at IS NULL
+      AND COALESCE(h.status, 'current') = 'historical'
+      AND h.fact_key NOT LIKE 'swap-%'
+      AND h.superseded_by IS NOT NULL
+      AND (
+        h.superseded_by = h.id
+        OR s.id IS NULL
+        OR COALESCE(s.fact_key, '') != COALESCE(h.fact_key, '')
+      )
+  `).get().c || 0);
+  const brokenSuccessors = db.prepare(`
+    SELECT h.id, h.fact_key, h.superseded_by,
+           CASE
+             WHEN h.superseded_by = h.id THEN 'self_reference'
+             WHEN s.id IS NULL THEN 'missing_successor'
+             WHEN COALESCE(s.fact_key, '') != COALESCE(h.fact_key, '') THEN 'fact_key_mismatch'
+             ELSE 'unknown'
+           END AS reason
+    FROM memories h
+    LEFT JOIN memories s ON s.id = h.superseded_by AND s.deleted_at IS NULL
+    WHERE h.deleted_at IS NULL
+      AND COALESCE(h.status, 'current') = 'historical'
+      AND h.fact_key NOT LIKE 'swap-%'
+      AND h.superseded_by IS NOT NULL
+      AND (
+        h.superseded_by = h.id
+        OR s.id IS NULL
+        OR COALESCE(s.fact_key, '') != COALESCE(h.fact_key, '')
+      )
+    ORDER BY h.created_at DESC
+    LIMIT ?
+  `).all(limit);
+  const currentFilterHistoricalMatches = Number(db.prepare(`
+    SELECT COUNT(*) AS c
+    FROM memories
+    WHERE ${currentMemorySql()}
+      AND COALESCE(status, 'current') = 'historical'
+  `).get().c || 0);
+  const excludedSwapHistorical = Number(db.prepare(`
+    SELECT COUNT(*) AS c
+    FROM memories
+    WHERE deleted_at IS NULL
+      AND COALESCE(status, 'current') = 'historical'
+      AND fact_key LIKE 'swap-%'
+  `).get().c || 0);
+  return {
+    historical_without_successor_count: historicalWithoutSuccessorCount,
+    historical_without_successor: historicalWithoutSuccessor,
+    broken_successor_count: brokenSuccessorCount,
+    broken_successors: brokenSuccessors,
+    current_filter_historical_matches: currentFilterHistoricalMatches,
+    runtime_current_queries: recallStateMetrics.current_queries,
+    runtime_current_query_historical_leaks: recallStateMetrics.current_query_historical_leaks,
+    excluded_swap_historical_count: excludedSwapHistorical,
+  };
 }
 
 function rawEventSearch({ query, mode = 'fuzzy', channel = 'all', source = '', speaker = '', limit = 20 }) {
@@ -1531,7 +1673,7 @@ function hasUnnegatedHit(hits) {
   return hits.some(hit => !hit.negated);
 }
 
-function graphExpand(seedIds, { hops = 2, limit = 12, minStrength = 0.35 } = {}) {
+function graphExpand(seedIds, { hops = 2, limit = 12, minStrength = 0.35, stateView = 'current' } = {}) {
   const now = new Date().toISOString();
   const seen = new Set(seedIds);
   let frontier = seedIds.map(id => ({ id, depth: 0, score: 1 }));
@@ -1554,7 +1696,7 @@ function graphExpand(seedIds, { hops = 2, limit = 12, minStrength = 0.35 } = {})
         if (strength < threshold) continue;
         const targetId = edge.source_id === seed.id ? edge.target_id : edge.source_id;
         if (seen.has(targetId)) continue;
-        const mem = db.prepare(`SELECT * FROM memories WHERE id = ? AND (expires_at IS NULL OR expires_at > ?) AND ${currentMemorySql()}`).get(targetId, now);
+        const mem = db.prepare(`SELECT * FROM memories WHERE id = ? AND (expires_at IS NULL OR expires_at > ?) AND ${recallMemorySql(stateView)}`).get(targetId, now);
         if (!mem) continue;
         seen.add(targetId);
         const typeWeight = RELATION_TYPE_WEIGHTS[relationType] || 0.65;
@@ -3004,24 +3146,27 @@ function createMcpServer() {
   // 22. recall_lmc — unified LMC recall
   mcp.tool(
     'recall_lmc',
-    'Unified LMC recall: curated keyword/semantic, optional exact raw fallback, chunk fallback, safe Y two-hop expansion, and compact injection text.',
+    'Unified LMC recall with explicit current/historical state views. auto is shadow-only and never changes retrieval in this phase.',
     {
       query: z.string().min(1),
       limit: z.number().int().min(1).max(20).default(8),
       fallback_to_raw: z.boolean().default(false),
       include_chunks: z.boolean().default(true),
       graph_hops: z.number().int().min(0).max(2).default(2),
+      state_view: z.enum(['current', 'historical', 'auto']).default('current').describe('current is the stable default; historical retrieves old fact versions; auto only reports a shadow suggestion.'),
     },
-    async ({ query, limit = 8, fallback_to_raw = false, include_chunks = true, graph_hops = 2 }) => {
+    async ({ query, limit = 8, fallback_to_raw = false, include_chunks = true, graph_hops = 2, state_view = 'current' }) => {
       cleanExpired();
       const now = new Date().toISOString();
-      const keywordSearch = memoryKeywordSearch({ query, now, limit: Math.max(limit * 4, 20) });
+      const stateShadow = shadowStateViewForQuery(query);
+      const effectiveStateView = state_view === 'historical' ? 'historical' : 'current';
+      const keywordSearch = memoryKeywordSearch({ query, now, limit: Math.max(limit * 4, 20), stateView: effectiveStateView });
       const keywordRows = keywordSearch.rows;
       let semanticRows = [];
       const embeddingResult = await getEmbeddingDetailed(query);
       const embedding = embeddingResult.embedding;
       if (embedding) {
-        semanticRows = db.prepare(`SELECT * FROM memories WHERE embedding IS NOT NULL AND (expires_at IS NULL OR expires_at > ?) AND ${currentMemorySql()}`).all(now)
+        semanticRows = db.prepare(`SELECT * FROM memories WHERE embedding IS NOT NULL AND (expires_at IS NULL OR expires_at > ?) AND ${recallMemorySql(effectiveStateView)}`).all(now)
           .map(r => { try { return { ...r, score: cosineSim(embedding, JSON.parse(r.embedding)) }; } catch { return null; } })
           .filter(Boolean)
           .sort((a, b) => b.score - a.score)
@@ -3045,7 +3190,7 @@ function createMcpServer() {
       });
       const primary = [...fuse.values()]
         .sort((a, b) => b.score - a.score)
-        .map(e => ({ ...e, gate: lmcClosure.metabolicGateForRecall(e.row, { mode: 'recall' }) }))
+        .map(e => ({ ...e, gate: lmcClosure.metabolicGateForRecall(e.row, { mode: effectiveStateView === 'historical' ? 'historical' : 'recall' }) }))
         .filter(e => e.gate.allowed)
         .slice(0, limit)
         .map(e => ({
@@ -3053,13 +3198,19 @@ function createMcpServer() {
           recall_layer: 'main_recall', recall_tier: 'authority', evidence_role: 'authority', metabolic_gate: e.gate,
           score_breakdown: { final: +(e.score * e.gate.factor).toFixed(4), rrf_k: K, keyword_rank: e.ranks.keyword || null, semantic_rank: e.ranks.semantic || null, metabolic_factor: e.gate.factor },
         }));
-      const graph = (graph_hops > 0 ? graphExpand(primary.map(r => r.id), { hops: graph_hops, limit }) : [])
-        .map((row) => ({ ...row, gate: lmcClosure.metabolicGateForRecall(row, { mode: 'recall' }) }))
+      const graph = (graph_hops > 0 ? graphExpand(primary.map(r => r.id), { hops: graph_hops, limit, stateView: effectiveStateView }) : [])
+        .map((row) => ({ ...row, gate: lmcClosure.metabolicGateForRecall(row, { mode: effectiveStateView === 'historical' ? 'historical' : 'recall' }) }))
         .filter((row) => row.gate.allowed)
         .map((row) => {
           const finalScore = +(row.graph_score * row.gate.factor).toFixed(4);
           return { ...row, graph_score: finalScore, recall_layer: 'graph_expansion', recall_tier: 'association', evidence_role: 'association', metabolic_gate: row.gate, score_breakdown: { final: finalScore, graph_score: row.graph_score, depth: row.graph_depth, metabolic_factor: row.gate.factor } };
         });
+      const factChains = effectiveStateView === 'historical' ? factChainsForMemories(primary, now) : [];
+      if (effectiveStateView === 'current') {
+        recallStateMetrics.current_queries += 1;
+        recallStateMetrics.current_query_historical_leaks += [...primary, ...graph]
+          .filter(row => row.status === 'historical' || row.superseded_by).length;
+      }
       const raw = fallback_to_raw ? rawEventSearch({ query, mode: 'exact', channel: 'all', limit: 5 }).rows.map(fmtRawEvent) : [];
       const chunks = include_chunks
         ? db.prepare('SELECT * FROM event_chunks WHERE summary LIKE ? ORDER BY created_at DESC LIMIT ?').all(`%${query}%`, Math.min(5, limit, primary.length)).map(fmtEventChunk)
@@ -3084,6 +3235,7 @@ function createMcpServer() {
             query,
             primary,
             graph,
+            fact_chains: factChains,
             raw_fallback: raw,
             chunks,
             layers,
@@ -3093,7 +3245,14 @@ function createMcpServer() {
             semantic_error: embedding ? null : embeddingResult.error,
             semantic_attempts: embeddingResult.attempts,
             keyword_terms: keywordSearch.terms,
-            note: 'Layer roles are strict: main=authority, chunks=navigation, graph=association, raw=last resort. M-axis gates output; E-axis remains shadow-only.',
+            state_view_requested: state_view,
+            state_view_effective: effectiveStateView,
+            state_view_shadow: {
+              active: false,
+              ...stateShadow,
+              note: state_view === 'auto' ? 'Shadow-only: the suggestion was reported but current retrieval remained active.' : 'Shadow signal is informational only.',
+            },
+            note: 'Layer roles are strict: main=authority, chunks=navigation, graph=association, raw=last resort. Historical fact chains use fact_key/superseded_by directly; swap-* facts are excluded. No personality or behavior prompt is added.',
           }, null, 2),
         }],
       };
@@ -3114,6 +3273,7 @@ function createMcpServer() {
     async ({ save_report = true, dry_run = true, since_hours = 24, edge_issue_limit = 50, e_axis_risk_threshold = 0.6 }) => {
       const now = new Date().toISOString();
       const edge = inspectMemoryEdges(edge_issue_limit);
+      const temporalState = inspectTemporalMemoryHealth(edge_issue_limit);
       const factGroups = db.prepare("SELECT fact_key, SUM(CASE WHEN COALESCE(status, 'current') = 'current' AND superseded_by IS NULL THEN 1 ELSE 0 END) as current_count FROM memories WHERE deleted_at IS NULL AND fact_key IS NOT NULL GROUP BY fact_key").all();
       const currentFactConflicts = factGroups.filter(g => g.current_count > 1);
       const conflicts = {
@@ -3137,9 +3297,14 @@ function createMcpServer() {
         e_axis_scored: db.prepare('SELECT COUNT(*) as c FROM e_axis_scores').get().c,
         edge_health: edge,
         fact_conflicts: currentFactConflicts,
+        temporal_state_health: temporalState,
         daily_summary: dailySummary,
       };
-      const status = edge.issue_count || currentFactConflicts.length || dailySummary.e_axis_alerts.length || conflicts.pending_z_audits ? 'needs_review' : 'ok';
+      const temporalIssueCount = temporalState.historical_without_successor_count
+        + temporalState.broken_successor_count
+        + temporalState.current_filter_historical_matches
+        + temporalState.runtime_current_query_historical_leaks;
+      const status = edge.issue_count || currentFactConflicts.length || dailySummary.e_axis_alerts.length || conflicts.pending_z_audits || temporalIssueCount ? 'needs_review' : 'ok';
       const summary = dailySummary.text;
       let reportId = null;
       if (save_report && !dry_run) {

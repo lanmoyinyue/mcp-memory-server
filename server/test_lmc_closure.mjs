@@ -113,6 +113,8 @@ try {
 
   assert.equal(service.metabolicGateForRecall({ status: 'current', source: 'debug', category: 'log' }).allowed, false);
   assert.equal(service.metabolicGateForRecall({ status: 'current', protected: 1, source: 'debug', category: 'deep' }).allowed, true);
+  assert.equal(service.metabolicGateForRecall({ status: 'historical', superseded_by: 'next-id', source: 'test', category: 'work' }, { mode: 'historical' }).allowed, true);
+  assert.equal(service.metabolicGateForRecall({ status: 'historical', superseded_by: 'next-id', source: 'test', category: 'work' }).allowed, false);
 
   const incubation = service.inspectOtherIncubation();
   assert.ok(incubation.suggestions.some((item) => item.group_kind === 'category' && item.group_key === 'work' && item.stage === 'observe_cluster'));

@@ -248,7 +248,11 @@ function metabolicGate(row, mode = 'recall', at = new Date()) {
   const category = String(row.category || '').toLowerCase();
   const protectedRow = !!row.protected || PROTECTED_CATEGORIES.has(row.category)
     || ['identity', 'relationship', 'corridor'].includes(category);
-  if (status !== 'current' || row.deleted_at || row.superseded_by) {
+  const historicalMode = mode === 'historical';
+  const invalidLifecycle = historicalMode
+    ? status !== 'historical' || !row.superseded_by
+    : status !== 'current' || row.superseded_by;
+  if (invalidLifecycle || row.deleted_at) {
     return { bucket: 'quarantine', allowed: false, factor: 0, reason: `status:${status}` };
   }
   if (protectedRow) return { bucket: 'retain', allowed: true, factor: 1, reason: 'protected' };
