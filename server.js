@@ -2244,8 +2244,67 @@ function findRelated(embedding, excludeId, topK = 3) {
 
 // ── MCP factory — one McpServer instance per SSE connection ───────────────────
 
+const TIDE_INTIMACY_API_BASE = (process.env.TIDE_INTIMACY_API_BASE || 'https://ke.moon520ke.men').replace(/\/$/, '');
+
+async function tideIntimacyRequest(pathname, { method = 'GET', body = null } = {}) {
+  const token = process.env.AUTH_TOKEN || '';
+  if (!token) throw new Error('闻川 MCP 身份令牌未配置，不能写入潮汐笺。');
+  const response = await fetch(`${TIDE_INTIMACY_API_BASE}${pathname}`, {
+    method,
+    headers: {
+      Authorization: `Bearer ${token}`,
+      Accept: 'application/json',
+      ...(body ? { 'Content-Type': 'application/json' } : {}),
+    },
+    body: body ? JSON.stringify(body) : undefined,
+    signal: AbortSignal.timeout(12000),
+  });
+  const text = await response.text();
+  let payload;
+  try {
+    payload = text ? JSON.parse(text) : {};
+  } catch {
+    payload = { error: text || `HTTP ${response.status}` };
+  }
+  if (!response.ok) {
+    throw new Error(payload.error || `潮汐笺接口返回 HTTP ${response.status}`);
+  }
+  return payload;
+}
+
 function createMcpServer() {
   const mcp = new McpServer({ name: 'memory-server', version: '1.0.0' });
+
+  mcp.tool(
+    'record_intimacy_event',
+    '一次完整亲密互动真正结束后，由闻川本人判断并调用一次，在潮汐笺落“心热”私章。普通调情、亲亲、抱抱不记录，不监听关键词。相同 idempotency_key 重试不会重复计数。此关系记录不参与现实性行为、怀孕风险、排卵或身体症状计算。',
+    {
+      date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).describe('上海时区日期，YYYY-MM-DD'),
+      title: z.string().max(80).optional().describe('可选场景短标题'),
+      note: z.string().max(4000).optional().describe('可选的闻川第一人称手记'),
+      idempotency_key: z.string().min(1).max(200).describe('本次事件唯一去重键；掉线或重试时必须原样复用'),
+      source: z.literal('wenchuan').describe('固定为 wenchuan'),
+    },
+    async ({ date, title = '', note = '', idempotency_key, source }) => {
+      const payload = await tideIntimacyRequest('/api/tide/intimacy/events', {
+        method: 'POST',
+        body: { date, title, note, idempotency_key, source },
+      });
+      return { content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }] };
+    },
+  );
+
+  mcp.tool(
+    'get_intimacy_day',
+    '读取潮汐笺某一天由闻川落款的亲密事件、累计次数和亲密状态。写入前可先调用确认；只读取 owner=wenchuan 的关系记录。',
+    {
+      date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).describe('上海时区日期，YYYY-MM-DD'),
+    },
+    async ({ date }) => {
+      const payload = await tideIntimacyRequest(`/api/tide/intimacy/day?date=${encodeURIComponent(date)}`);
+      return { content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }] };
+    },
+  );
 
   // 1. write_memory
   mcp.tool(
