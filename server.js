@@ -2245,8 +2245,9 @@ function findRelated(embedding, excludeId, topK = 3) {
 const TIDE_API_BASE = (process.env.TIDE_INTIMACY_API_BASE || 'https://ke.moon520ke.men').replace(/\/$/, '');
 
 async function tideRequest(pathname, { method = 'GET', body = null } = {}) {
-  const tideAuthToken = process.env.AUTH_TOKEN || '';
-  if (!tideAuthToken) throw new Error('克的 MCP 身份令牌未配置，不能访问潮汐笺。');
+  const baseAuthToken = process.env.AUTH_TOKEN || '';
+  if (!baseAuthToken) throw new Error('克的 MCP 身份令牌未配置，不能访问潮汐笺。');
+  const tideAuthToken = crypto.createHmac('sha256', baseAuthToken).update('tide-intimacy-owner:ke').digest('hex');
   const response = await fetch(`${TIDE_API_BASE}${pathname}`, {
     method,
     headers: {
