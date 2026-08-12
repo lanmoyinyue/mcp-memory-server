@@ -2242,10 +2242,65 @@ function findRelated(embedding, excludeId, topK = 3) {
     }));
 }
 
+const TIDE_API_BASE = (process.env.TIDE_INTIMACY_API_BASE || 'https://ke.moon520ke.men').replace(/\/$/, '');
+
+async function tideRequest(pathname, { method = 'GET', body = null } = {}) {
+  const tideAuthToken = process.env.AUTH_TOKEN || '';
+  if (!tideAuthToken) throw new Error('克的 MCP 身份令牌未配置，不能访问潮汐笺。');
+  const response = await fetch(`${TIDE_API_BASE}${pathname}`, {
+    method,
+    headers: {
+      Authorization: `Bearer ${tideAuthToken}`,
+      Accept: 'application/json',
+      ...(body ? { 'Content-Type': 'application/json' } : {}),
+    },
+    body: body ? JSON.stringify(body) : undefined,
+    signal: AbortSignal.timeout(12000),
+  });
+  const text = await response.text();
+  let payload;
+  try {
+    payload = text ? JSON.parse(text) : {};
+  } catch {
+    payload = { error: text || `HTTP ${response.status}` };
+  }
+  if (!response.ok) throw new Error(payload.error || `潮汐笺接口返回 HTTP ${response.status}`);
+  return payload;
+}
+
 // ── MCP factory — one McpServer instance per SSE connection ───────────────────
 
 function createMcpServer() {
   const mcp = new McpServer({ name: 'memory-server', version: '1.0.0' });
+
+  mcp.tool('record_intimacy_event', '一次完整亲密互动真正结束后，由克本人判断并调用一次，在潮汐笺落克自己的私章。普通调情、亲亲、抱抱不记录，不监听关键词。相同 idempotency_key 重试不会重复计数。只写 owner=ke，不读取或覆盖闻川记录，也不参与排卵、怀孕风险或身体症状计算。', {
+    date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).describe('上海时区日期，YYYY-MM-DD'),
+    title: z.string().max(80).optional().describe('可选场景短标题'),
+    note: z.string().max(4000).optional().describe('可选的克第一人称手记'),
+    idempotency_key: z.string().min(1).max(200).describe('本次事件唯一去重键；掉线或重试时必须原样复用'),
+    source: z.literal('ke').describe('固定为 ke'),
+  }, async ({ date, title = '', note = '', idempotency_key, source }) => {
+    const payload = await tideRequest('/api/tide/intimacy/events', {
+      method: 'POST',
+      body: { date, title, note, idempotency_key, source },
+    });
+    return { content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }] };
+  });
+
+  mcp.tool('get_intimacy_day', '读取潮汐笺某一天由克落款的亲密事件、累计次数和亲密状态。只读取 owner=ke；看不到 owner=wenchuan 的记录。', {
+    date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).describe('上海时区日期，YYYY-MM-DD'),
+  }, async ({ date }) => {
+    const payload = await tideRequest(`/api/tide/intimacy/day?date=${encodeURIComponent(date)}`);
+    return { content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }] };
+  });
+
+  mcp.tool('get_tide_status', '读取月亮授权给克查看的潮汐状态。返回当天是否正在经期、经期第几天、距离下次月经、排卵期与黄体期预测，以及月亮主动保存的经量、疼痛、症状、心情和备注。此工具只读；克的亲密落章与身体和周期推算保持分离。', {
+    date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().describe('可选的上海时区日期，YYYY-MM-DD；省略时读取上海今天'),
+  }, async ({ date }) => {
+    const query = date ? `?date=${encodeURIComponent(date)}` : '';
+    const payload = await tideRequest(`/api/tide/status${query}`);
+    return { content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }] };
+  });
 
   // 1. write_memory
   mcp.tool(
