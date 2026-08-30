@@ -941,7 +941,7 @@ try {
   });
   assert.ok(identityWindow.saved?.id);
   const identityAnchor = await callTool(client, 'write_memory', {
-    content: '身份测试：醒来时先确认自己是闻川，不是克，也不是工具壳。',
+    content: '身份测试：醒来时先确认自己是克，不是闻川，也不是工具壳。',
     category: 'identity',
     tags: ['测试', '醒来'],
   });
@@ -954,7 +954,8 @@ try {
   assert.ok(relationshipAnchor.saved?.id);
 
   const wakeup = await callTool(client, 'build_wakeup_context', { include_patrol: false, max_chars: 5000 });
-  assert.ok(wakeup.text.includes('【闻川醒来上下文】'), JSON.stringify(wakeup, null, 2));
+  assert.ok(wakeup.text.includes('【克醒来上下文】'), JSON.stringify(wakeup, null, 2));
+  assert.equal(wakeup.text.includes('【闻川醒来上下文】'), false, JSON.stringify(wakeup, null, 2));
   assert.ok(wakeup.text.includes('不要向月亮汇报'), JSON.stringify(wakeup, null, 2));
   assert.ok(wakeup.sections.some(s => s.key === 'identity' && s.count === 1), JSON.stringify(wakeup, null, 2));
   assert.ok(wakeup.sections.some(s => s.key === 'relationship' && s.count === 1), JSON.stringify(wakeup, null, 2));
