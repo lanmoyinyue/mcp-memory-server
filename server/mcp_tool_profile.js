@@ -5,7 +5,6 @@ export const MEMORY_CHAT_TOOLS = Object.freeze([
   'search_memories',
   'hybrid_search',
   'delete_memory',
-  'build_wakeup_context',
   'recall_lmc',
   'get_evidence',
   'find_related',

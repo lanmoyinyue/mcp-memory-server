@@ -6,8 +6,9 @@ import {
   normalizeMcpToolProfile,
 } from './mcp_tool_profile.js';
 
-assert.equal(MEMORY_CHAT_TOOLS.length, 15);
-assert.equal(new Set(MEMORY_CHAT_TOOLS).size, 15);
+assert.equal(MEMORY_CHAT_TOOLS.length, 14);
+assert.equal(new Set(MEMORY_CHAT_TOOLS).size, 14);
+assert.equal(MEMORY_CHAT_TOOLS.includes('build_wakeup_context'), false);
 assert.equal(normalizeMcpToolProfile('chat'), 'chat');
 assert.equal(normalizeMcpToolProfile('CHAT'), 'chat');
 assert.equal(normalizeMcpToolProfile('admin'), 'admin');
@@ -29,6 +30,7 @@ function fakeMcp() {
 const chat = fakeMcp();
 installMcpToolProfile(chat, 'chat');
 for (const name of MEMORY_CHAT_TOOLS) chat.tool(name);
+chat.tool('build_wakeup_context');
 chat.tool('run_memory_patrol');
 chat.tool('list_memory_patrol_reports');
 assert.deepEqual(chat.registered, MEMORY_CHAT_TOOLS);
