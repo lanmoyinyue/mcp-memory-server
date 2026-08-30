@@ -17,6 +17,7 @@ import {
   registerLmcClosureTools,
 } from './server/lmc_closure.js';
 import { createEdgeMigrationService, excludeSupersededRelated } from './server/edge_migration.js';
+import { installMcpToolProfile, mcpToolProfileFromRequest } from './server/mcp_tool_profile.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DEFAULT_E_AXIS_RULES = {
@@ -2271,8 +2272,9 @@ async function tideRequest(pathname, { method = 'GET', body = null } = {}) {
 
 // ── MCP factory — one McpServer instance per SSE connection ───────────────────
 
-function createMcpServer() {
+function createMcpServer(profile = 'admin') {
   const mcp = new McpServer({ name: 'memory-server', version: '1.0.0' });
+  installMcpToolProfile(mcp, profile);
 
   mcp.tool('record_intimacy_event', '一次完整亲密互动真正结束后，由克本人判断并调用一次，在潮汐笺落克自己的私章。普通调情、亲亲、抱抱不记录，不监听关键词。相同 idempotency_key 重试不会重复计数。只写 owner=ke，不读取或覆盖闻川记录，也不参与排卵、怀孕风险或身体症状计算。', {
     date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).describe('上海时区日期，YYYY-MM-DD'),
@@ -4379,7 +4381,7 @@ app.get('/sse', auth, async (req, res) => {
   res.on('close', () => sessions.delete(transport.sessionId));
 
   try {
-    await createMcpServer().connect(transport);
+    await createMcpServer(mcpToolProfileFromRequest(req)).connect(transport);
   } catch (err) {
     console.error('[SSE] connect error:', err);
     sessions.delete(transport.sessionId);
@@ -4404,7 +4406,7 @@ app.post('/mcp', auth, async (req, res) => {
   res.setHeader('X-Accel-Buffering', 'no');
   const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
   try {
-    await createMcpServer().connect(transport);
+    await createMcpServer(mcpToolProfileFromRequest(req)).connect(transport);
     await transport.handleRequest(req, res, req.body);
   } catch (err) {
     console.error('[MCP] StreamableHTTP error:', err);
