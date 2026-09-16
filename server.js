@@ -5162,8 +5162,9 @@ process.on('unhandledRejection', (err) => console.error('[unhandledRejection]', 
 // ── Start ─────────────────────────────────────────────────────────────────────
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`Memory server on port ${PORT}`);
+const HOST = process.env.HOST || '0.0.0.0';
+app.listen(PORT, HOST, () => {
+  console.log(`Memory server on ${HOST}:${PORT}`);
   console.log(`MCP SSE:   http://localhost:${PORT}/sse`);
   console.log(`Frontend:  http://localhost:${PORT}`);
   if (AUTH_TOKEN) console.log('Auth: Bearer token enabled');
