@@ -2131,6 +2131,9 @@ function somaticPromptText(items) {
 
 // ── Embedding & vector similarity ─────────────────────────────────────────────
 // Set VOYAGE_API_KEY env var to enable. Free at voyageai.com (200M tokens/month)
+const embeddingApiUrl = process.env.VOYAGE_API_URL || process.env.VOYAGEAI_API_URL || 'https://api.voyageai.com/v1/embeddings';
+const embeddingModel = process.env.VOYAGE_EMBEDDING_MODEL || process.env.EMBEDDING_MODEL || 'voyage-3-lite';
+const embeddingApiKey = () => process.env.VOYAGE_API_KEY || process.env.VOYAGEAI_API_KEY || '';
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -2144,11 +2147,12 @@ function classifyEmbeddingStatus(status) {
 }
 
 const embeddingRuntime = {
+  model: embeddingModel,
   attempts: 0,
   successes: 0,
   failures: 0,
   redacted_inputs: 0,
-  last_status: process.env.VOYAGE_API_KEY ? 'not_checked' : 'missing_key',
+  last_status: embeddingApiKey() ? 'not_checked' : 'missing_key',
   last_error: '',
   last_attempt_at: null,
   last_success_at: null,
@@ -2156,7 +2160,7 @@ const embeddingRuntime = {
 };
 
 async function getEmbeddingDetailed(text, { maxAttempts = 2, retryDelayMs = 100, timeoutMs = 8000 } = {}) {
-  const apiKey = process.env.VOYAGE_API_KEY;
+  const apiKey = embeddingApiKey();
   if (!apiKey) return { embedding: null, error: 'missing_key', attempts: 0 };
   const remoteText = redactForRemote(text);
   if (!remoteText) return { embedding: null, error: 'empty_after_redaction', attempts: 0 };
@@ -2169,10 +2173,10 @@ async function getEmbeddingDetailed(text, { maxAttempts = 2, retryDelayMs = 100,
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
-      const res = await fetch('https://api.voyageai.com/v1/embeddings', {
+      const res = await fetch(embeddingApiUrl, {
         method: 'POST',
         headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ input: [remoteText], model: 'voyage-3-lite' }),
+        body: JSON.stringify({ input: [remoteText], model: embeddingModel }),
         signal: controller.signal,
       });
       clearTimeout(timer);
